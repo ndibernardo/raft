@@ -2,10 +2,17 @@ use serde::{Deserialize, Serialize};
 
 use super::primitives::Term;
 
+/// The data carried by a log entry. §8: leaders append a NoOp on election to commit
+/// prior-term entries via Log Matching without direct commitment of old terms.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogPayload<Cmd> {
+    NoOp,
+    Command(Cmd),
+}
+
 /// A single entry in the replicated log.
-/// command is None for no-op entries appended on leader election (§8).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LogEntry<Cmd> {
     pub term: Term,
-    pub command: Option<Cmd>,
+    pub payload: LogPayload<Cmd>,
 }

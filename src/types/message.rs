@@ -32,10 +32,18 @@ pub struct AppendEntries<Cmd> {
 
 /// AppendEntries RPC response.
 #[derive(Serialize, Deserialize)]
-pub struct AppendEntriesResponse {
-    pub term: Term,
-    pub success: bool,
-    pub match_index: LogIndex,
+pub enum AppendEntriesResponse {
+    Accepted { term: Term, match_index: LogIndex },
+    /// Term mismatch or log inconsistency; match_index is undefined.
+    Rejected { term: Term },
+}
+
+impl AppendEntriesResponse {
+    pub fn term(&self) -> Term {
+        match self {
+            Self::Accepted { term, .. } | Self::Rejected { term } => *term,
+        }
+    }
 }
 
 /// All possible Raft messages.

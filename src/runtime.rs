@@ -224,17 +224,16 @@ mod tests {
 
         // Submit command.
         let index = rt.submit(KvCommand::Set {
-            key: "foo".to_string(),
-            value: "bar".to_string(),
+            key: "username".to_string(),
+            value: "miles".to_string(),
         });
         assert!(index.is_some());
 
         // Simulate replication success (no-op at index 1, command at index 2).
         rt.handle(Event::Message {
             from: NodeId::from(2),
-            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
                 term: Term::from(1),
-                success: true,
                 match_index: LogIndex::from(2),
             }),
         })
@@ -242,9 +241,9 @@ mod tests {
 
         // Verify command was applied to state machine.
         let result = rt.state_machine.apply(KvCommand::Get {
-            key: "foo".to_string(),
+            key: "username".to_string(),
         });
-        assert_eq!(result, KvResult::Value(Some("bar".to_string())));
+        assert_eq!(result, KvResult::Value(Some("miles".to_string())));
     }
 
     #[test]
@@ -264,14 +263,13 @@ mod tests {
 
         // Submit a command and replicate it (no-op at 1, command at 2).
         rt.submit(KvCommand::Set {
-            key: "k".to_string(),
-            value: "v".to_string(),
+            key: "counter".to_string(),
+            value: "1".to_string(),
         });
         rt.handle(Event::Message {
             from: NodeId::from(2),
-            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
                 term: Term::from(1),
-                success: true,
                 match_index: LogIndex::from(2),
             }),
         })

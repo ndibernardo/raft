@@ -219,9 +219,8 @@ mod tests {
         // B → A: AppendEntriesResponse
         b.send(
             NodeId::from(1),
-            Message::AppendEntriesResponse(AppendEntriesResponse {
+            Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
                 term: Term::from(1),
-                success: true,
                 match_index: LogIndex::from(0),
             }),
         )
@@ -230,6 +229,6 @@ mod tests {
         let (from, msg) = a.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(from, NodeId::from(2));
         let Message::AppendEntriesResponse(resp) = msg else { panic!("wrong variant") };
-        assert!(resp.success);
+        assert!(matches!(resp, AppendEntriesResponse::Accepted { .. }));
     }
 }

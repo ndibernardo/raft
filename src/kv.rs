@@ -63,12 +63,12 @@ mod tests {
 
         store.apply(KvCommand::Set {
             key: "username".to_string(),
-            value: "alice".to_string(),
+            value: "miles".to_string(),
         });
 
         let result = store.apply(KvCommand::Get { key: "username".to_string() });
 
-        assert_eq!(result, KvResult::Value(Some("alice".to_string())));
+        assert_eq!(result, KvResult::Value(Some("miles".to_string())));
     }
 
     #[test]
@@ -86,7 +86,7 @@ mod tests {
 
         store.apply(KvCommand::Set {
             key: "username".to_string(),
-            value: "alice".to_string(),
+            value: "miles".to_string(),
         });
         store.apply(KvCommand::Delete { key: "username".to_string() });
 

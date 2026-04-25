@@ -248,7 +248,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Term;
+    use crate::types::{LogPayload, Term};
 
     fn open_fresh(dir: &Path) -> FileStorage<String> {
         FileStorage::open(dir).expect("open failed")
@@ -272,20 +272,20 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            s.append(LogEntry { term: Term::from(1), command: Some("a".into()) })
+            s.append(LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".into()) })
                 .expect("append");
-            s.append(LogEntry { term: Term::from(1), command: Some("b".into()) })
+            s.append(LogEntry { term: Term::from(1), payload: LogPayload::Command("SET counter=1".into()) })
                 .expect("append");
         }
         let s = open_fresh(tmp.path());
         assert_eq!(s.last_log_index().expect("idx"), LogIndex::from(2));
         assert_eq!(
-            s.entry(LogIndex::from(1)).expect("entry").map(|e| e.command),
-            Some(Some("a".into()))
+            s.entry(LogIndex::from(1)).expect("entry").map(|e| e.payload),
+            Some(LogPayload::Command("SET name=miles".into()))
         );
         assert_eq!(
-            s.entry(LogIndex::from(2)).expect("entry").map(|e| e.command),
-            Some(Some("b".into()))
+            s.entry(LogIndex::from(2)).expect("entry").map(|e| e.payload),
+            Some(LogPayload::Command("SET counter=1".into()))
         );
     }
 
@@ -294,8 +294,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            for ch in ["a", "b", "c"] {
-                s.append(LogEntry { term: Term::from(1), command: Some(ch.into()) })
+            for cmd in ["SET name=miles", "SET counter=1", "SET price=100"] {
+                s.append(LogEntry { term: Term::from(1), payload: LogPayload::Command(cmd.into()) })
                     .expect("append");
             }
             s.truncate_from(LogIndex::from(2)).expect("truncate");
@@ -303,8 +303,8 @@ mod tests {
         let s = open_fresh(tmp.path());
         assert_eq!(s.last_log_index().expect("idx"), LogIndex::from(1));
         assert_eq!(
-            s.entry(LogIndex::from(1)).expect("entry").map(|e| e.command),
-            Some(Some("a".into()))
+            s.entry(LogIndex::from(1)).expect("entry").map(|e| e.payload),
+            Some(LogPayload::Command("SET name=miles".into()))
         );
     }
 
@@ -313,22 +313,22 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            s.append(LogEntry { term: Term::from(1), command: Some("a".into()) })
+            s.append(LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".into()) })
                 .expect("append");
-            s.append(LogEntry { term: Term::from(1), command: Some("old".into()) })
+            s.append(LogEntry { term: Term::from(1), payload: LogPayload::Command("SET status=pending".into()) })
                 .expect("append");
             // Entry at index 2 conflicts (term 2 vs 1): truncate and replace.
             s.append_entries(
                 LogIndex::from(1),
-                vec![LogEntry { term: Term::from(2), command: Some("new".into()) }],
+                vec![LogEntry { term: Term::from(2), payload: LogPayload::Command("SET status=active".into()) }],
             )
             .expect("append_entries");
         }
         let s = open_fresh(tmp.path());
         assert_eq!(s.last_log_index().expect("idx"), LogIndex::from(2));
         assert_eq!(
-            s.entry(LogIndex::from(2)).expect("entry").map(|e| e.command),
-            Some(Some("new".into()))
+            s.entry(LogIndex::from(2)).expect("entry").map(|e| e.payload),
+            Some(LogPayload::Command("SET status=active".into()))
         );
     }
 
@@ -348,13 +348,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s: FileStorage<String> = open_fresh(tmp.path());
-            s.append(LogEntry { term: Term::from(1), command: None })
+            s.append(LogEntry { term: Term::from(1), payload: LogPayload::NoOp })
                 .expect("append noop");
         }
         let s: FileStorage<String> = open_fresh(tmp.path());
         assert_eq!(
-            s.entry(LogIndex::from(1)).expect("entry").map(|e| e.command),
-            Some(None)
+            s.entry(LogIndex::from(1)).expect("entry").map(|e| e.payload),
+            Some(LogPayload::NoOp)
         );
     }
 }

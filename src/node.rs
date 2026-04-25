@@ -4,8 +4,8 @@ use crate::command::Command;
 use crate::state::{Candidate, Follower, Leader};
 use crate::storage::Storage;
 use crate::types::{
-    AppendEntries, AppendEntriesResponse, LogEntry, LogIndex, Message, NodeId, RequestVote,
-    RequestVoteResponse, Term,
+    AppendEntries, AppendEntriesResponse, LogEntry, LogIndex, LogPayload, Message, NodeId,
+    RequestVote, RequestVoteResponse, Term,
 };
 
 /// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
@@ -267,7 +267,7 @@ impl<Cmd: Clone> Node<Cmd> {
     fn become_leader(&mut self) -> Vec<Command<Cmd>> {
         self.persistent.log.push(LogEntry {
             term: self.persistent.current_term,
-            command: None,
+            payload: LogPayload::NoOp,
         });
         self.role = Role::Leader(Leader::new(&self.peers, self.last_log_index()));
         info!(node = %self.id, term = %self.persistent.current_term, "became leader");
@@ -348,10 +348,8 @@ impl<Cmd: Clone> Node<Cmd> {
         if req.term < self.persistent.current_term {
             return vec![Command::Send {
                 to: from,
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                message: Message::AppendEntriesResponse(AppendEntriesResponse::Rejected {
                     term: self.persistent.current_term,
-                    success: false,
-                    match_index: LogIndex::default(),
                 }),
             }];
         }
@@ -372,10 +370,8 @@ impl<Cmd: Clone> Node<Cmd> {
         if !self.check_log_consistency(req.prev_log_index, req.prev_log_term) {
             commands.push(Command::Send {
                 to: from,
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                message: Message::AppendEntriesResponse(AppendEntriesResponse::Rejected {
                     term: self.persistent.current_term,
-                    success: false,
-                    match_index: LogIndex::default(),
                 }),
             });
             return commands;
@@ -389,9 +385,8 @@ impl<Cmd: Clone> Node<Cmd> {
 
         commands.push(Command::Send {
             to: from,
-            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
                 term: self.persistent.current_term,
-                success: true,
                 match_index: self.last_log_index(),
             }),
         });
@@ -418,24 +413,29 @@ impl<Cmd: Clone> Node<Cmd> {
         from: NodeId,
         resp: AppendEntriesResponse,
     ) -> Vec<Command<Cmd>> {
-        if resp.term > self.persistent.current_term {
-            self.become_follower(resp.term, None);
+        let term = resp.term();
+        if term > self.persistent.current_term {
+            self.become_follower(term, None);
             return vec![Command::ResetElectionTimer];
         }
-        if resp.term < self.persistent.current_term {
+        if term < self.persistent.current_term {
             return Vec::new();
         }
 
-        match &mut self.role {
-            Role::Leader(leader) => {
-                if resp.success {
-                    leader.record_success(from, resp.match_index);
-                    self.advance_commit_index();
-                } else {
-                    leader.record_failure(from);
-                }
+        let accepted = match (&mut self.role, resp) {
+            (Role::Leader(leader), AppendEntriesResponse::Accepted { match_index, .. }) => {
+                leader.record_success(from, match_index);
+                true
             }
-            Role::Follower(_) | Role::Candidate(_) => {}
+            (Role::Leader(leader), AppendEntriesResponse::Rejected { .. }) => {
+                leader.record_failure(from);
+                false
+            }
+            _ => false,
+        };
+
+        if accepted {
+            self.advance_commit_index();
         }
 
         Vec::new()
@@ -449,7 +449,7 @@ impl<Cmd: Clone> Node<Cmd> {
 
         let entry = LogEntry {
             term: self.persistent.current_term,
-            command: Some(command),
+            payload: LogPayload::Command(command),
         };
         self.persistent.log.push(entry);
 
@@ -506,8 +506,9 @@ impl<Cmd: Clone> Node<Cmd> {
             let idx = index.to_array_index()?;
             let entry = self.persistent.log.get(idx)?;
 
-            if let Some(command) = &entry.command {
-                return Some(Applied { index, command });
+            match &entry.payload {
+                LogPayload::NoOp => {}
+                LogPayload::Command(command) => return Some(Applied { index, command }),
             }
         }
     }
@@ -574,7 +575,7 @@ mod tests {
                 Command::Send {
                     message: Message::AppendEntriesResponse(r),
                     ..
-                } => Some(r.success),
+                } => Some(matches!(r, AppendEntriesResponse::Accepted { .. })),
                 _ => None,
             })
             .unwrap()
@@ -676,7 +677,7 @@ mod tests {
         let mut n = node(1, &[2, 3]);
         n.persistent.log.push(LogEntry {
             term: Term::from(2),
-            command: Some("x".to_string()),
+            payload: LogPayload::Command("SET name=miles".to_string()),
         });
 
         let req = RequestVote {
@@ -737,11 +738,11 @@ mod tests {
             entries: vec![
                 LogEntry {
                     term: Term::from(1),
-                    command: Some("a".to_string()),
+                    payload: LogPayload::Command("a".to_string()),
                 },
                 LogEntry {
                     term: Term::from(1),
-                    command: Some("b".to_string()),
+                    payload: LogPayload::Command("b".to_string()),
                 },
             ],
             leader_commit: LogIndex::default(),
@@ -756,11 +757,11 @@ mod tests {
         let mut n = node(1, &[2, 3]);
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("old".to_string()),
+            payload: LogPayload::Command("SET name=miles".to_string()),
         });
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("conflict".to_string()),
+            payload: LogPayload::Command("SET status=pending".to_string()),
         });
 
         let req = AppendEntries {
@@ -770,14 +771,14 @@ mod tests {
             prev_log_term: Term::from(1),
             entries: vec![LogEntry {
                 term: Term::from(2),
-                command: Some("new".to_string()),
+                payload: LogPayload::Command("SET status=active".to_string()),
             }],
             leader_commit: LogIndex::default(),
         };
         n.handle_append_entries(NodeId::from(2), req);
 
         assert_eq!(n.persistent.log.len(), 2);
-        assert_eq!(n.persistent.log[1].command, Some("new".to_string()));
+        assert_eq!(n.persistent.log[1].payload, LogPayload::Command("SET status=active".to_string()));
         assert_eq!(n.persistent.log[1].term, Term::from(2));
     }
 
@@ -815,15 +816,14 @@ mod tests {
         assert!(is_leader(&n));
 
         // Submit a command (no-op is at index 1, command at index 2).
-        let index = n.submit_command("cmd".to_string());
+        let index = n.submit_command("SET counter=1".to_string());
         assert_eq!(index, Some(LogIndex::from(2)));
 
         // Simulate successful replication of no-op to one follower.
         n.handle_append_entries_response(
             NodeId::from(2),
-            AppendEntriesResponse {
+            AppendEntriesResponse::Accepted {
                 term: Term::from(1),
-                success: true,
                 match_index: LogIndex::from(1),
             },
         );
@@ -846,8 +846,8 @@ mod tests {
         assert!(is_leader(&n));
 
         // Add entries to leader's log.
-        n.submit_command("a".to_string());
-        n.submit_command("b".to_string());
+        n.submit_command("SET name=miles".to_string());
+        n.submit_command("SET counter=1".to_string());
 
         let Role::Leader(leader) = &n.role else {
             panic!("expected leader");
@@ -857,10 +857,8 @@ mod tests {
         // Simulate failed replication.
         n.handle_append_entries_response(
             NodeId::from(2),
-            AppendEntriesResponse {
+            AppendEntriesResponse::Rejected {
                 term: Term::from(1),
-                success: false,
-                match_index: LogIndex::default(),
             },
         );
 
@@ -875,10 +873,10 @@ mod tests {
     #[test]
     fn submit_command_fails_on_non_leader() {
         let mut n = node(1, &[2, 3]);
-        assert!(n.submit_command("cmd".to_string()).is_none());
+        assert!(n.submit_command("SET counter=1".to_string()).is_none());
 
         n.election_timeout();
-        assert!(n.submit_command("cmd".to_string()).is_none());
+        assert!(n.submit_command("SET counter=1".to_string()).is_none());
     }
 
     #[test]
@@ -894,7 +892,7 @@ mod tests {
         n.persistent.voted_for = Some(NodeId::from(1));
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("old".to_string()),
+            payload: LogPayload::Command("SET name=miles".to_string()),
         });
         // Set up leader state with next_index starting after the existing entry.
         n.role = Role::Leader(LeaderState::new(&n.peers, LogIndex::from(1)));
@@ -902,9 +900,8 @@ mod tests {
         // Peer 2 reports it has replicated the old entry.
         n.handle_append_entries_response(
             NodeId::from(2),
-            AppendEntriesResponse {
+            AppendEntriesResponse::Accepted {
                 term: Term::from(2),
-                success: true,
                 match_index: LogIndex::from(1),
             },
         );
@@ -920,11 +917,11 @@ mod tests {
         // Add entries to log.
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("a".to_string()),
+            payload: LogPayload::Command("SET name=miles".to_string()),
         });
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("b".to_string()),
+            payload: LogPayload::Command("SET counter=1".to_string()),
         });
 
         // Commit first entry.
@@ -933,7 +930,7 @@ mod tests {
         assert!(n.has_pending_applies());
         let applied = n.take_entry_to_apply().unwrap();
         assert_eq!(applied.index, LogIndex::from(1));
-        assert_eq!(applied.command, &"a".to_string());
+        assert_eq!(applied.command, &"SET name=miles".to_string());
         assert!(!n.has_pending_applies());
         assert!(n.take_entry_to_apply().is_none());
 
@@ -943,7 +940,7 @@ mod tests {
         assert!(n.has_pending_applies());
         let applied = n.take_entry_to_apply().unwrap();
         assert_eq!(applied.index, LogIndex::from(2));
-        assert_eq!(applied.command, &"b".to_string());
+        assert_eq!(applied.command, &"SET counter=1".to_string());
         assert!(!n.has_pending_applies());
     }
 
@@ -953,7 +950,7 @@ mod tests {
 
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("cmd".to_string()),
+            payload: LogPayload::Command("SET counter=1".to_string()),
         });
         n.volatile.commit_index = LogIndex::from(1);
 
@@ -976,7 +973,7 @@ mod tests {
 
         assert!(is_leader(&n));
         assert_eq!(n.persistent.log.len(), 1);
-        assert!(n.persistent.log[0].command.is_none());
+        assert!(matches!(n.persistent.log[0].payload, LogPayload::NoOp));
         assert_eq!(n.persistent.log[0].term, Term::from(1));
     }
 
@@ -987,18 +984,18 @@ mod tests {
         // no-op at index 1, real command at index 2.
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: None,
+            payload: LogPayload::NoOp,
         });
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("cmd".to_string()),
+            payload: LogPayload::Command("SET price=100".to_string()),
         });
         n.volatile.commit_index = LogIndex::from(2);
 
         // First call must skip the no-op and return the real command.
         let applied = n.take_entry_to_apply().unwrap();
         assert_eq!(applied.index, LogIndex::from(2));
-        assert_eq!(applied.command, &"cmd".to_string());
+        assert_eq!(applied.command, &"SET price=100".to_string());
         assert_eq!(n.volatile.last_applied, LogIndex::from(2));
         assert!(n.take_entry_to_apply().is_none());
     }
@@ -1038,8 +1035,8 @@ mod tests {
                 vote_granted: true,
             },
         );
-        n.submit_command("cmd1".to_string());
-        n.submit_command("cmd2".to_string());
+        n.submit_command("SET name=miles".to_string());
+        n.submit_command("SET counter=1".to_string());
 
         let mut storage = MemoryStorage::new();
         n.save(&mut storage).unwrap();
@@ -1091,7 +1088,7 @@ mod tests {
         let mut n = node(1, &[2, 3]);
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("SET counter=1".to_string()),
+            payload: LogPayload::Command("SET counter=1".to_string()),
         });
 
         let req = AppendEntries {
@@ -1112,7 +1109,7 @@ mod tests {
         let mut n = node(1, &[2, 3]);
         n.persistent.log.push(LogEntry {
             term: Term::from(1),
-            command: Some("SET counter=1".to_string()),
+            payload: LogPayload::Command("SET counter=1".to_string()),
         });
 
         let req = AppendEntries {

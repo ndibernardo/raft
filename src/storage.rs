@@ -147,6 +147,7 @@ impl<Cmd: Clone> Storage<Cmd> for MemoryStorage<Cmd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::LogPayload;
 
     #[test]
     fn term_and_vote_round_trip_through_storage() {
@@ -169,7 +170,7 @@ mod tests {
         let idx = storage
             .append(LogEntry {
                 term: Term::from(1),
-                command: Some("a".to_string()),
+                payload: LogPayload::Command("SET name=miles".to_string()),
             })
             .unwrap();
         assert_eq!(idx, LogIndex::from(1));
@@ -177,7 +178,7 @@ mod tests {
         let idx = storage
             .append(LogEntry {
                 term: Term::from(1),
-                command: Some("b".to_string()),
+                payload: LogPayload::Command("SET counter=1".to_string()),
             })
             .unwrap();
         assert_eq!(idx, LogIndex::from(2));
@@ -185,8 +186,8 @@ mod tests {
         assert_eq!(storage.last_log_index().unwrap(), LogIndex::from(2));
         assert_eq!(storage.term_at(LogIndex::from(1)).unwrap(), Some(Term::from(1)));
         assert_eq!(
-            storage.entry(LogIndex::from(1)).unwrap().map(|e| e.command),
-            Some(Some("a".to_string()))
+            storage.entry(LogIndex::from(1)).unwrap().map(|e| e.payload),
+            Some(LogPayload::Command("SET name=miles".to_string()))
         );
     }
 
@@ -197,19 +198,19 @@ mod tests {
         storage
             .append(LogEntry {
                 term: Term::from(1),
-                command: Some("a".to_string()),
+                payload: LogPayload::Command("SET name=miles".to_string()),
             })
             .unwrap();
         storage
             .append(LogEntry {
                 term: Term::from(1),
-                command: Some("b".to_string()),
+                payload: LogPayload::Command("SET counter=1".to_string()),
             })
             .unwrap();
         storage
             .append(LogEntry {
                 term: Term::from(1),
-                command: Some("c".to_string()),
+                payload: LogPayload::Command("SET price=100".to_string()),
             })
             .unwrap();
 
@@ -225,13 +226,13 @@ mod tests {
         storage
             .append(LogEntry {
                 term: Term::from(1),
-                command: Some("a".to_string()),
+                payload: LogPayload::Command("SET name=miles".to_string()),
             })
             .unwrap();
         storage
             .append(LogEntry {
                 term: Term::from(1),
-                command: Some("old".to_string()),
+                payload: LogPayload::Command("SET status=pending".to_string()),
             })
             .unwrap();
 
@@ -240,15 +241,15 @@ mod tests {
                 LogIndex::from(1),
                 vec![LogEntry {
                     term: Term::from(2),
-                    command: Some("new".to_string()),
+                    payload: LogPayload::Command("SET status=active".to_string()),
                 }],
             )
             .unwrap();
 
         assert_eq!(storage.last_log_index().unwrap(), LogIndex::from(2));
         assert_eq!(
-            storage.entry(LogIndex::from(2)).unwrap().map(|e| e.command),
-            Some(Some("new".to_string()))
+            storage.entry(LogIndex::from(2)).unwrap().map(|e| e.payload),
+            Some(LogPayload::Command("SET status=active".to_string()))
         );
     }
 }

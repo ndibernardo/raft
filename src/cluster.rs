@@ -238,8 +238,8 @@ mod proptest_tests {
                         )
                     });
                     assert_eq!(
-                        (ei.term, &ei.command),
-                        (ej.term, &ej.command),
+                        (ei.term, &ei.payload),
+                        (ej.term, &ej.payload),
                         "state machine safety violated at index {idx}: \
                          nodes {i} and {j} have different committed entries"
                     );
