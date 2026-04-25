@@ -4,7 +4,7 @@ use super::log::LogEntry;
 use super::primitives::{LogIndex, NodeId, Term};
 
 /// RequestVote RPC arguments.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestVote {
     pub term: Term,
     pub candidate_id: NodeId,
@@ -13,14 +13,14 @@ pub struct RequestVote {
 }
 
 /// RequestVote RPC response.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RequestVoteResponse {
     pub term: Term,
     pub vote_granted: bool,
 }
 
 /// AppendEntries RPC arguments.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AppendEntries<Cmd> {
     pub term: Term,
     pub leader_id: NodeId,
@@ -31,7 +31,7 @@ pub struct AppendEntries<Cmd> {
 }
 
 /// AppendEntries RPC response.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum AppendEntriesResponse {
     Accepted { term: Term, match_index: LogIndex },
     /// Term mismatch or log inconsistency; match_index is undefined.
@@ -47,7 +47,7 @@ impl AppendEntriesResponse {
 }
 
 /// All possible Raft messages.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Message<Cmd> {
     RequestVote(RequestVote),
     RequestVoteResponse(RequestVoteResponse),

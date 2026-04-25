@@ -10,6 +10,7 @@ use crate::types::{
 
 /// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
 /// responding to any RPC — persisting after responding violates Raft's safety guarantees.
+#[derive(Debug)]
 pub struct PersistentState<Cmd> {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
@@ -48,11 +49,13 @@ impl<Cmd: Clone> PersistentState<Cmd> {
 }
 
 /// §Figure 2: commit_index and last_applied. Reset to zero on every restart — not persisted.
+#[derive(Debug)]
 pub struct VolatileState {
     pub commit_index: LogIndex,
     pub last_applied: LogIndex,
 }
 
+#[derive(Debug)]
 pub enum Role {
     Follower(Follower),
     Candidate(Candidate),
@@ -66,6 +69,7 @@ pub struct Applied<'a, Cmd> {
     pub command: &'a Cmd,
 }
 
+#[derive(Debug)]
 pub struct Node<Cmd> {
     pub id: NodeId,
     pub peers: Vec<NodeId>,
@@ -196,6 +200,9 @@ impl<Cmd: Clone> Node<Cmd> {
         if vote_granted {
             self.persistent.voted_for = Some(req.candidate_id);
             reset_timer = true;
+            info!(node = %self.id, term = %self.persistent.current_term, candidate = %req.candidate_id, "vote granted");
+        } else {
+            debug!(node = %self.id, term = %self.persistent.current_term, candidate = %req.candidate_id, "vote denied");
         }
 
         let mut commands = Vec::new();
@@ -249,6 +256,7 @@ impl<Cmd: Clone> Node<Cmd> {
             Role::Candidate(candidate) => {
                 if resp.vote_granted {
                     candidate.record_vote(from);
+                    debug!(node = %self.id, term = %self.persistent.current_term, from = %from, "vote received");
                 }
                 candidate.has_majority(self.peers.len() + 1)
             }
@@ -300,6 +308,9 @@ impl<Cmd: Clone> Node<Cmd> {
 
             let entries = self.entries_from(next_index);
 
+            if !entries.is_empty() {
+                debug!(node = %self.id, peer = %peer, count = entries.len(), prev_index = %prev_log_index, "replicating entries");
+            }
             commands.push(Command::Send {
                 to: peer,
                 message: Message::AppendEntries(AppendEntries {
@@ -346,6 +357,7 @@ impl<Cmd: Clone> Node<Cmd> {
             self.become_follower(req.term, Some(req.leader_id));
         }
         if req.term < self.persistent.current_term {
+            debug!(node = %self.id, our_term = %self.persistent.current_term, their_term = %req.term, leader = %from, "append entries rejected: stale term");
             return vec![Command::Send {
                 to: from,
                 message: Message::AppendEntriesResponse(AppendEntriesResponse::Rejected {
@@ -368,6 +380,7 @@ impl<Cmd: Clone> Node<Cmd> {
         let mut commands = vec![Command::ResetElectionTimer];
 
         if !self.check_log_consistency(req.prev_log_index, req.prev_log_term) {
+            debug!(node = %self.id, leader = %from, prev_index = %req.prev_log_index, prev_term = %req.prev_log_term, "append entries rejected: log inconsistency");
             commands.push(Command::Send {
                 to: from,
                 message: Message::AppendEntriesResponse(AppendEntriesResponse::Rejected {
@@ -377,7 +390,11 @@ impl<Cmd: Clone> Node<Cmd> {
             return commands;
         }
 
+        let entry_count = req.entries.len();
         self.append_entries(req.prev_log_index, req.entries);
+        if entry_count > 0 {
+            debug!(node = %self.id, leader = %from, count = entry_count, match_index = %self.last_log_index(), "entries appended");
+        }
 
         if req.leader_commit > self.volatile.commit_index {
             self.volatile.commit_index = std::cmp::min(req.leader_commit, self.last_log_index());
@@ -429,6 +446,7 @@ impl<Cmd: Clone> Node<Cmd> {
             }
             (Role::Leader(leader), AppendEntriesResponse::Rejected { .. }) => {
                 leader.record_failure(from);
+                debug!(node = %self.id, peer = %from, "replication rejected, decrementing next_index");
                 false
             }
             _ => false,
@@ -452,8 +470,9 @@ impl<Cmd: Clone> Node<Cmd> {
             payload: LogPayload::Command(command),
         };
         self.persistent.log.push(entry);
-
-        Some(self.last_log_index())
+        let index = self.last_log_index();
+        debug!(node = %self.id, term = %self.persistent.current_term, index = %index, "command appended to log");
+        Some(index)
     }
 
     /// Figure 2, Rules for Servers (Leaders): if there exists N > commitIndex such that a
@@ -521,6 +540,7 @@ impl<Cmd: Clone> Node<Cmd> {
             match insert_index.to_array_index() {
                 Some(idx) if idx < self.persistent.log.len() => {
                     if self.persistent.log[idx].term != entry.term {
+                        debug!(node = %self.id, truncate_from = idx + 1, "log truncated on conflict");
                         self.persistent.log.truncate(idx);
                         self.persistent.log.push(entry);
                     }

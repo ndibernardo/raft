@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 /// §5.1: followers are passive — they issue no requests, only respond to RPCs from
 /// leaders and candidates. If a follower receives no communication, it starts an election.
+#[derive(Debug)]
 pub struct Follower {
     leader_id: Option<NodeId>,
 }
@@ -29,6 +30,7 @@ impl Default for Follower {
 
 /// §5.2: a candidate requests votes from peers to win an election. It votes for itself
 /// and wins if it receives votes from a majority of servers in the full cluster.
+#[derive(Debug)]
 pub struct Candidate {
     votes_received: HashSet<NodeId>,
 }
@@ -54,6 +56,7 @@ impl Candidate {
 
 /// §5.3, Figure 2, Volatile state on leaders (reinitialized after election).
 /// The leader maintains next_index and match_index for each follower to track replication.
+#[derive(Debug)]
 pub struct Leader {
     next_index: HashMap<NodeId, LogIndex>,  // next log index to send to each server
     match_index: HashMap<NodeId, LogIndex>, // highest log index known to be replicated
