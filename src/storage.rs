@@ -149,7 +149,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_storage_term_and_vote() {
+    fn term_and_vote_round_trip_through_storage() {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
         assert_eq!(storage.current_term().unwrap(), Term::default());
@@ -163,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_storage_append_and_read() {
+    fn appended_entry_is_readable_by_index() {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
         let idx = storage
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_storage_truncate() {
+    fn truncate_from_removes_entries_from_index_inclusive() {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
         storage
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_storage_append_entries_with_conflict() {
+    fn append_entries_replaces_conflicting_entry_and_trims_tail() {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
         storage

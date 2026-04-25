@@ -333,6 +333,17 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_log_file_returns_corrupt_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("log.jsonl"), b"not valid json\n")
+            .expect("write corrupt log");
+
+        let result = FileStorage::<String>::open(tmp.path());
+
+        assert!(matches!(result, Err(FileStorageError::Corrupt(_))));
+    }
+
+    #[test]
     fn noop_entry_round_trips() {
         let tmp = tempfile::tempdir().expect("tempdir");
         {

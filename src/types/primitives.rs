@@ -103,3 +103,55 @@ impl From<u64> for NodeId {
         NodeId { value }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn term_increment_increases_by_one() {
+        assert_eq!(Term::from(3).increment(), Term::from(4));
+    }
+
+    #[test]
+    fn term_increment_saturates_at_max() {
+        assert_eq!(Term::from(u64::MAX).increment(), Term::from(u64::MAX));
+    }
+
+    #[test]
+    fn log_index_next_increases_by_one() {
+        assert_eq!(LogIndex::from(5).next(), LogIndex::from(6));
+    }
+
+    #[test]
+    fn log_index_next_saturates_at_max() {
+        assert_eq!(LogIndex::from(u64::MAX).next(), LogIndex::from(u64::MAX));
+    }
+
+    #[test]
+    fn log_index_prev_returns_predecessor() {
+        assert_eq!(LogIndex::from(3).prev(), Some(LogIndex::from(2)));
+    }
+
+    #[test]
+    fn log_index_prev_returns_none_at_zero() {
+        assert_eq!(LogIndex::default().prev(), None);
+    }
+
+    #[test]
+    fn log_index_to_array_index_returns_none_for_zero() {
+        assert_eq!(LogIndex::default().to_array_index(), None);
+    }
+
+    #[test]
+    fn log_index_to_array_index_returns_zero_based_offset() {
+        assert_eq!(LogIndex::from(1).to_array_index(), Some(0));
+        assert_eq!(LogIndex::from(3).to_array_index(), Some(2));
+    }
+
+    #[test]
+    fn log_index_from_length_maps_array_length_to_last_index() {
+        assert_eq!(LogIndex::from_length(0), LogIndex::default());
+        assert_eq!(LogIndex::from_length(3), LogIndex::from(3));
+    }
+}

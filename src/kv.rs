@@ -58,48 +58,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_and_get() {
+    fn get_returns_stored_value_after_set() {
         let mut store = KvStore::new();
 
         store.apply(KvCommand::Set {
-            key: "foo".to_string(),
-            value: "bar".to_string(),
+            key: "username".to_string(),
+            value: "alice".to_string(),
         });
 
-        let result = store.apply(KvCommand::Get {
-            key: "foo".to_string(),
-        });
+        let result = store.apply(KvCommand::Get { key: "username".to_string() });
 
-        assert_eq!(result, KvResult::Value(Some("bar".to_string())));
+        assert_eq!(result, KvResult::Value(Some("alice".to_string())));
     }
 
     #[test]
-    fn get_missing_key() {
+    fn get_returns_none_for_absent_key() {
         let mut store = KvStore::new();
 
-        let result = store.apply(KvCommand::Get {
-            key: "missing".to_string(),
-        });
+        let result = store.apply(KvCommand::Get { key: "username".to_string() });
 
         assert_eq!(result, KvResult::Value(None));
     }
 
     #[test]
-    fn delete() {
+    fn delete_removes_key_and_subsequent_get_returns_none() {
         let mut store = KvStore::new();
 
         store.apply(KvCommand::Set {
-            key: "foo".to_string(),
-            value: "bar".to_string(),
+            key: "username".to_string(),
+            value: "alice".to_string(),
         });
-        store.apply(KvCommand::Delete {
-            key: "foo".to_string(),
-        });
+        store.apply(KvCommand::Delete { key: "username".to_string() });
 
-        let result = store.apply(KvCommand::Get {
-            key: "foo".to_string(),
-        });
+        let result = store.apply(KvCommand::Get { key: "username".to_string() });
 
         assert_eq!(result, KvResult::Value(None));
+    }
+
+    #[test]
+    fn delete_on_absent_key_returns_ok() {
+        let mut store = KvStore::new();
+
+        let result = store.apply(KvCommand::Delete { key: "username".to_string() });
+
+        assert_eq!(result, KvResult::Ok);
     }
 }
