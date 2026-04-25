@@ -29,7 +29,12 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
             .map(|&id| {
                 let peers: Vec<NodeId> = ids.iter().filter(|&&p| p != id).copied().collect();
                 let node = Node::new(id, peers);
-                Runtime::new(node, S::default(), MemoryStorage::new(), TimerConfig::default())
+                Runtime::new(
+                    node,
+                    S::default(),
+                    MemoryStorage::new(),
+                    TimerConfig::default(),
+                )
             })
             .collect();
 
@@ -53,7 +58,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     pub fn election_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
             .handle(crate::runtime::Event::ElectionTimeout)
-            .unwrap();
+            .unwrap_or_else(|e| match e {});
         self.queue_commands(index, commands);
     }
 
@@ -61,7 +66,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     pub fn heartbeat_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
             .handle(crate::runtime::Event::HeartbeatTimeout)
-            .unwrap();
+            .unwrap_or_else(|e| match e {});
         self.queue_commands(index, commands);
     }
 
@@ -91,7 +96,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
                     from: inflight.from,
                     message: inflight.message,
                 })
-                .unwrap();
+                .unwrap_or_else(|e| match e {});
             self.queue_commands(index, commands);
         }
     }
@@ -112,9 +117,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
 
     /// Find runtime index by node ID.
     fn node_index(&self, id: NodeId) -> Option<usize> {
-        self.runtimes
-            .iter()
-            .position(|rt| rt.node().id == id)
+        self.runtimes.iter().position(|rt| rt.node().id == id)
     }
 
     /// Find the current leader, if any.
@@ -217,8 +220,7 @@ mod proptest_tests {
             for j in (i + 1)..N {
                 let ni = cluster.runtime(i).node();
                 let nj = cluster.runtime(j).node();
-                let min_commit =
-                    std::cmp::min(ni.volatile.commit_index, nj.volatile.commit_index);
+                let min_commit = std::cmp::min(ni.volatile.commit_index, nj.volatile.commit_index);
 
                 let mut idx = LogIndex::from(1u64);
                 while idx <= min_commit {
@@ -327,9 +329,12 @@ mod tests {
         );
 
         // Verify state machine applied on leader.
-        let result = cluster.runtime_mut(0).state_machine_mut().apply(KvCommand::Get {
-            key: "x".to_string(),
-        });
+        let result = cluster
+            .runtime_mut(0)
+            .state_machine_mut()
+            .apply(KvCommand::Get {
+                key: "x".to_string(),
+            });
         assert_eq!(result, KvResult::Value(Some("1".to_string())));
     }
 
