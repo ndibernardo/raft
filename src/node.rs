@@ -535,6 +535,21 @@ impl<Cmd: Clone> Node<Cmd> {
 }
 
 #[cfg(test)]
+impl<Cmd: Clone> Node<Cmd> {
+    fn force_term(&mut self, term: Term) {
+        self.persistent.current_term = term;
+    }
+
+    fn force_vote(&mut self, candidate: NodeId) {
+        self.persistent.voted_for = Some(candidate);
+    }
+
+    fn push_entry(&mut self, entry: LogEntry<Cmd>) {
+        self.persistent.log.push(entry);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -659,8 +674,8 @@ mod tests {
     #[test]
     fn node_grants_vote_in_new_term() {
         let mut n = node(1, &[2, 3]);
-        n.persistent.current_term = Term::from(1);
-        n.persistent.voted_for = Some(NodeId::from(2));
+        n.force_term(Term::from(1));
+        n.force_vote(NodeId::from(2));
 
         let req = RequestVote {
             term: Term::from(2),
@@ -675,7 +690,7 @@ mod tests {
     #[test]
     fn node_rejects_vote_with_stale_log() {
         let mut n = node(1, &[2, 3]);
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(2),
             payload: LogPayload::Command("SET name=miles".to_string()),
         });
@@ -712,7 +727,7 @@ mod tests {
     #[test]
     fn append_entries_rejects_stale_term() {
         let mut n = node(1, &[2, 3]);
-        n.persistent.current_term = Term::from(5);
+        n.force_term(Term::from(5));
 
         let req = AppendEntries {
             term: Term::from(3),
@@ -755,11 +770,11 @@ mod tests {
     #[test]
     fn append_entries_truncates_on_conflict() {
         let mut n = node(1, &[2, 3]);
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET name=miles".to_string()),
         });
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET status=pending".to_string()),
         });
@@ -888,9 +903,9 @@ mod tests {
         // must not advance commitIndex to an entry whose term < currentTerm even when
         // it has majority replication — only a current-term entry may trigger the commit.
         let mut n = node(1, &[2, 3]);
-        n.persistent.current_term = Term::from(2);
-        n.persistent.voted_for = Some(NodeId::from(1));
-        n.persistent.log.push(LogEntry {
+        n.force_term(Term::from(2));
+        n.force_vote(NodeId::from(1));
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET name=miles".to_string()),
         });
@@ -915,11 +930,11 @@ mod tests {
         let mut n = node(1, &[2, 3]);
 
         // Add entries to log.
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET name=miles".to_string()),
         });
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET counter=1".to_string()),
         });
@@ -948,7 +963,7 @@ mod tests {
     fn take_entry_to_apply_advances_last_applied() {
         let mut n = node(1, &[2, 3]);
 
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET counter=1".to_string()),
         });
@@ -982,11 +997,11 @@ mod tests {
         let mut n = node(1, &[2, 3]);
 
         // no-op at index 1, real command at index 2.
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::NoOp,
         });
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET price=100".to_string()),
         });
@@ -1057,7 +1072,7 @@ mod tests {
     #[test]
     fn stale_vote_response_is_ignored() {
         let mut n = node(1, &[2, 3]);
-        n.persistent.current_term = Term::from(3);
+        n.force_term(Term::from(3));
 
         let cmds = n.handle_request_vote_response(
             NodeId::from(2),
@@ -1072,7 +1087,7 @@ mod tests {
     fn vote_response_is_ignored_when_not_candidate() {
         // same-term response so term guards don't fire; role check must reject
         let mut n = node(1, &[2, 3]);
-        n.persistent.current_term = Term::from(1);
+        n.force_term(Term::from(1));
 
         let cmds = n.handle_request_vote_response(
             NodeId::from(2),
@@ -1086,7 +1101,7 @@ mod tests {
     #[test]
     fn append_entries_rejects_on_prev_term_mismatch() {
         let mut n = node(1, &[2, 3]);
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET counter=1".to_string()),
         });
@@ -1107,7 +1122,7 @@ mod tests {
     #[test]
     fn follower_advances_commit_index_from_leader_commit() {
         let mut n = node(1, &[2, 3]);
-        n.persistent.log.push(LogEntry {
+        n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET counter=1".to_string()),
         });
