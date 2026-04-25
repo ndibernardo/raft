@@ -98,6 +98,12 @@ impl fmt::Display for NodeId {
     }
 }
 
+impl NodeId {
+    pub fn value(self) -> u64 {
+        self.value
+    }
+}
+
 impl From<u64> for NodeId {
     fn from(value: u64) -> Self {
         NodeId { value }
