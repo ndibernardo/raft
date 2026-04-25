@@ -401,17 +401,14 @@ impl<Cmd: Clone> Node<Cmd> {
 
     /// §5.3 Log Matching: reject if prev_log_index/term don't match our log (Figure 2 §2).
     fn check_log_consistency(&self, prev_log_index: LogIndex, prev_log_term: Term) -> bool {
-        if prev_log_index == LogIndex::default() {
-            return prev_log_term == Term::default();
-        }
-
         match prev_log_index.to_array_index() {
+            // Index 0 is the implicit sentinel: term must also be 0.
+            None => prev_log_term == Term::default(),
             Some(idx) => self
                 .persistent
                 .log
                 .get(idx)
                 .is_some_and(|entry| entry.term == prev_log_term),
-            None => false,
         }
     }
 
@@ -1058,5 +1055,76 @@ mod tests {
         assert_eq!(restored.persistent.voted_for, n.persistent.voted_for);
         assert_eq!(restored.persistent.log.len(), n.persistent.log.len());
         assert!(is_follower(&restored));
+    }
+
+    #[test]
+    fn stale_vote_response_is_ignored() {
+        let mut n = node(1, &[2, 3]);
+        n.persistent.current_term = Term::from(3);
+
+        let cmds = n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+        );
+
+        assert!(cmds.is_empty());
+        assert!(is_follower(&n));
+    }
+
+    #[test]
+    fn vote_response_is_ignored_when_not_candidate() {
+        // same-term response so term guards don't fire; role check must reject
+        let mut n = node(1, &[2, 3]);
+        n.persistent.current_term = Term::from(1);
+
+        let cmds = n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+        );
+
+        assert!(cmds.is_empty());
+        assert!(is_follower(&n));
+    }
+
+    #[test]
+    fn append_entries_rejects_on_prev_term_mismatch() {
+        let mut n = node(1, &[2, 3]);
+        n.persistent.log.push(LogEntry {
+            term: Term::from(1),
+            command: Some("SET counter=1".to_string()),
+        });
+
+        let req = AppendEntries {
+            term: Term::from(2),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::from(1),
+            prev_log_term: Term::from(2), // mismatches our term 1 at index 1
+            entries: vec![],
+            leader_commit: LogIndex::default(),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(2), req);
+
+        assert!(!extract_append_success(&cmds));
+    }
+
+    #[test]
+    fn follower_advances_commit_index_from_leader_commit() {
+        let mut n = node(1, &[2, 3]);
+        n.persistent.log.push(LogEntry {
+            term: Term::from(1),
+            command: Some("SET counter=1".to_string()),
+        });
+
+        let req = AppendEntries {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::from(1),
+            prev_log_term: Term::from(1),
+            entries: vec![],
+            leader_commit: LogIndex::from(1),
+        };
+        n.handle_append_entries(NodeId::from(2), req);
+
+        assert_eq!(n.volatile.commit_index, LogIndex::from(1));
     }
 }

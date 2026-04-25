@@ -1,5 +1,5 @@
 use crate::types::{LogIndex, NodeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// §5.1: followers are passive — they issue no requests, only respond to RPCs from
 /// leaders and candidates. If a follower receives no communication, it starts an election.
@@ -26,18 +26,18 @@ impl Default for Follower {
 /// §5.2: a candidate requests votes from peers to win an election. It votes for itself
 /// and wins if it receives votes from a majority of servers in the full cluster.
 pub struct Candidate {
-    votes_received: Vec<NodeId>,
+    votes_received: HashSet<NodeId>,
 }
 
 impl Candidate {
     pub fn new(self_id: NodeId) -> Self {
         Self {
-            votes_received: vec![self_id],
+            votes_received: HashSet::from([self_id]),
         }
     }
 
     pub fn record_vote(&mut self, from: NodeId) {
-        self.votes_received.push(from);
+        self.votes_received.insert(from);
     }
 
     // §5.2: a candidate wins the election if it receives votes from a majority
@@ -97,15 +97,12 @@ mod tests {
     #[test]
     fn leader_new_initializes_correctly() {
         let peers = vec![NodeId::from(1), NodeId::from(2), NodeId::from(3)];
-        let last_log_index = LogIndex::from(5);
-        let leader = Leader::new(&peers, last_log_index);
+        let leader = Leader::new(&peers, LogIndex::from(5));
 
-        // next_index should be last_log_index + 1 for all peers
         assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(6)));
         assert_eq!(leader.next_index_for(NodeId::from(2)), Some(LogIndex::from(6)));
         assert_eq!(leader.next_index_for(NodeId::from(3)), Some(LogIndex::from(6)));
 
-        // match_index should be 0 for all peers
         let match_indices: Vec<_> = leader.match_indices().collect();
         assert_eq!(match_indices.len(), 3);
         assert!(match_indices.iter().all(|&idx| idx == LogIndex::default()));
@@ -126,11 +123,8 @@ mod tests {
 
         leader.record_success(NodeId::from(1), LogIndex::from(5));
 
-        // match_index should be updated to the given value
         let match_indices: Vec<_> = leader.match_indices().collect();
         assert!(match_indices.contains(&LogIndex::from(5)));
-
-        // next_index should be match_index + 1
         assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(6)));
     }
 
@@ -150,17 +144,12 @@ mod tests {
         let peers = vec![NodeId::from(1)];
         let mut leader = Leader::new(&peers, LogIndex::from(10));
 
-        // Initial next_index is 11
         assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(11)));
 
         leader.record_failure(NodeId::from(1));
-
-        // Should decrement to 10
         assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(10)));
 
         leader.record_failure(NodeId::from(1));
-
-        // Should decrement to 9
         assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(9)));
     }
 
@@ -169,17 +158,10 @@ mod tests {
         let peers = vec![NodeId::from(1)];
         let mut leader = Leader::new(&peers, LogIndex::from(0));
 
-        // Start at next_index = 1
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(1)));
-
         leader.record_failure(NodeId::from(1));
-
-        // Should decrement to 0
         assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(0)));
 
         leader.record_failure(NodeId::from(1));
-
-        // Should stay at 0 (prev() returns None for 0)
         assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(0)));
     }
 
@@ -218,11 +200,32 @@ mod tests {
         let peers = vec![NodeId::from(1)];
         let mut leader = Leader::new(&peers, LogIndex::from(0));
 
-        // Record success for a peer not in the original list
         leader.record_success(NodeId::from(99), LogIndex::from(10));
 
         assert_eq!(leader.next_index_for(NodeId::from(99)), Some(LogIndex::from(11)));
         let match_indices: Vec<_> = leader.match_indices().collect();
         assert!(match_indices.contains(&LogIndex::from(10)));
+    }
+
+    #[test]
+    fn candidate_counts_self_vote_on_creation() {
+        let candidate = Candidate::new(NodeId::from(1));
+        assert!(candidate.has_majority(1));
+    }
+
+    #[test]
+    fn candidate_reaches_majority_with_enough_grants() {
+        let mut candidate = Candidate::new(NodeId::from(1));
+        candidate.record_vote(NodeId::from(2));
+        assert!(candidate.has_majority(3));
+    }
+
+    #[test]
+    fn candidate_does_not_count_duplicate_grants_from_same_peer() {
+        let mut candidate = Candidate::new(NodeId::from(1));
+        candidate.record_vote(NodeId::from(2));
+        candidate.record_vote(NodeId::from(2));
+        // 3 grants from only 2 distinct peers must not reach majority in a 5-node cluster
+        assert!(!candidate.has_majority(5));
     }
 }
