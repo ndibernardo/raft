@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
 # End-to-end integration test for a 3-node raft cluster.
-# Usage: ./scripts/test-cluster.sh
+# Usage: ./scripts/test-cluster.sh [--logs]
+#
+#   --logs   stream node logs to stderr in real-time
+#
+# Set RUST_LOG to control log verbosity (default: raft=info).
+# Examples:
+#   RUST_LOG=raft=debug ./scripts/test-cluster.sh --logs
+#   RUST_LOG=raft=trace ./scripts/test-cluster.sh --logs
 set -euo pipefail
+
+SHOW_LOGS=0
+for arg in "$@"; do
+    case "$arg" in
+        --logs) SHOW_LOGS=1 ;;
+        *) echo "unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
 
 # Find project root (directory containing Cargo.toml)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,14 +48,24 @@ echo ""
 
 DATA=$(mktemp -d)
 PIDS=()
+TAIL_PID=""
 
 cleanup() {
     for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+    [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
     rm -rf "$DATA"
 }
 trap cleanup EXIT
 
 echo "Starting 3-node cluster (data: $DATA)..."
+
+# Pre-create log files so tail -f can open them before the processes write anything.
+touch "$DATA/node1.log" "$DATA/node2.log" "$DATA/node3.log"
+
+if [ "$SHOW_LOGS" = "1" ]; then
+    tail -f "$DATA/node1.log" "$DATA/node2.log" "$DATA/node3.log" >&2 &
+    TAIL_PID=$!
+fi
 
 "$BINARY" --id 1 --addr 127.0.0.1:9001 \
     --peer 2=127.0.0.1:9002 --peer 3=127.0.0.1:9003 \
