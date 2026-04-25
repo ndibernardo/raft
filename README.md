@@ -77,9 +77,16 @@ curl -X PUT http://127.0.0.1:8002/kv/db-primary -d "10.0.0.1:5432"   # 503 not t
 
 ## Testing
 
+Cargo is provided by the Nix flake. Enter the environment with `direnv allow` (first time only), then run the full suite:
+
 ```bash
 cargo test
 ```
+
+The suite covers:
+- **Unit tests** (`src/`) — node protocol logic, storage, state machine, transport
+- **Property tests** (`src/cluster.rs`) — randomised operation sequences verified against election-safety and state-machine-safety invariants
+- **Integration tests** (`tests/`) — end-to-end scenarios (election, replication, commit propagation, re-election) exercising the public API only
 
 ## References
 
