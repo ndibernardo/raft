@@ -4,12 +4,16 @@ use std::collections::{HashMap, HashSet};
 /// §5.1: followers are passive — they issue no requests, only respond to RPCs from
 /// leaders and candidates. If a follower receives no communication, it starts an election.
 pub struct Follower {
-    pub leader_id: Option<NodeId>,
+    leader_id: Option<NodeId>,
 }
 
 impl Follower {
     pub fn new() -> Self {
         Self { leader_id: None }
+    }
+
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.leader_id
     }
 
     pub fn set_leader(&mut self, leader_id: NodeId) {
