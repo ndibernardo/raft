@@ -1,11 +1,13 @@
+use std::collections::HashSet;
+
 use tracing::{debug, info};
 
 use crate::command::Command;
 use crate::state::{Candidate, Follower, Leader};
 use crate::storage::Storage;
 use crate::types::{
-    AppendEntries, AppendEntriesResponse, LogEntry, LogIndex, LogPayload, Message, NodeId,
-    RequestVote, RequestVoteResponse, Term,
+    AppendEntries, AppendEntriesResponse, ClusterConfig, LogEntry, LogIndex, LogPayload, Message,
+    NodeId, RequestVote, RequestVoteResponse, Term,
 };
 
 /// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
@@ -73,17 +75,29 @@ pub struct Applied<'a, Cmd> {
 pub struct Node<Cmd> {
     pub id: NodeId,
     pub peers: Vec<NodeId>,
+    /// Current effective cluster config (from latest ConfigChange in log, or initial_config).
+    pub config: ClusterConfig,
+    /// Config at startup — used as the floor when rescanning the log after a truncation
+    /// removes all ConfigChange entries.
+    initial_config: ClusterConfig,
     pub persistent: PersistentState<Cmd>,
     pub volatile: VolatileState,
     pub role: Role,
+    /// Configs applied on append (before commit). Drained by Runtime → Transport.
+    pending_config_changes: Vec<ClusterConfig>,
+    /// Configs that have just been committed. Drained by Server to resolve HTTP requests.
+    pending_committed_config_changes: Vec<(LogIndex, ClusterConfig)>,
 }
 
 impl<Cmd: Clone> Node<Cmd> {
     /// Starts as follower with no known leader (§5.1 initial state).
-    pub fn new(id: NodeId, peers: Vec<NodeId>) -> Self {
+    pub fn new(id: NodeId, config: ClusterConfig) -> Self {
+        let peers = config.peer_ids(id);
         Self {
             id,
             peers,
+            initial_config: config.clone(),
+            config,
             persistent: PersistentState {
                 current_term: Term::default(),
                 voted_for: None,
@@ -94,26 +108,38 @@ impl<Cmd: Clone> Node<Cmd> {
                 last_applied: LogIndex::default(),
             },
             role: Role::Follower(Follower::new()),
+            pending_config_changes: Vec::new(),
+            pending_committed_config_changes: Vec::new(),
         }
     }
 
     /// Crash recovery: restore term, vote, and log from durable storage, restart as follower.
+    /// Derives the current config from the latest ConfigChange entry in the restored log.
     pub fn from_storage<S: Storage<Cmd>>(
         id: NodeId,
-        peers: Vec<NodeId>,
+        initial_config: ClusterConfig,
         storage: &S,
     ) -> Result<Self, S::Error> {
         let persistent = PersistentState::load(storage)?;
-        Ok(Self {
+        let peers = initial_config.peer_ids(id);
+        let mut node = Self {
             id,
             peers,
+            config: initial_config.clone(),
+            initial_config,
             persistent,
             volatile: VolatileState {
                 commit_index: LogIndex::default(),
                 last_applied: LogIndex::default(),
             },
             role: Role::Follower(Follower::new()),
-        })
+            pending_config_changes: Vec::new(),
+            pending_committed_config_changes: Vec::new(),
+        };
+        // Replay the latest config from the restored log so peers and transport
+        // are updated correctly on restart.
+        node.apply_latest_config_from_log();
+        Ok(node)
     }
 
     /// Must be called before responding to any RPC (§5.1 durability requirement).
@@ -148,6 +174,49 @@ impl<Cmd: Clone> Node<Cmd> {
             .log
             .last()
             .map_or(Term::default(), |entry| entry.term)
+    }
+
+    /// Apply a new cluster config: updates peers, leader tracking maps, and emits a
+    /// pending notification so the transport is updated before the next heartbeat.
+    fn set_config(&mut self, config: ClusterConfig) {
+        let new_peers: Vec<NodeId> = config.peer_ids(self.id);
+        let last = LogIndex::from_length(self.persistent.log.len());
+        let old_peers: HashSet<NodeId> = self.peers.iter().copied().collect();
+        let new_peer_set: HashSet<NodeId> = new_peers.iter().copied().collect();
+
+        if let Role::Leader(leader) = &mut self.role {
+            for &peer in &new_peers {
+                if !old_peers.contains(&peer) {
+                    leader.add_peer(peer, last);
+                }
+            }
+            for &old_peer in &old_peers {
+                if !new_peer_set.contains(&old_peer) {
+                    leader.remove_peer(old_peer);
+                }
+            }
+        }
+
+        self.peers = new_peers;
+        self.config = config.clone();
+        self.pending_config_changes.push(config);
+    }
+
+    /// Scan the log backward for the latest ConfigChange entry and apply it.
+    /// Called after a truncation (which may have removed a previously active config)
+    /// and on startup (to replay the config from a recovered log).
+    fn apply_latest_config_from_log(&mut self) {
+        let latest = self.persistent.log.iter().rev().find_map(|e| {
+            if let LogPayload::ConfigChange(c) = &e.payload {
+                Some(c.clone())
+            } else {
+                None
+            }
+        });
+        let config = latest.unwrap_or_else(|| self.initial_config.clone());
+        if config != self.config {
+            self.set_config(config);
+        }
     }
 
     /// Leaders ignore; followers and candidates start a new election.
@@ -296,9 +365,13 @@ impl<Cmd: Clone> Node<Cmd> {
             return Vec::new();
         };
 
+        // Collect tracked peers upfront to avoid a borrow-checker conflict: the iterator
+        // borrows `leader` (which borrows `self.role`), but the loop body also needs `&self`
+        // to call term_at / entries_from.
+        let peers: Vec<NodeId> = leader.tracked_peers().collect();
         let mut commands = Vec::new();
 
-        for &peer in &self.peers {
+        for peer in peers {
             let next_index = leader
                 .next_index_for(peer)
                 .unwrap_or_else(|| self.last_log_index().next());
@@ -475,6 +548,41 @@ impl<Cmd: Clone> Node<Cmd> {
         Some(index)
     }
 
+    /// Propose a membership change. Returns the log index of the ConfigChange entry,
+    /// or None if not the leader or another change is already uncommitted.
+    ///
+    /// The new config takes effect immediately on append (dissertation §4.1).
+    pub fn propose_config_change(&mut self, config: ClusterConfig) -> Option<LogIndex> {
+        if !matches!(self.role, Role::Leader(_)) {
+            return None;
+        }
+        if self.has_pending_config_change() {
+            debug!(node = %self.id, "config change rejected: another change is pending");
+            return None;
+        }
+        let entry = LogEntry {
+            term: self.persistent.current_term,
+            payload: LogPayload::ConfigChange(config.clone()),
+        };
+        self.persistent.log.push(entry);
+        let index = self.last_log_index();
+        // Takes effect immediately on append — quorum calculations use the new config
+        // before the entry is committed.
+        self.set_config(config);
+        info!(node = %self.id, term = %self.persistent.current_term, index = %index, members = self.config.size(), "config change proposed");
+        Some(index)
+    }
+
+    /// Returns true if there is a ConfigChange entry in the uncommitted suffix.
+    /// Used to enforce the one-change-at-a-time rule of single-server changes.
+    fn has_pending_config_change(&self) -> bool {
+        let committed = self.volatile.commit_index;
+        self.persistent.log.iter().enumerate().any(|(i, e)| {
+            let index = LogIndex::from((i + 1) as u64);
+            index > committed && matches!(e.payload, LogPayload::ConfigChange(_))
+        })
+    }
+
     /// Figure 2, Rules for Servers (Leaders): if there exists N > commitIndex such that a
     /// majority of matchIndex[i] >= N and log[N].term == currentTerm, set commitIndex = N.
     /// §5.4.2, Figure 8: a leader may only commit entries from its current term directly;
@@ -512,7 +620,8 @@ impl<Cmd: Clone> Node<Cmd> {
         self.volatile.commit_index > self.volatile.last_applied
     }
 
-    /// §5.3: no-op entries advance last_applied but are not returned to the caller.
+    /// §5.3: no-op and config-change entries advance last_applied but are not returned
+    /// to the caller. Config changes are buffered in pending_committed_config_changes.
     pub fn take_entry_to_apply(&mut self) -> Option<Applied<'_, Cmd>> {
         loop {
             if self.volatile.last_applied >= self.volatile.commit_index {
@@ -527,29 +636,61 @@ impl<Cmd: Clone> Node<Cmd> {
 
             match &entry.payload {
                 LogPayload::NoOp => {}
+                LogPayload::ConfigChange(cfg) => {
+                    // Already applied to self.config/self.peers on append.
+                    // Buffer the commit notification for Server to resolve HTTP requests.
+                    let cfg = cfg.clone();
+                    self.pending_committed_config_changes.push((index, cfg));
+                }
                 LogPayload::Command(command) => return Some(Applied { index, command }),
             }
         }
     }
 
+    /// Newly applied (appended, not necessarily committed) configs.
+    /// Runtime passes these to Transport so RPCs to new peers can be sent immediately.
+    pub fn take_config_changes(&mut self) -> Vec<ClusterConfig> {
+        std::mem::take(&mut self.pending_config_changes)
+    }
+
+    /// Committed config changes with their log index.
+    /// Server uses these to resolve pending membership HTTP requests.
+    pub fn take_committed_config_changes(&mut self) -> Vec<(LogIndex, ClusterConfig)> {
+        std::mem::take(&mut self.pending_committed_config_changes)
+    }
+
     /// §5.3 Figure 2 AppendEntries §3–5: truncates on conflict (same index, different term).
+    /// Calls apply_latest_config_from_log if a truncation occurred or a ConfigChange was added,
+    /// because a truncation may have removed a previously active config.
     fn append_entries(&mut self, prev_log_index: LogIndex, entries: Vec<LogEntry<Cmd>>) {
         let mut insert_index = prev_log_index.next();
+        let mut config_updated = false;
 
         for entry in entries {
+            let is_config = matches!(entry.payload, LogPayload::ConfigChange(_));
             match insert_index.to_array_index() {
                 Some(idx) if idx < self.persistent.log.len() => {
                     if self.persistent.log[idx].term != entry.term {
                         debug!(node = %self.id, truncate_from = idx + 1, "log truncated on conflict");
                         self.persistent.log.truncate(idx);
                         self.persistent.log.push(entry);
+                        // Truncation may have removed a ConfigChange; rescan needed.
+                        config_updated = true;
                     }
+                    // Same term at this index: entry already present, skip.
                 }
                 _ => {
                     self.persistent.log.push(entry);
+                    if is_config {
+                        config_updated = true;
+                    }
                 }
             }
             insert_index = insert_index.next();
+        }
+
+        if config_updated {
+            self.apply_latest_config_from_log();
         }
     }
 }
@@ -573,11 +714,20 @@ impl<Cmd: Clone> Node<Cmd> {
 mod tests {
     use super::*;
 
+    fn test_addr(id: u64) -> std::net::SocketAddr {
+        format!("127.0.0.1:{}", 9000 + id).parse().unwrap()
+    }
+
+    fn test_config(id: u64, peer_ids: &[u64]) -> ClusterConfig {
+        let members = std::iter::once(id)
+            .chain(peer_ids.iter().copied())
+            .map(|i| (NodeId::from(i), test_addr(i)))
+            .collect();
+        ClusterConfig::new(members)
+    }
+
     fn node(id: u64, peers: &[u64]) -> Node<String> {
-        Node::new(
-            NodeId::from(id),
-            peers.iter().map(|&p| NodeId::from(p)).collect(),
-        )
+        Node::new(NodeId::from(id), test_config(id, peers))
     }
 
     fn is_follower(node: &Node<String>) -> bool {
@@ -918,10 +1068,6 @@ mod tests {
     fn leader_does_not_commit_entries_from_previous_term() {
         use crate::state::Leader as LeaderState;
 
-        // Build a leader in term 2 that has an old entry at index 1 (term 1) but no
-        // current-term entry yet.  This replicates the Figure 8 scenario: the leader
-        // must not advance commitIndex to an entry whose term < currentTerm even when
-        // it has majority replication — only a current-term entry may trigger the commit.
         let mut n = node(1, &[2, 3]);
         n.force_term(Term::from(2));
         n.force_vote(NodeId::from(1));
@@ -929,7 +1075,6 @@ mod tests {
             term: Term::from(1),
             payload: LogPayload::Command("SET name=miles".to_string()),
         });
-        // Set up leader state with next_index starting after the existing entry.
         n.role = Role::Leader(LeaderState::new(&n.peers, LogIndex::from(1)));
 
         // Peer 2 reports it has replicated the old entry.
@@ -949,7 +1094,6 @@ mod tests {
     fn take_entry_to_apply_returns_committed_entries() {
         let mut n = node(1, &[2, 3]);
 
-        // Add entries to log.
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET name=miles".to_string()),
@@ -959,7 +1103,6 @@ mod tests {
             payload: LogPayload::Command("SET counter=1".to_string()),
         });
 
-        // Commit first entry.
         n.volatile.commit_index = LogIndex::from(1);
 
         assert!(n.has_pending_applies());
@@ -969,7 +1112,6 @@ mod tests {
         assert!(!n.has_pending_applies());
         assert!(n.take_entry_to_apply().is_none());
 
-        // Commit second entry.
         n.volatile.commit_index = LogIndex::from(2);
 
         assert!(n.has_pending_applies());
@@ -1016,7 +1158,6 @@ mod tests {
     fn take_entry_to_apply_skips_noop() {
         let mut n = node(1, &[2, 3]);
 
-        // no-op at index 1, real command at index 2.
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::NoOp,
@@ -1027,7 +1168,6 @@ mod tests {
         });
         n.volatile.commit_index = LogIndex::from(2);
 
-        // First call must skip the no-op and return the real command.
         let applied = n.take_entry_to_apply().unwrap();
         assert_eq!(applied.index, LogIndex::from(2));
         assert_eq!(applied.command, &"SET price=100".to_string());
@@ -1038,12 +1178,12 @@ mod tests {
     #[test]
     fn candidate_steps_down_on_same_term_append_entries() {
         let mut n = node(1, &[2, 3]);
-        n.election_timeout(); // term 1, voted for self
+        n.election_timeout();
         assert!(is_candidate(&n));
         assert_eq!(n.persistent.voted_for, Some(NodeId::from(1)));
 
         let req = AppendEntries {
-            term: Term::from(1), // same term — leader already elected
+            term: Term::from(1),
             leader_id: NodeId::from(2),
             prev_log_index: LogIndex::default(),
             prev_log_term: Term::default(),
@@ -1052,7 +1192,6 @@ mod tests {
         };
         n.handle_append_entries(NodeId::from(2), req);
 
-        // must revert to follower but keep the vote (§5.2)
         assert!(is_follower(&n));
         assert_eq!(n.persistent.voted_for, Some(NodeId::from(1)));
     }
@@ -1076,9 +1215,12 @@ mod tests {
         let mut storage = MemoryStorage::new();
         n.save(&mut storage).unwrap();
 
-        let restored: Node<String> =
-            Node::from_storage(NodeId::from(1), vec![NodeId::from(2), NodeId::from(3)], &storage)
-                .unwrap();
+        let restored: Node<String> = Node::from_storage(
+            NodeId::from(1),
+            test_config(1, &[2, 3]),
+            &storage,
+        )
+        .unwrap();
 
         assert_eq!(
             restored.persistent.current_term,
@@ -1105,7 +1247,6 @@ mod tests {
 
     #[test]
     fn vote_response_is_ignored_when_not_candidate() {
-        // same-term response so term guards don't fire; role check must reject
         let mut n = node(1, &[2, 3]);
         n.force_term(Term::from(1));
 
@@ -1130,7 +1271,7 @@ mod tests {
             term: Term::from(2),
             leader_id: NodeId::from(2),
             prev_log_index: LogIndex::from(1),
-            prev_log_term: Term::from(2), // mismatches our term 1 at index 1
+            prev_log_term: Term::from(2),
             entries: vec![],
             leader_commit: LogIndex::default(),
         };
@@ -1158,5 +1299,79 @@ mod tests {
         n.handle_append_entries(NodeId::from(2), req);
 
         assert_eq!(n.volatile.commit_index, LogIndex::from(1));
+    }
+
+    #[test]
+    fn propose_config_change_fails_on_non_leader() {
+        let mut n = node(1, &[2, 3]);
+        let new_config = test_config(1, &[2, 3, 4]);
+        assert!(n.propose_config_change(new_config).is_none());
+    }
+
+    #[test]
+    fn propose_config_change_appends_entry_and_updates_peers() {
+        let mut n = node(1, &[2, 3]);
+        // Become leader.
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+        );
+        assert!(is_leader(&n));
+
+        let new_config = test_config(1, &[2, 3, 4]);
+        let index = n.propose_config_change(new_config);
+        assert!(index.is_some());
+
+        // Peers now include node 4.
+        assert!(n.peers.contains(&NodeId::from(4)));
+        // A ConfigChange entry was appended after the no-op.
+        assert!(matches!(
+            n.persistent.log.last().unwrap().payload,
+            LogPayload::ConfigChange(_)
+        ));
+    }
+
+    #[test]
+    fn second_config_change_rejected_while_first_uncommitted() {
+        let mut n = node(1, &[2, 3]);
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+        );
+
+        let config_a = test_config(1, &[2, 3, 4]);
+        let config_b = test_config(1, &[2, 3, 4, 5]);
+
+        assert!(n.propose_config_change(config_a).is_some());
+        assert!(n.propose_config_change(config_b).is_none(), "second change must be rejected");
+    }
+
+    #[test]
+    fn take_entry_to_apply_skips_config_change_and_buffers_committed() {
+        let mut n = node(1, &[2, 3]);
+        let new_config = test_config(1, &[2, 3, 4]);
+
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::ConfigChange(new_config.clone()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET city=amsterdam".to_string()),
+        });
+        n.volatile.commit_index = LogIndex::from(2);
+
+        // First call must skip the ConfigChange and return the Command.
+        let applied = n.take_entry_to_apply().unwrap();
+        assert_eq!(applied.index, LogIndex::from(2));
+        assert_eq!(applied.command, &"SET city=amsterdam".to_string());
+
+        // The committed config change must be buffered.
+        let committed = n.take_committed_config_changes();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].0, LogIndex::from(1));
+        assert_eq!(committed[0].1, new_config);
     }
 }
