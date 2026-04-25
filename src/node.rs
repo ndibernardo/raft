@@ -8,16 +8,15 @@ use crate::types::{
     RequestVoteResponse, Term,
 };
 
-/// Persistent state on all servers. Must survive crashes — updated on stable storage
-/// before responding to RPCs. Figure 2, State (persistent state on all servers).
+/// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
+/// responding to any RPC — persisting after responding violates Raft's safety guarantees.
 pub struct PersistentState<Cmd> {
-    pub current_term: Term,    // latest term server has seen (initialized to 0)
-    pub voted_for: Option<NodeId>, // candidateId that received vote in current term
-    pub log: Vec<LogEntry<Cmd>>, // log entries; each entry contains command and term
+    pub current_term: Term,
+    pub voted_for: Option<NodeId>,
+    pub log: Vec<LogEntry<Cmd>>,
 }
 
 impl<Cmd: Clone> PersistentState<Cmd> {
-    /// Load persistent state from storage.
     pub fn load<S: Storage<Cmd>>(storage: &S) -> Result<Self, S::Error> {
         Ok(Self {
             current_term: storage.current_term()?,
@@ -26,7 +25,6 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         })
     }
 
-    /// Save persistent state to storage.
     pub fn save<S: Storage<Cmd>>(&self, storage: &mut S) -> Result<(), S::Error> {
         storage.set_current_term(self.current_term)?;
         storage.set_voted_for(self.voted_for)?;
@@ -49,14 +47,12 @@ impl<Cmd: Clone> PersistentState<Cmd> {
     }
 }
 
-/// Volatile state on all servers. Reinitialized after a crash.
-/// Figure 2, State (volatile state on all servers).
+/// §Figure 2: commit_index and last_applied. Reset to zero on every restart — not persisted.
 pub struct VolatileState {
-    pub commit_index: LogIndex, // index of highest log entry known to be committed
-    pub last_applied: LogIndex, // index of highest log entry applied to state machine
+    pub commit_index: LogIndex,
+    pub last_applied: LogIndex,
 }
 
-/// Server role with associated state.
 pub enum Role {
     Follower(Follower),
     Candidate(Candidate),
@@ -70,7 +66,6 @@ pub struct Applied<'a, Cmd> {
     pub command: &'a Cmd,
 }
 
-/// A Raft node.
 pub struct Node<Cmd> {
     pub id: NodeId,
     pub peers: Vec<NodeId>,
@@ -80,7 +75,7 @@ pub struct Node<Cmd> {
 }
 
 impl<Cmd: Clone> Node<Cmd> {
-    /// Create a new node. Starts as follower with no known leader.
+    /// Starts as follower with no known leader (§5.1 initial state).
     pub fn new(id: NodeId, peers: Vec<NodeId>) -> Self {
         Self {
             id,
@@ -98,7 +93,7 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Create a node from persistent storage. Used for crash recovery.
+    /// Crash recovery: restore term, vote, and log from durable storage, restart as follower.
     pub fn from_storage<S: Storage<Cmd>>(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -117,7 +112,7 @@ impl<Cmd: Clone> Node<Cmd> {
         })
     }
 
-    /// Save current persistent state to storage.
+    /// Must be called before responding to any RPC (§5.1 durability requirement).
     pub fn save<S: Storage<Cmd>>(&self, storage: &mut S) -> Result<(), S::Error> {
         self.persistent.save(storage)
     }
@@ -151,7 +146,7 @@ impl<Cmd: Clone> Node<Cmd> {
             .map_or(Term::default(), |entry| entry.term)
     }
 
-    /// Called when election timer fires. Follower/Candidate starts new election.
+    /// Leaders ignore; followers and candidates start a new election.
     pub fn election_timeout(&mut self) -> Vec<Command<Cmd>> {
         match &self.role {
             Role::Leader(_) => Vec::new(),
@@ -159,8 +154,6 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    // §5.2: on election timeout, increment currentTerm, vote for self,
-    // reset election timer, send RequestVote to all other servers.
     fn start_election(&mut self) -> Vec<Command<Cmd>> {
         self.persistent.current_term = self.persistent.current_term.increment();
         self.persistent.voted_for = Some(self.id);
@@ -191,7 +184,7 @@ impl<Cmd: Clone> Node<Cmd> {
         commands
     }
 
-    /// Handle incoming RequestVote RPC. Figure 2, RequestVote RPC (receiver implementation).
+    /// §Figure 2 RequestVote RPC — receiver implementation.
     pub fn handle_request_vote(&mut self, from: NodeId, req: RequestVote) -> Vec<Command<Cmd>> {
         let mut reset_timer = false;
         if req.term > self.persistent.current_term {
@@ -233,13 +226,12 @@ impl<Cmd: Clone> Node<Cmd> {
         term_ok && vote_ok && log_ok
     }
 
-    /// §5.4.1: the candidate's log must be at least as up-to-date as any other log in the
-    /// cluster. Determined by comparing the last entry's term, then index.
+    /// §5.4.1: compare last-entry term first, then index.
     fn is_log_up_to_date(&self, candidate_term: Term, candidate_index: LogIndex) -> bool {
         (candidate_term, candidate_index) >= (self.last_log_term(), self.last_log_index())
     }
 
-    /// Handle incoming RequestVoteResponse RPC.
+    /// Step down on higher term; become leader on majority.
     pub fn handle_request_vote_response(
         &mut self,
         from: NodeId,
@@ -270,10 +262,8 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// §5.2: upon winning the election, send initial empty AppendEntries (heartbeats) to
-    /// each server. Figure 2, Rules for Servers (Leaders): initialize nextIndex and matchIndex.
-    /// §8: append a no-op entry so that entries from previous terms are committed indirectly
-    /// once the no-op reaches majority, avoiding the Figure 8 anomaly.
+    /// §8: no-op entry commits prior-term entries indirectly via Log Matching, avoiding the
+    /// Figure 8 anomaly where a leader cannot directly commit entries from previous terms.
     fn become_leader(&mut self) -> Vec<Command<Cmd>> {
         self.persistent.log.push(LogEntry {
             term: self.persistent.current_term,
@@ -284,7 +274,7 @@ impl<Cmd: Clone> Node<Cmd> {
         self.send_heartbeats()
     }
 
-    /// Called when heartbeat timer fires. Leader sends AppendEntries to all peers.
+    /// Leaders replicate and reset the heartbeat timer; non-leaders are no-ops.
     pub fn heartbeat_timeout(&mut self) -> Vec<Command<Cmd>> {
         match &self.role {
             Role::Leader(_) => self.send_heartbeats(),
@@ -292,8 +282,7 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    // §5.3, Figure 2, AppendEntries RPC (sender): for each peer, send entries starting at
-    // nextIndex. prev_log_index/term let the follower verify log consistency.
+    // §5.3: prev_log_index/term lets the follower detect a gap before accepting new entries.
     fn send_heartbeats(&self) -> Vec<Command<Cmd>> {
         let Role::Leader(leader) = &self.role else {
             return Vec::new();
@@ -347,7 +336,7 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Handle incoming AppendEntries RPC. Figure 2, AppendEntries RPC (receiver implementation).
+    /// §Figure 2 AppendEntries RPC — receiver implementation.
     pub fn handle_append_entries(
         &mut self,
         from: NodeId,
@@ -410,9 +399,7 @@ impl<Cmd: Clone> Node<Cmd> {
         commands
     }
 
-    /// §5.3 Log Matching Property: if two logs have an entry with the same index and term,
-    /// they are identical in all entries up through that index. Verified by checking
-    /// prev_log_index and prev_log_term before accepting new entries. Figure 2, §2.
+    /// §5.3 Log Matching: reject if prev_log_index/term don't match our log (Figure 2 §2).
     fn check_log_consistency(&self, prev_log_index: LogIndex, prev_log_term: Term) -> bool {
         if prev_log_index == LogIndex::default() {
             return prev_log_term == Term::default();
@@ -428,7 +415,7 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Handle incoming AppendEntriesResponse RPC (leader only).
+    /// Non-leaders and stale terms are no-ops; leaders update replication progress.
     pub fn handle_append_entries_response(
         &mut self,
         from: NodeId,
@@ -457,9 +444,7 @@ impl<Cmd: Clone> Node<Cmd> {
         Vec::new()
     }
 
-    /// §5.3: leader appends the command to its log as a new entry, then issues
-    /// AppendEntries in parallel to replicate. Returns the assigned log index, or None if
-    /// not leader. Figure 2, Rules for Servers (Leaders) §2.
+    /// Returns the assigned log index. None if not leader — caller must redirect.
     pub fn submit_command(&mut self, command: Cmd) -> Option<LogIndex> {
         if !matches!(self.role, Role::Leader(_)) {
             return None;
@@ -506,14 +491,12 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Returns true if there are committed entries waiting to be applied.
+    /// True when commit_index has advanced past last_applied.
     pub fn has_pending_applies(&self) -> bool {
         self.volatile.commit_index > self.volatile.last_applied
     }
 
-    /// Figure 2, Rules for Servers (All Servers): if commitIndex > lastApplied, increment
-    /// lastApplied and apply log[lastApplied] to the state machine. §5.3.
-    /// No-op entries (command = None) advance lastApplied but are not returned to the caller.
+    /// §5.3: no-op entries advance last_applied but are not returned to the caller.
     pub fn take_entry_to_apply(&mut self) -> Option<Applied<'_, Cmd>> {
         loop {
             if self.volatile.last_applied >= self.volatile.commit_index {
@@ -523,22 +506,16 @@ impl<Cmd: Clone> Node<Cmd> {
             self.volatile.last_applied = self.volatile.last_applied.next();
             let index = self.volatile.last_applied;
 
-            let Some(idx) = index.to_array_index() else {
-                return None;
-            };
-            let Some(entry) = self.persistent.log.get(idx) else {
-                return None;
-            };
+            let idx = index.to_array_index()?;
+            let entry = self.persistent.log.get(idx)?;
 
             if let Some(command) = &entry.command {
                 return Some(Applied { index, command });
             }
-            // no-op entry — advance last_applied and keep looping
         }
     }
 
-    /// §5.3, Figure 2, AppendEntries RPC §3–5: if an existing entry conflicts with a new one
-    /// (same index, different term), delete it and all that follow, then append new entries.
+    /// §5.3 Figure 2 AppendEntries §3–5: truncates on conflict (same index, different term).
     fn append_entries(&mut self, prev_log_index: LogIndex, entries: Vec<LogEntry<Cmd>>) {
         let mut insert_index = prev_log_index.next();
 

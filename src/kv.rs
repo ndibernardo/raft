@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::StateMachine;
 
-/// Commands for the key-value store.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCommand {
     Get { key: String },
@@ -12,14 +11,13 @@ pub enum KvCommand {
     Delete { key: String },
 }
 
-/// Result of applying a command to the KV store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KvResult {
     Ok,
     Value(Option<String>),
 }
 
-/// A simple in-memory key-value store.
+/// In-memory key-value store.
 #[derive(Default)]
 pub struct KvStore {
     data: HashMap<String, String>,
@@ -32,7 +30,6 @@ impl KvStore {
         }
     }
 
-    /// Apply a command to the store.
     pub fn apply(&mut self, command: KvCommand) -> KvResult {
         match command {
             KvCommand::Get { key } => KvResult::Value(self.data.get(&key).cloned()),

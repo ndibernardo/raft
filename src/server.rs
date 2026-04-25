@@ -41,8 +41,7 @@ pub struct Server {
 }
 
 impl Server {
-    /// Open storage, bind the Raft listener, optionally start the HTTP API,
-    /// and restore any persistent state.
+    /// Restores persistent state from disk and binds the Raft listener.
     pub fn start(config: Config, client_rx: mpsc::Receiver<Pending>) -> Result<Self, ServerError> {
         let local_id = NodeId::from(config.id);
 
@@ -106,18 +105,15 @@ impl Server {
 
     /// Check for pending client requests and submit them to the runtime.
     fn poll_client_requests(&mut self) {
-        loop {
-            match self.client_rx.try_recv() {
-                Ok((command, resp_tx)) => match self.runtime.submit(command) {
-                    Some(index) => {
-                        tracing::debug!(node = %self.runtime.node().id, %index, "client command queued");
-                        self.pending.insert(index, resp_tx);
-                    }
-                    None => {
-                        let _ = resp_tx.send(ApiResponse::NotLeader);
-                    }
-                },
-                Err(_) => break,
+        while let Ok((command, resp_tx)) = self.client_rx.try_recv() {
+            match self.runtime.submit(command) {
+                Some(index) => {
+                    tracing::debug!(node = %self.runtime.node().id, %index, "client command queued");
+                    self.pending.insert(index, resp_tx);
+                }
+                None => {
+                    let _ = resp_tx.send(ApiResponse::NotLeader);
+                }
             }
         }
     }

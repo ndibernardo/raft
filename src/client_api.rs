@@ -16,11 +16,10 @@ pub enum ApiResponse {
     NotLeader,
 }
 
-/// One pending client request: the command to run and where to send the result.
+/// Command paired with the channel to deliver its result.
 pub type Pending = (KvCommand, oneshot::Sender<ApiResponse>);
 
-/// Spawn a background thread that runs an axum HTTP server and forwards
-/// requests to the Raft event loop via `tx`.
+/// Spawns a background thread hosting the axum HTTP server; requests forwarded via `tx`.
 pub fn start(addr: SocketAddr, tx: mpsc::Sender<Pending>) {
     thread::spawn(move || {
         match tokio::runtime::Runtime::new() {
@@ -75,7 +74,7 @@ async fn handle_delete(
     submit(tx, KvCommand::Delete { key }).await
 }
 
-/// Send a command to the event loop and wait up to 5 s for the result.
+/// 5-second timeout; SERVICE_UNAVAILABLE on timeout or channel error.
 async fn submit(tx: mpsc::Sender<Pending>, command: KvCommand) -> (StatusCode, String) {
     let (resp_tx, resp_rx) = oneshot::channel::<ApiResponse>();
 

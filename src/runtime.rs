@@ -62,10 +62,8 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         }
     }
 
-    /// Reconstruct a Runtime after a crash by loading persistent state from storage.
-    /// The node restarts as a follower (§5.1). The caller is responsible for supplying
-    /// a fresh state machine; replaying committed entries is the server's responsibility
-    /// once the new leader drives AppendEntries with the correct commit index.
+    /// Restarts as follower (§5.1). State machine starts fresh — committed entries are
+    /// replayed lazily as the leader drives AppendEntries with the updated commit index.
     pub fn from_storage(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -89,9 +87,8 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         &mut self.state_machine
     }
 
-    /// Process an event, persist state, apply committed entries, and return outbound commands.
-    /// Persistent state is saved before returning — callers must not send responses until
-    /// this method returns successfully, matching the durability requirement of §5.1.
+    /// Callers must not transmit responses before this returns — §5.1 requires durable state
+    /// before responding to any RPC.
     pub fn handle(&mut self, event: Event<Cmd>) -> Result<Vec<Command<Cmd>>, St::Error> {
         let commands = match event {
             Event::ElectionTimeout => self.node.election_timeout(),
@@ -106,9 +103,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         Ok(commands)
     }
 
-    /// §5.2: if election timeout elapses without receiving AppendEntries or granting a vote,
-    /// the server starts an election. Leaders suppress elections by sending heartbeats
-    /// within each interval. Timeouts should be randomized in [T, 2T] to avoid split votes.
+    /// §5.2: leaders check the heartbeat deadline; others check the election deadline.
     pub fn poll_timers(&self) -> Option<Event<Cmd>> {
         let now = Instant::now();
 
@@ -126,7 +121,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         None
     }
 
-    /// Time until next timer fires.
+    /// Use to avoid busy-waiting: sleep until this instant, then call poll_timers.
     pub fn next_deadline(&self) -> Instant {
         if matches!(self.node.role, Role::Leader(_)) {
             self.heartbeat_deadline
@@ -135,7 +130,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         }
     }
 
-    /// Submit a client command. Returns log index if leader, None otherwise.
+    /// Returns the assigned log index. None if not leader — client must retry elsewhere.
     pub fn submit(&mut self, command: Cmd) -> Option<LogIndex> {
         self.node.submit_command(command)
     }
@@ -171,14 +166,11 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         }
     }
 
-    /// Drain all state machine outputs accumulated since the last call.
-    /// Each entry is (log_index, output) in application order.
+    /// Returns (log_index, output) pairs in commit order since the last call; drains the buffer.
     pub fn take_outputs(&mut self) -> Vec<(LogIndex, S::Output)> {
         std::mem::take(&mut self.pending_outputs)
     }
 
-    // Figure 2, Rules for Servers (All Servers): if commitIndex > lastApplied, apply the
-    // next entry to the state machine. §5.3: state machines process entries in log order.
     fn apply_committed(&mut self) {
         let node_id = self.node.id;
         while let Some(applied) = self.node.take_entry_to_apply() {

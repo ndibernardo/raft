@@ -1,45 +1,36 @@
 use crate::types::{LogEntry, LogIndex, NodeId, Term};
 
-/// Storage abstraction for Raft persistent state. §5.1, Figure 2 (Persistent state on all
-/// servers): currentTerm, votedFor, and log must be stored on stable storage and survive
-/// crashes. Implementations must flush to durable media before returning from any mutating
-/// method — responding to an RPC before persisting violates Raft's safety guarantees.
+/// §5.1: currentTerm, votedFor, and log on stable storage. Implementations must flush to
+/// durable media before returning from any write — persisting after responding violates safety.
 pub trait Storage<Cmd> {
     type Error;
 
-    /// Get the current term.
     fn current_term(&self) -> Result<Term, Self::Error>;
 
-    /// Set the current term. Must be durable before returning.
+    /// Must be durable before returning (§5.1).
     fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error>;
 
-    /// Get the node this server voted for in the current term.
     fn voted_for(&self) -> Result<Option<NodeId>, Self::Error>;
 
-    /// Set the voted_for field. Must be durable before returning.
+    /// Must be durable before returning (§5.1).
     fn set_voted_for(&mut self, candidate: Option<NodeId>) -> Result<(), Self::Error>;
 
-    /// Get the last log index.
     fn last_log_index(&self) -> Result<LogIndex, Self::Error>;
 
-    /// Get the term at a specific log index. Returns None if index is out of bounds.
+    /// Index 0 returns Some(Term::default()); out-of-bounds returns None.
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>, Self::Error>;
 
-    /// Get a log entry by index.
     fn entry(&self, index: LogIndex) -> Result<Option<LogEntry<Cmd>>, Self::Error>;
 
-    /// Get log entries starting from an index.
     fn entries_from(&self, start: LogIndex) -> Result<Vec<LogEntry<Cmd>>, Self::Error>;
 
-    /// Append an entry to the log. Returns the index of the new entry.
+    /// Returns the index of the appended entry.
     fn append(&mut self, entry: LogEntry<Cmd>) -> Result<LogIndex, Self::Error>;
 
-    /// Truncate the log from the given index (inclusive).
+    /// Inclusive: the entry at index is also removed.
     fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error>;
 
-    /// Append multiple entries, handling conflicts per Raft rules.
-    /// If an existing entry conflicts with a new one (same index, different term),
-    /// delete the existing entry and all that follow it.
+    /// On conflict (same index, different term), truncates and replaces per §5.3.
     fn append_entries(
         &mut self,
         prev_log_index: LogIndex,

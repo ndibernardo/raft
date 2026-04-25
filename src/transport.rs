@@ -70,9 +70,7 @@ where
         Self { local_id, peers, rx, _listener: listener }
     }
 
-    /// Send a message to a peer. Returns immediately; actual delivery happens on a
-    /// background thread. Unknown peer is the only synchronous error — all I/O
-    /// failures during send are swallowed (see struct-level docs).
+    /// Fire-and-forget: returns immediately; UnknownPeer is the only synchronous error.
     pub fn send(&self, to: NodeId, message: Message<Cmd>) -> Result<(), TransportError> {
         let addr = self
             .peers
@@ -86,12 +84,11 @@ where
         Ok(())
     }
 
-    /// Block until a message arrives or `timeout` elapses. Returns `None` on timeout.
+    /// Returns None on timeout.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<(NodeId, Message<Cmd>)> {
         self.rx.recv_timeout(timeout).ok()
     }
 
-    /// The address this transport is listening on.
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
         Ok(self._listener.local_addr()?)
     }
@@ -101,25 +98,18 @@ fn accept_loop<Cmd>(listener: Arc<TcpListener>, tx: mpsc::Sender<(NodeId, Messag
 where
     Cmd: Send + 'static + for<'de> Deserialize<'de>,
 {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let tx = tx.clone();
-                thread::spawn(move || {
-                    // Bound how long we wait for a slow/misbehaving sender.
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    if let Ok(env) = read_envelope::<Cmd>(&stream) {
-                        let _ = tx.send((env.from, env.message));
-                    }
-                });
+    while let Ok((stream, _)) = listener.accept() {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            // Bound how long we wait for a slow/misbehaving sender.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            if let Ok(env) = read_envelope::<Cmd>(&stream) {
+                let _ = tx.send((env.from, env.message));
             }
-            // Listener was closed (Transport dropped) or an unrecoverable error.
-            Err(_) => break,
-        }
+        });
     }
 }
 
-/// Read one length-prefixed JSON envelope from the stream.
 fn read_envelope<Cmd: for<'de> Deserialize<'de>>(
     mut stream: &TcpStream,
 ) -> Result<Envelope<Cmd>, TransportError> {
@@ -131,7 +121,6 @@ fn read_envelope<Cmd: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(&buf)?)
 }
 
-/// Connect, send one length-prefixed JSON envelope, and close.
 fn dial_and_send<Cmd: Serialize>(
     addr: SocketAddr,
     from: NodeId,

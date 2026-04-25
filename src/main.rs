@@ -7,23 +7,23 @@ use raft::server::{Config, Server};
 
 #[derive(Parser)]
 struct Args {
-    /// This node's numeric ID (must be unique in the cluster).
+    /// Unique node ID within the cluster.
     #[arg(long)]
     id: u64,
 
-    /// TCP address to listen on for Raft RPCs.
+    /// Raft RPC listen address.
     #[arg(long)]
     addr: String,
 
-    /// A peer in the form ID=ADDR. Repeat for each peer.
+    /// Peer in ID=ADDR form; repeat for each peer.
     #[arg(long = "peer")]
     peers: Vec<String>,
 
-    /// Directory for persistent state (meta.json, log.jsonl).
+    /// Persistent state directory.
     #[arg(long)]
     data_dir: std::path::PathBuf,
 
-    /// TCP address for the HTTP client API (e.g. 127.0.0.1:8001). Optional.
+    /// HTTP client API listen address.
     #[arg(long)]
     client_addr: Option<String>,
 }
@@ -46,7 +46,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         peers.insert(id.to_string(), addr.to_string());
     }
 
-    // Channel between the HTTP API thread and the Raft event loop.
     let (client_tx, client_rx) = mpsc::channel::<client_api::Pending>();
 
     let config = Config {
@@ -57,7 +56,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_addr: args.client_addr.clone(),
     };
 
-    // Start HTTP API if requested.
     if let Some(ref addr_str) = args.client_addr {
         let addr = addr_str
             .parse()
@@ -65,7 +63,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_api::start(addr, client_tx.clone());
     }
 
-    // Run the Raft event loop on the main thread (sync).
     Server::start(config, client_rx)?.run()?;
 
     Ok(())

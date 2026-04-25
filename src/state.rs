@@ -65,28 +65,27 @@ impl Leader {
         }
     }
 
-    /// Get next_index for a peer.
     pub fn next_index_for(&self, peer: NodeId) -> Option<LogIndex> {
-        self.next_index.get(&peer).map(|&idx| idx)
+        self.next_index.get(&peer).copied()
     }
 
-    /// Collect all follower match indices for commit calculation.
+    /// For commit calculation: includes all followers, not the leader's own index.
     pub fn match_indices(&self) -> impl Iterator<Item = LogIndex> + '_ {
-        self.match_index.values().map(|&idx| idx)
+        self.match_index.values().copied()
     }
 
-    /// Update follower progress after successful replication.
+    /// §5.3: advance both indices together — next_index is always match_index + 1.
     pub fn record_success(&mut self, from: NodeId, match_index: LogIndex) {
         self.match_index.insert(from, match_index);
         self.next_index.insert(from, match_index.next());
     }
 
-    /// Decrement next_index after failed replication.
+    /// §5.3: back off one position so the next AppendEntries probes earlier in the log.
     pub fn record_failure(&mut self, from: NodeId) {
-        if let Some(&current) = self.next_index.get(&from) {
-            if let Some(prev) = current.prev() {
-                self.next_index.insert(from, prev);
-            }
+        if let Some(&current) = self.next_index.get(&from)
+            && let Some(prev) = current.prev()
+        {
+            self.next_index.insert(from, prev);
         }
     }
 }
