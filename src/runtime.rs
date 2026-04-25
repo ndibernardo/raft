@@ -5,7 +5,7 @@ use rand::Rng;
 use crate::command::Command;
 use crate::node::{Node, Role};
 use crate::storage::Storage;
-use crate::types::{LogIndex, Message, NodeId};
+use crate::types::{ClusterConfig, LogIndex, Message, NodeId};
 
 /// Trait for state machines that can apply commands.
 pub trait StateMachine<Cmd> {
@@ -66,12 +66,12 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
     /// replayed lazily as the leader drives AppendEntries with the updated commit index.
     pub fn from_storage(
         id: NodeId,
-        peers: Vec<NodeId>,
+        initial_config: ClusterConfig,
         state_machine: S,
         storage: St,
         config: TimerConfig,
     ) -> Result<Self, St::Error> {
-        let node = Node::from_storage(id, peers, &storage)?;
+        let node = Node::from_storage(id, initial_config, &storage)?;
         Ok(Self::new(node, state_machine, storage, config))
     }
 
@@ -135,6 +135,21 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         self.node.submit_command(command)
     }
 
+    /// Propose a membership change. None if not leader or another change is uncommitted.
+    pub fn submit_config_change(&mut self, config: ClusterConfig) -> Option<LogIndex> {
+        self.node.propose_config_change(config)
+    }
+
+    /// Configs applied on append (before commit). Caller passes to Transport for immediate RPC routing.
+    pub fn take_config_changes(&mut self) -> Vec<ClusterConfig> {
+        self.node.take_config_changes()
+    }
+
+    /// Committed config changes with their log index. Caller uses to resolve pending membership requests.
+    pub fn take_committed_config_changes(&mut self) -> Vec<(LogIndex, ClusterConfig)> {
+        self.node.take_committed_config_changes()
+    }
+
     fn handle_message(&mut self, from: NodeId, message: Message<Cmd>) -> Vec<Command<Cmd>> {
         match message {
             Message::RequestVote(req) => self.node.handle_request_vote(from, req),
@@ -183,16 +198,27 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
     use super::*;
     use crate::kv::{KvCommand, KvResult, KvStore};
     use crate::storage::MemoryStorage;
     use crate::types::{AppendEntriesResponse, RequestVoteResponse, Term};
 
+    fn test_config(id: u64, peers: &[u64]) -> ClusterConfig {
+        let members: HashMap<NodeId, SocketAddr> = std::iter::once(id)
+            .chain(peers.iter().copied())
+            .map(|i| {
+                let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+                (NodeId::from(i), addr)
+            })
+            .collect();
+        ClusterConfig::new(members)
+    }
+
     fn runtime(id: u64, peers: &[u64]) -> Runtime<KvCommand, KvStore, MemoryStorage<KvCommand>> {
-        let node = Node::new(
-            NodeId::from(id),
-            peers.iter().map(|&p| NodeId::from(p)).collect(),
-        );
+        let node = Node::new(NodeId::from(id), test_config(id, peers));
         Runtime::new(node, KvStore::new(), MemoryStorage::new(), TimerConfig::default())
     }
 
@@ -307,7 +333,7 @@ mod tests {
         let storage = rt.storage;
         let restored = Runtime::from_storage(
             NodeId::from(1),
-            vec![NodeId::from(2), NodeId::from(3)],
+            test_config(1, &[2, 3]),
             KvStore::new(),
             storage,
             TimerConfig::default(),
