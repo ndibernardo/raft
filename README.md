@@ -75,6 +75,24 @@ curl http://127.0.0.1:8001/kv/db-primary                             # 404
 curl -X PUT http://127.0.0.1:8002/kv/db-primary -d "10.0.0.1:5432"   # 503 not the leader
 ```
 
+## Membership changes
+
+Single-server membership changes (dissertation §4.1) are supported via the HTTP API. Only the leader accepts these requests; a `503 not the leader` is returned otherwise. Only one change may be in flight at a time — a second request returns `409` until the first commits.
+
+**Add a node**
+```bash
+curl -X POST http://127.0.0.1:8001/cluster/members \
+  -H "Content-Type: application/json" \
+  -d '{"id": 4, "addr": "127.0.0.1:9004"}'   # ok
+```
+
+**Remove a node**
+```bash
+curl -X DELETE http://127.0.0.1:8001/cluster/members/4   # ok
+```
+
+The request blocks until the change is committed by a quorum, then returns `200 ok`. The new peer starts receiving RPCs immediately on append — before the entry commits — so it can begin catching up without waiting for the round-trip.
+
 ## Testing
 
 Cargo is provided by the Nix flake. Enter the environment with `direnv allow` (first time only), then run the full suite:
