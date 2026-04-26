@@ -54,7 +54,7 @@ Each node prints its listen addresses to stderr on startup. The cluster elects a
 
 ## Client API
 
-Send commands to any node's client API. Writes are accepted only by the leader — non-leaders return `503 not the leader`.
+Send commands to any node's client API. Writes and membership changes are accepted only by the leader — non-leaders return `503 not the leader`. Only one membership change may be in flight at a time; concurrent requests return `409`.
 
 ```bash
 # Store a value
@@ -73,6 +73,14 @@ curl http://127.0.0.1:8001/kv/db-primary                             # 404
 
 # Writes to a non-leader are rejected
 curl -X PUT http://127.0.0.1:8002/kv/db-primary -d "10.0.0.1:5432"   # 503 not the leader
+
+# Add a node; blocks until committed by a quorum
+curl -X POST http://127.0.0.1:8001/cluster/members \
+  -H "Content-Type: application/json" \
+  -d '{"id": 4, "addr": "127.0.0.1:9004"}'                           # ok
+
+# Remove a node
+curl -X DELETE http://127.0.0.1:8001/cluster/members/4               # ok
 ```
 
 ## Testing
@@ -83,10 +91,7 @@ Cargo is provided by the Nix flake. Enter the environment with `direnv allow` (f
 cargo test
 ```
 
-The suite covers:
-- **Unit tests** (`src/`) — node protocol logic, storage, state machine, transport
-- **Property tests** (`src/cluster.rs`) — randomised operation sequences verified against election-safety and state-machine-safety invariants
-- **Integration tests** (`tests/`) — end-to-end scenarios (election, replication, commit propagation, re-election) exercising the public API only
+Unit tests in `src/` cover node protocol logic, storage, state machine, and transport. Property tests in `src/cluster.rs` run randomised operation sequences verified against election-safety and state-machine-safety invariants. Integration tests in `tests/` exercise end-to-end scenarios (election, replication, commit propagation, re-election) through the public API only.
 
 ## References
 
