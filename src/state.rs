@@ -95,6 +95,24 @@ impl Leader {
             self.next_index.insert(from, prev);
         }
     }
+
+    /// All peer IDs currently tracked by this leader.
+    pub fn tracked_peers(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.next_index.keys().copied()
+    }
+
+    /// Register a new peer. Idempotent — calling twice with the same ID does not
+    /// reset an already-advanced next_index.
+    pub fn add_peer(&mut self, peer: NodeId, last_log_index: LogIndex) {
+        self.next_index.entry(peer).or_insert_with(|| last_log_index.next());
+        self.match_index.entry(peer).or_default();
+    }
+
+    /// Deregister a peer. Removes it from quorum calculations immediately.
+    pub fn remove_peer(&mut self, peer: NodeId) {
+        self.next_index.remove(&peer);
+        self.match_index.remove(&peer);
+    }
 }
 
 #[cfg(test)]

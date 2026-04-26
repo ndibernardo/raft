@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+
 use crate::command::Command;
 use crate::node::{Node, Role};
 use crate::runtime::{Runtime, StateMachine, TimerConfig};
 use crate::storage::MemoryStorage;
-use crate::types::{Message, NodeId};
+use crate::types::{ClusterConfig, Message, NodeId};
 
 /// A message in flight between nodes.
 struct InFlight<Cmd> {
@@ -24,17 +27,23 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     pub fn new(size: usize) -> Self {
         let ids: Vec<NodeId> = (1..=size).map(|i| NodeId::from(i as u64)).collect();
 
+        // Shared config: all nodes start with the same full membership.
+        // Addresses are dummies — cluster harness delivers messages in-memory, not over TCP.
+        let members: HashMap<NodeId, SocketAddr> = ids
+            .iter()
+            .map(|&id| {
+                // Construct directly from octets to avoid parsing and unwrap.
+                let addr = SocketAddr::from(([127, 0, 0, 1], (9000 + id.value()) as u16));
+                (id, addr)
+            })
+            .collect();
+
         let runtimes = ids
             .iter()
             .map(|&id| {
-                let peers: Vec<NodeId> = ids.iter().filter(|&&p| p != id).copied().collect();
-                let node = Node::new(id, peers);
-                Runtime::new(
-                    node,
-                    S::default(),
-                    MemoryStorage::new(),
-                    TimerConfig::default(),
-                )
+                let config = ClusterConfig::new(members.clone());
+                let node = Node::new(id, config);
+                Runtime::new(node, S::default(), MemoryStorage::new(), TimerConfig::default())
             })
             .collect();
 

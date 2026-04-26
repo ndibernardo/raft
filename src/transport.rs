@@ -70,6 +70,21 @@ where
         Self { local_id, peers, rx, _listener: listener }
     }
 
+    /// Register a new peer. Overwrites the address if the peer already exists.
+    pub fn add_peer(&mut self, peer: NodeId, addr: SocketAddr) {
+        self.peers.insert(peer, addr);
+    }
+
+    /// Deregister a peer. Subsequent sends to this ID return UnknownPeer.
+    pub fn remove_peer(&mut self, peer: NodeId) {
+        self.peers.remove(&peer);
+    }
+
+    /// All currently registered peer IDs.
+    pub fn peer_ids(&self) -> Vec<NodeId> {
+        self.peers.keys().copied().collect()
+    }
+
     /// Fire-and-forget: returns immediately; UnknownPeer is the only synchronous error.
     pub fn send(&self, to: NodeId, message: Message<Cmd>) -> Result<(), TransportError> {
         let addr = self
