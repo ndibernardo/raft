@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (client_tx, client_rx) = mpsc::channel::<client_api::Pending>();
+    let (membership_tx, membership_rx) = mpsc::channel::<client_api::MembershipPending>();
 
     let config = Config {
         id: args.id,
@@ -61,10 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = addr_str
             .parse()
             .map_err(|e| format!("invalid --client-addr '{addr_str}': {e}"))?;
-        client_api::start(addr, client_tx.clone());
+        client_api::start(addr, client_tx.clone(), membership_tx.clone());
     }
 
-    Server::start(config, client_rx)?.run()?;
+    Server::start(config, client_rx, membership_rx)?.run()?;
 
     Ok(())
 }
