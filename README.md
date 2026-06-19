@@ -85,8 +85,6 @@ curl -X DELETE http://127.0.0.1:8001/cluster/members/4               # ok
 
 ## Testing
 
-Cargo is provided by the Nix flake. Enter the environment with `direnv allow` (first time only), then run the full suite:
-
 ```bash
 cargo test
 ```
