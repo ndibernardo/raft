@@ -16,7 +16,7 @@ use crate::types::NodeId;
 #[derive(Debug)]
 pub enum ApiResponse {
     Result(KvResult),
-    NotLeader,
+    NotLeader { leader_hint: Option<NodeId> },
 }
 
 /// KV command paired with the channel to deliver its result.
@@ -152,7 +152,11 @@ async fn submit_kv(tx: mpsc::Sender<Pending>, command: KvCommand) -> (StatusCode
         Ok(Ok(ApiResponse::Result(KvResult::Value(None)))) => {
             (StatusCode::NOT_FOUND, String::new())
         }
-        Ok(Ok(ApiResponse::NotLeader)) => {
+        Ok(Ok(ApiResponse::NotLeader { leader_hint: Some(id) })) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not the leader; leader hint: node {}", id.value()),
+        ),
+        Ok(Ok(ApiResponse::NotLeader { leader_hint: None })) => {
             (StatusCode::SERVICE_UNAVAILABLE, "not the leader".into())
         }
         Ok(Err(_)) | Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout".into()),

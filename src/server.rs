@@ -12,6 +12,7 @@ use crate::client_api::{
 use crate::command::Command;
 use crate::file_storage::{FileStorage, FileStorageError};
 use crate::kv::{KvCommand, KvStore};
+use crate::node::{NotLeaderError, SubmitError};
 use crate::runtime::{Event, Runtime, TimerConfig};
 use crate::transport::{Transport, TransportError};
 use crate::types::{ClusterConfig, LogIndex, NodeId, Term};
@@ -132,15 +133,15 @@ impl Server {
     fn poll_client_requests(&mut self) {
         while let Ok((command, resp_tx)) = self.client_rx.try_recv() {
             match self.runtime.submit(command) {
-                Some(index) => {
+                Ok(index) => {
                     // submit() just appended this entry as the current term, so reading
                     // the term back here is exactly the term it was submitted under.
                     let term = self.runtime.node().persistent.current_term;
                     tracing::debug!(node = %self.runtime.node().id, %term, %index, "client command queued");
                     self.pending.insert((term, index), resp_tx);
                 }
-                None => {
-                    let _ = resp_tx.send(ApiResponse::NotLeader);
+                Err(NotLeaderError { leader_hint }) => {
+                    let _ = resp_tx.send(ApiResponse::NotLeader { leader_hint });
                 }
             }
         }
@@ -149,25 +150,27 @@ impl Server {
     fn poll_membership_requests(&mut self) {
         while let Ok((req, resp_tx)) = self.membership_rx.try_recv() {
             match self.apply_membership_request(req) {
-                Some(index) => {
+                Ok(index) => {
                     tracing::debug!(node = %self.runtime.node().id, %index, "membership change queued");
                     self.pending_membership.insert(index, resp_tx);
                 }
-                None => {
+                Err(SubmitError::NotLeader { .. }) => {
                     let _ = resp_tx.send(MembershipResult::NotLeader);
+                }
+                Err(SubmitError::ConfigChangePending) => {
+                    let _ = resp_tx.send(MembershipResult::Rejected);
                 }
             }
         }
     }
 
-    /// Build the new config from the current one and submit it. None means not leader or
-    /// another change is already uncommitted (propose_config_change returns None for both).
+    /// Build the new config from the current one and submit it.
     ///
     /// Syncs the transport peer map before returning — the new config takes effect on
     /// `Node` immediately on append (§4.1), so transport must not lag behind it even by
     /// one event-loop iteration, or the next heartbeat sends to a peer transport doesn't
     /// know about yet.
-    fn apply_membership_request(&mut self, req: MembershipRequest) -> Option<LogIndex> {
+    fn apply_membership_request(&mut self, req: MembershipRequest) -> Result<LogIndex, SubmitError> {
         let mut new_members = self.runtime.node().config.members.clone();
         match req {
             MembershipRequest::Add { id, addr } => {
@@ -177,11 +180,9 @@ impl Server {
                 new_members.remove(&id);
             }
         }
-        let index = self.runtime.submit_config_change(ClusterConfig::new(new_members));
-        if index.is_some() {
-            self.apply_config_changes();
-        }
-        index
+        let index = self.runtime.submit_config_change(ClusterConfig::new(new_members))?;
+        self.apply_config_changes();
+        Ok(index)
     }
 
     /// Sync the transport peer map whenever a new config takes effect on append.
@@ -218,8 +219,9 @@ impl Server {
     /// Fail every outstanding client fast with `NotLeader` instead of leaving it to time
     /// out — their entries may never commit now that this node is no longer leader.
     fn purge_pending(&mut self) {
+        let leader_hint = self.runtime.node().leader_hint();
         for (_, tx) in self.pending.drain() {
-            let _ = tx.send(ApiResponse::NotLeader);
+            let _ = tx.send(ApiResponse::NotLeader { leader_hint });
         }
     }
 
@@ -314,10 +316,38 @@ mod tests {
             addr: test_addr(19999),
         });
 
-        assert!(index.is_some(), "leader must accept the membership change");
+        assert!(index.is_ok(), "leader must accept the membership change");
         assert!(
             server.transport.peer_ids().contains(&new_peer),
             "transport must track the new peer immediately, before any heartbeat tries to reach it"
+        );
+    }
+
+    /// Before the SubmitError fix both "not leader" and "another change pending"
+    /// collapsed to the same `None`, so `MembershipResult::Rejected` was dead code —
+    /// clients always saw a misleading `NotLeader` instead of the true 409 conflict.
+    #[test]
+    fn second_membership_request_is_rejected_while_first_uncommitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+        assert!(matches!(server.runtime.node().role, Role::Leader(_)));
+
+        let first = server.apply_membership_request(MembershipRequest::Add {
+            id: NodeId::from(2),
+            addr: test_addr(19999),
+        });
+        assert!(first.is_ok(), "first change must be accepted");
+
+        let second = server.apply_membership_request(MembershipRequest::Add {
+            id: NodeId::from(3),
+            addr: test_addr(19998),
+        });
+        assert_eq!(
+            second,
+            Err(SubmitError::ConfigChangePending),
+            "second change must be distinguishably rejected as pending, not conflated with not-leader"
         );
     }
 
@@ -416,7 +446,7 @@ mod tests {
             Ok(ApiResponse::Result(result)) => {
                 panic!("stranded client incorrectly received a different command's result: {result:?}")
             }
-            Ok(ApiResponse::NotLeader) | Err(_) => {}
+            Ok(ApiResponse::NotLeader { .. }) | Err(_) => {}
         }
     }
 }

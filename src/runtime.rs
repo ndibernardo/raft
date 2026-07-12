@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 
 use crate::command::Command;
-use crate::node::{Node, Role};
+use crate::node::{Node, NotLeaderError, Role, SubmitError};
 use crate::storage::Storage;
 use crate::types::{ClusterConfig, LogIndex, Message, NodeId, Term};
 
@@ -152,13 +152,13 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         }
     }
 
-    /// Returns the assigned log index. None if not leader — client must retry elsewhere.
-    pub fn submit(&mut self, command: Cmd) -> Option<LogIndex> {
+    /// Returns the assigned log index. Errors if not leader — client must retry elsewhere.
+    pub fn submit(&mut self, command: Cmd) -> Result<LogIndex, NotLeaderError> {
         self.node.submit_command(command)
     }
 
-    /// Propose a membership change. None if not leader or another change is uncommitted.
-    pub fn submit_config_change(&mut self, config: ClusterConfig) -> Option<LogIndex> {
+    /// Propose a membership change. Errors if not leader or another change is uncommitted.
+    pub fn submit_config_change(&mut self, config: ClusterConfig) -> Result<LogIndex, SubmitError> {
         self.node.propose_config_change(config)
     }
 
@@ -277,7 +277,7 @@ mod tests {
             key: "username".to_string(),
             value: "miles".to_string(),
         });
-        assert!(index.is_some());
+        assert!(index.is_ok());
 
         // Simulate replication success (no-op at index 1, command at index 2).
         rt.handle(Event::Message {
@@ -315,7 +315,8 @@ mod tests {
         rt.submit(KvCommand::Set {
             key: "counter".to_string(),
             value: "1".to_string(),
-        });
+        })
+        .unwrap();
         rt.handle(Event::Message {
             from: NodeId::from(2),
             message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {

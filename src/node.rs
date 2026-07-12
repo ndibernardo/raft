@@ -10,6 +10,24 @@ use crate::types::{
     MergeOutcome, Message, NodeId, RequestVote, RequestVoteResponse, Term,
 };
 
+/// Why `Node::submit_command` refused a client command: this node isn't the leader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("not the leader")]
+pub struct NotLeaderError {
+    /// Best-known current leader, if this node has heard from one — the client can retry there.
+    pub leader_hint: Option<NodeId>,
+}
+
+/// Why `Node::propose_config_change` refused a membership change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SubmitError {
+    #[error("not the leader")]
+    NotLeader { leader_hint: Option<NodeId> },
+    /// Single-server changes (§4.1) allow at most one uncommitted config change at a time.
+    #[error("a config change is already pending")]
+    ConfigChangePending,
+}
+
 /// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
 /// responding to any RPC — persisting after responding violates Raft's safety guarantees.
 #[derive(Debug)]
@@ -530,10 +548,19 @@ impl<Cmd: Clone> Node<Cmd> {
         Vec::new()
     }
 
-    /// Returns the assigned log index. None if not leader — caller must redirect.
-    pub fn submit_command(&mut self, command: Cmd) -> Option<LogIndex> {
+    /// Best-known current leader, for redirecting a client that reached the wrong node.
+    /// `None` for a leader (self is the answer) or a candidate (no leader known this term).
+    pub fn leader_hint(&self) -> Option<NodeId> {
+        match &self.role {
+            Role::Follower(follower) => follower.leader_id(),
+            Role::Candidate(_) | Role::Leader(_) => None,
+        }
+    }
+
+    /// Appends a command to the log. Errors if this node isn't the leader.
+    pub fn submit_command(&mut self, command: Cmd) -> Result<LogIndex, NotLeaderError> {
         if !matches!(self.role, Role::Leader(_)) {
-            return None;
+            return Err(NotLeaderError { leader_hint: self.leader_hint() });
         }
 
         let entry = LogEntry {
@@ -542,20 +569,24 @@ impl<Cmd: Clone> Node<Cmd> {
         };
         let index = self.persistent.log.append(entry);
         debug!(node = %self.id, term = %self.persistent.current_term, index = %index, "command appended to log");
-        Some(index)
+        Ok(index)
     }
 
-    /// Propose a membership change. Returns the log index of the ConfigChange entry,
-    /// or None if not the leader or another change is already uncommitted.
+    /// Propose a membership change. Returns the log index of the ConfigChange entry.
     ///
     /// The new config takes effect immediately on append (dissertation §4.1).
-    pub fn propose_config_change(&mut self, config: ClusterConfig) -> Option<LogIndex> {
+    ///
+    /// # Errors
+    /// `SubmitError::NotLeader` — this node isn't the leader.
+    /// `SubmitError::ConfigChangePending` — another change is already uncommitted;
+    /// single-server changes (§4.1) allow at most one in flight.
+    pub fn propose_config_change(&mut self, config: ClusterConfig) -> Result<LogIndex, SubmitError> {
         if !matches!(self.role, Role::Leader(_)) {
-            return None;
+            return Err(SubmitError::NotLeader { leader_hint: self.leader_hint() });
         }
         if self.has_pending_config_change() {
             debug!(node = %self.id, "config change rejected: another change is pending");
-            return None;
+            return Err(SubmitError::ConfigChangePending);
         }
         let entry = LogEntry {
             term: self.persistent.current_term,
@@ -566,7 +597,7 @@ impl<Cmd: Clone> Node<Cmd> {
         // before the entry is committed.
         self.set_config(config);
         info!(node = %self.id, term = %self.persistent.current_term, index = %index, members = self.config.size(), "config change proposed");
-        Some(index)
+        Ok(index)
     }
 
     /// Returns true if there is a ConfigChange entry in the uncommitted suffix.
@@ -985,7 +1016,7 @@ mod tests {
 
         // Submit a command (no-op is at index 1, command at index 2).
         let index = n.submit_command("SET counter=1".to_string());
-        assert_eq!(index, Some(LogIndex::from(2)));
+        assert_eq!(index, Ok(LogIndex::from(2)));
 
         // Simulate successful replication of no-op to one follower.
         n.handle_append_entries_response(
@@ -1014,8 +1045,8 @@ mod tests {
         assert!(is_leader(&n));
 
         // Add entries to leader's log.
-        n.submit_command("SET name=miles".to_string());
-        n.submit_command("SET counter=1".to_string());
+        n.submit_command("SET name=miles".to_string()).unwrap();
+        n.submit_command("SET counter=1".to_string()).unwrap();
 
         let Role::Leader(leader) = &n.role else {
             panic!("expected leader");
@@ -1041,10 +1072,41 @@ mod tests {
     #[test]
     fn submit_command_fails_on_non_leader() {
         let mut n = node(1, &[2, 3]);
-        assert!(n.submit_command("SET counter=1".to_string()).is_none());
+        assert!(n.submit_command("SET counter=1".to_string()).is_err());
 
         n.election_timeout();
-        assert!(n.submit_command("SET counter=1".to_string()).is_none());
+        assert!(n.submit_command("SET counter=1".to_string()).is_err());
+    }
+
+    /// A follower that has heard from a leader must surface it as a redirect hint
+    /// so the client can retry there instead of guessing.
+    #[test]
+    fn submit_command_on_follower_returns_known_leader_hint() {
+        let mut n = node(1, &[2, 3]);
+        let req = AppendEntries {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::default(),
+            prev_log_term: Term::default(),
+            entries: vec![],
+            leader_commit: LogIndex::default(),
+        };
+        n.handle_append_entries(NodeId::from(2), req);
+        assert!(is_follower(&n));
+
+        let result = n.submit_command("SET counter=1".to_string());
+        assert_eq!(result, Err(NotLeaderError { leader_hint: Some(NodeId::from(2)) }));
+    }
+
+    /// A candidate has no leader to redirect to this term.
+    #[test]
+    fn submit_command_on_candidate_returns_no_leader_hint() {
+        let mut n = node(1, &[2, 3, 4, 5]);
+        n.election_timeout();
+        assert!(is_candidate(&n));
+
+        let result = n.submit_command("SET counter=1".to_string());
+        assert_eq!(result, Err(NotLeaderError { leader_hint: None }));
     }
 
     #[test]
@@ -1192,8 +1254,8 @@ mod tests {
                 vote_granted: true,
             },
         );
-        n.submit_command("SET name=miles".to_string());
-        n.submit_command("SET counter=1".to_string());
+        n.submit_command("SET name=miles".to_string()).unwrap();
+        n.submit_command("SET counter=1".to_string()).unwrap();
 
         let mut storage = MemoryStorage::new();
         n.save(&mut storage).unwrap();
@@ -1372,7 +1434,10 @@ mod tests {
     fn propose_config_change_fails_on_non_leader() {
         let mut n = node(1, &[2, 3]);
         let new_config = test_config(1, &[2, 3, 4]);
-        assert!(n.propose_config_change(new_config).is_none());
+        assert!(matches!(
+            n.propose_config_change(new_config),
+            Err(SubmitError::NotLeader { .. })
+        ));
     }
 
     #[test]
@@ -1388,7 +1453,7 @@ mod tests {
 
         let new_config = test_config(1, &[2, 3, 4]);
         let index = n.propose_config_change(new_config);
-        assert!(index.is_some());
+        assert!(index.is_ok());
 
         // Peers now include node 4.
         assert!(n.peers.contains(&NodeId::from(4)));
@@ -1411,8 +1476,12 @@ mod tests {
         let config_a = test_config(1, &[2, 3, 4]);
         let config_b = test_config(1, &[2, 3, 4, 5]);
 
-        assert!(n.propose_config_change(config_a).is_some());
-        assert!(n.propose_config_change(config_b).is_none(), "second change must be rejected");
+        assert!(n.propose_config_change(config_a).is_ok());
+        assert_eq!(
+            n.propose_config_change(config_b),
+            Err(SubmitError::ConfigChangePending),
+            "second change must be rejected as pending, not conflated with not-leader"
+        );
     }
 
     #[test]

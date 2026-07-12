@@ -99,7 +99,7 @@ fn state_machine_reflects_committed_command() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("city", "amsterdam"));
+    cluster.runtime_mut(0).submit(set("city", "amsterdam")).unwrap();
 
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
@@ -117,7 +117,7 @@ fn outputs_empty_before_commit() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("pending", "true"));
+    cluster.runtime_mut(0).submit(set("pending", "true")).unwrap();
 
     assert!(
         cluster.runtime_mut(0).take_outputs().is_empty(),
@@ -156,7 +156,7 @@ fn command_replicated_to_all_followers_after_one_heartbeat() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("hostname", "node-alpha"));
+    cluster.runtime_mut(0).submit(set("hostname", "node-alpha")).unwrap();
 
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
@@ -177,7 +177,7 @@ fn command_committed_and_applied_on_all_nodes() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("region", "eu-west-1"));
+    cluster.runtime_mut(0).submit(set("region", "eu-west-1")).unwrap();
 
     // First heartbeat: replicate entries; leader commits (majority = self + one ack).
     cluster.heartbeat_timeout(0);
@@ -208,8 +208,8 @@ fn multiple_commands_applied_in_order() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("user", "miles"));
-    cluster.runtime_mut(0).submit(set("role", "admin"));
+    cluster.runtime_mut(0).submit(set("user", "miles")).unwrap();
+    cluster.runtime_mut(0).submit(set("role", "admin")).unwrap();
 
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
@@ -223,7 +223,7 @@ fn multiple_commands_applied_in_order() {
     assert_eq!(outputs[1], (Term::from(1), LogIndex::from(3), KvResult::Ok));
 }
 
-/// Submitting to a non-leader returns None — the client must redirect.
+/// Submitting to a non-leader returns Err — the client must redirect.
 #[test]
 fn submit_to_follower_returns_none() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
@@ -231,7 +231,7 @@ fn submit_to_follower_returns_none() {
 
     // Node 1 is a follower.
     let index = cluster.runtime_mut(1).submit(set("key", "value"));
-    assert!(index.is_none(), "follower must reject client commands");
+    assert!(index.is_err(), "follower must reject client commands");
 }
 
 /// After re-election the new leader can still accept and commit commands.
@@ -244,7 +244,7 @@ fn new_leader_accepts_commands_after_re_election() {
     assert_eq!(cluster.leader(), Some(1));
 
     let index = cluster.runtime_mut(1).submit(set("datacenter", "ams1"));
-    assert!(index.is_some(), "new leader must accept commands");
+    assert!(index.is_ok(), "new leader must accept commands");
 
     cluster.heartbeat_timeout(1);
     cluster.deliver_all();

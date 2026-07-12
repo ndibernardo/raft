@@ -320,7 +320,7 @@ mod tests {
             key: "x".to_string(),
             value: "1".to_string(),
         });
-        assert_eq!(index, Some(LogIndex::from(2)));
+        assert_eq!(index, Ok(LogIndex::from(2)));
 
         // Send heartbeats with new entries (no-op + command).
         cluster.heartbeat_timeout(0);
@@ -355,10 +355,13 @@ mod tests {
         cluster.election_timeout(0);
         cluster.deliver_all();
 
-        cluster.runtime_mut(0).submit(KvCommand::Set {
-            key: "y".to_string(),
-            value: "2".to_string(),
-        });
+        cluster
+            .runtime_mut(0)
+            .submit(KvCommand::Set {
+                key: "y".to_string(),
+                value: "2".to_string(),
+            })
+            .unwrap();
 
         // First heartbeat: replicate entry.
         cluster.heartbeat_timeout(0);
