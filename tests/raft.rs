@@ -1,7 +1,7 @@
 use raft::cluster::Cluster;
 use raft::kv::{KvCommand, KvResult, KvStore};
 use raft::node::Role;
-use raft::types::LogIndex;
+use raft::types::{LogIndex, Term};
 
 fn set(key: &str, value: &str) -> KvCommand {
     KvCommand::Set { key: key.to_string(), value: value.to_string() }
@@ -219,8 +219,8 @@ fn multiple_commands_applied_in_order() {
     // Drain applied outputs from the leader (indices 2 and 3; index 1 is no-op).
     let outputs = cluster.runtime_mut(0).take_outputs();
     assert_eq!(outputs.len(), 2);
-    assert_eq!(outputs[0], (LogIndex::from(2), KvResult::Ok));
-    assert_eq!(outputs[1], (LogIndex::from(3), KvResult::Ok));
+    assert_eq!(outputs[0], (Term::from(1), LogIndex::from(2), KvResult::Ok));
+    assert_eq!(outputs[1], (Term::from(1), LogIndex::from(3), KvResult::Ok));
 }
 
 /// Submitting to a non-leader returns None — the client must redirect.

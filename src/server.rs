@@ -14,7 +14,7 @@ use crate::file_storage::{FileStorage, FileStorageError};
 use crate::kv::{KvCommand, KvStore};
 use crate::runtime::{Event, Runtime, TimerConfig};
 use crate::transport::{Transport, TransportError};
-use crate::types::{ClusterConfig, LogIndex, NodeId};
+use crate::types::{ClusterConfig, LogIndex, NodeId, Term};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -39,7 +39,10 @@ pub struct Server {
     runtime: Runtime<KvCommand, KvStore, FileStorage<KvCommand>>,
     transport: Transport<KvCommand>,
     client_rx: mpsc::Receiver<Pending>,
-    pending: HashMap<LogIndex, oneshot::Sender<ApiResponse>>,
+    /// Keyed by (term, index) of the submitted entry, not index alone — if leadership
+    /// changes before commit, a different entry can later land at the same index, and
+    /// a bare-index key would deliver that unrelated result to this client.
+    pending: HashMap<(Term, LogIndex), oneshot::Sender<ApiResponse>>,
     membership_rx: mpsc::Receiver<MembershipPending>,
     pending_membership: HashMap<LogIndex, oneshot::Sender<MembershipResult>>,
 }
@@ -97,8 +100,11 @@ impl Server {
 
             if let Some(event) = self.runtime.poll_timers() {
                 let commands = self.runtime.handle(event)?;
-                self.dispatch(commands)?;
                 self.apply_config_changes();
+                self.dispatch(commands);
+                if self.runtime.take_stepped_down() {
+                    self.purge_pending();
+                }
                 self.resolve_outputs();
                 self.resolve_membership_outputs();
                 continue;
@@ -112,8 +118,11 @@ impl Server {
 
             if let Some((from, message)) = self.transport.recv_timeout(wait) {
                 let commands = self.runtime.handle(Event::Message { from, message })?;
-                self.dispatch(commands)?;
                 self.apply_config_changes();
+                self.dispatch(commands);
+                if self.runtime.take_stepped_down() {
+                    self.purge_pending();
+                }
                 self.resolve_outputs();
                 self.resolve_membership_outputs();
             }
@@ -124,8 +133,11 @@ impl Server {
         while let Ok((command, resp_tx)) = self.client_rx.try_recv() {
             match self.runtime.submit(command) {
                 Some(index) => {
-                    tracing::debug!(node = %self.runtime.node().id, %index, "client command queued");
-                    self.pending.insert(index, resp_tx);
+                    // submit() just appended this entry as the current term, so reading
+                    // the term back here is exactly the term it was submitted under.
+                    let term = self.runtime.node().persistent.current_term;
+                    tracing::debug!(node = %self.runtime.node().id, %term, %index, "client command queued");
+                    self.pending.insert((term, index), resp_tx);
                 }
                 None => {
                     let _ = resp_tx.send(ApiResponse::NotLeader);
@@ -150,6 +162,11 @@ impl Server {
 
     /// Build the new config from the current one and submit it. None means not leader or
     /// another change is already uncommitted (propose_config_change returns None for both).
+    ///
+    /// Syncs the transport peer map before returning — the new config takes effect on
+    /// `Node` immediately on append (§4.1), so transport must not lag behind it even by
+    /// one event-loop iteration, or the next heartbeat sends to a peer transport doesn't
+    /// know about yet.
     fn apply_membership_request(&mut self, req: MembershipRequest) -> Option<LogIndex> {
         let mut new_members = self.runtime.node().config.members.clone();
         match req {
@@ -160,7 +177,11 @@ impl Server {
                 new_members.remove(&id);
             }
         }
-        self.runtime.submit_config_change(ClusterConfig::new(new_members))
+        let index = self.runtime.submit_config_change(ClusterConfig::new(new_members));
+        if index.is_some() {
+            self.apply_config_changes();
+        }
+        index
     }
 
     /// Sync the transport peer map whenever a new config takes effect on append.
@@ -187,10 +208,18 @@ impl Server {
     }
 
     fn resolve_outputs(&mut self) {
-        for (index, result) in self.runtime.take_outputs() {
-            if let Some(tx) = self.pending.remove(&index) {
+        for (term, index, result) in self.runtime.take_outputs() {
+            if let Some(tx) = self.pending.remove(&(term, index)) {
                 let _ = tx.send(ApiResponse::Result(result));
             }
+        }
+    }
+
+    /// Fail every outstanding client fast with `NotLeader` instead of leaving it to time
+    /// out — their entries may never commit now that this node is no longer leader.
+    fn purge_pending(&mut self) {
+        for (_, tx) in self.pending.drain() {
+            let _ = tx.send(ApiResponse::NotLeader);
         }
     }
 
@@ -202,13 +231,16 @@ impl Server {
         }
     }
 
-    fn dispatch(&self, commands: Vec<Command<KvCommand>>) -> Result<(), ServerError> {
+    /// Sends are fire-and-forget (`transport.rs` doc comment) — a single unreachable or
+    /// unknown peer must never take down the event loop.
+    fn dispatch(&self, commands: Vec<Command<KvCommand>>) {
         for command in commands {
-            if let Command::Send { to, message } = command {
-                self.transport.send(to, message)?;
+            if let Command::Send { to, message } = command
+                && let Err(err) = self.transport.send(to, message)
+            {
+                tracing::warn!(peer = %to, error = %err, "failed to send message");
             }
         }
-        Ok(())
     }
 }
 
@@ -224,4 +256,167 @@ fn parse_peers(raw: &HashMap<String, String>) -> Result<HashMap<NodeId, SocketAd
             Ok((NodeId::from(id), addr))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::node::Role;
+    use crate::types::{
+        AppendEntries, AppendEntriesResponse, LogEntry, LogPayload, Message, RequestVote, Term,
+    };
+
+    fn test_addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// Single-node server: config contains only itself, listener on an ephemeral port.
+    fn test_server(id: u64, dir: &Path) -> Server {
+        let local_id = NodeId::from(id);
+        let listen_addr = test_addr(0);
+        let config = ClusterConfig::new(HashMap::from([(local_id, listen_addr)]));
+
+        let storage = FileStorage::open(dir).unwrap();
+        let runtime =
+            Runtime::from_storage(local_id, config, KvStore::new(), storage, TimerConfig::default())
+                .unwrap();
+        let transport = Transport::bind(local_id, listen_addr, HashMap::new()).unwrap();
+        let (_client_tx, client_rx) = mpsc::channel();
+        let (_membership_tx, membership_rx) = mpsc::channel();
+
+        Server {
+            runtime,
+            transport,
+            client_rx,
+            pending: HashMap::new(),
+            membership_rx,
+            pending_membership: HashMap::new(),
+        }
+    }
+
+    /// adding a member must sync the transport peer map immediately —
+    /// otherwise the next heartbeat tries to send to a peer transport doesn't know about,
+    /// `Transport::send` returns `UnknownPeer`, and (pre-fix) `run()` propagates that error
+    /// and the whole server dies.
+    #[test]
+    fn membership_add_updates_transport_before_next_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+        assert!(matches!(server.runtime.node().role, Role::Leader(_)));
+
+        let new_peer = NodeId::from(2);
+        let index = server.apply_membership_request(MembershipRequest::Add {
+            id: new_peer,
+            addr: test_addr(19999),
+        });
+
+        assert!(index.is_some(), "leader must accept the membership change");
+        assert!(
+            server.transport.peer_ids().contains(&new_peer),
+            "transport must track the new peer immediately, before any heartbeat tries to reach it"
+        );
+    }
+
+    /// a send to a peer that isn't (or is no longer) registered must not be treated
+    /// as fatal — sends are fire-and-forget by design (see `transport.rs`).
+    #[test]
+    fn dispatch_does_not_propagate_unknown_peer_as_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = test_server(1, dir.path());
+
+        let message = Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
+            term: Term::default(),
+            match_index: LogIndex::default(),
+        });
+
+        server.dispatch(vec![Command::Send { to: NodeId::from(99), message }]);
+    }
+
+    /// If leadership changes before a submitted command commits, a
+    /// different entry can later commit at the same log index. A client waiting on the
+    /// original submission must never receive that unrelated command's result.
+    #[test]
+    fn stranded_client_never_receives_a_different_commands_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+
+        // Node 1 becomes leader alone, in term 1, and a client submits a command that
+        // lands at index 2 (index 1 is the leader's own no-op).
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+        assert!(matches!(server.runtime.node().role, Role::Leader(_)));
+        let leader_term = server.runtime.node().persistent.current_term;
+
+        let index = server
+            .runtime
+            .submit(KvCommand::Set { key: "username".to_string(), value: "miles".to_string() })
+            .unwrap();
+        assert_eq!(index, LogIndex::from(2));
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        server.pending.insert((leader_term, index), resp_tx);
+
+        // A higher-term RequestVote from another node forces node 1 to step down —
+        // its own command at index 2 is now stranded, uncommitted.
+        let commands = server
+            .runtime
+            .handle(Event::Message {
+                from: NodeId::from(2),
+                message: Message::RequestVote(RequestVote {
+                    term: Term::from(5),
+                    candidate_id: NodeId::from(2),
+                    last_log_index: LogIndex::from(1),
+                    last_log_term: leader_term,
+                }),
+            })
+            .unwrap();
+        server.apply_config_changes();
+        server.dispatch(commands);
+        if server.runtime.take_stepped_down() {
+            server.purge_pending();
+        }
+        server.resolve_outputs();
+        assert!(matches!(server.runtime.node().role, Role::Follower(_)));
+
+        // A new leader (term 6) overwrites index 2 with an unrelated command and directs
+        // node 1 to commit it immediately.
+        let commands = server
+            .runtime
+            .handle(Event::Message {
+                from: NodeId::from(2),
+                message: Message::AppendEntries(AppendEntries {
+                    term: Term::from(6),
+                    leader_id: NodeId::from(2),
+                    prev_log_index: LogIndex::from(1),
+                    prev_log_term: leader_term,
+                    entries: vec![LogEntry {
+                        term: Term::from(6),
+                        payload: LogPayload::Command(KvCommand::Set {
+                            key: "region".to_string(),
+                            value: "eu-west-1".to_string(),
+                        }),
+                    }],
+                    leader_commit: LogIndex::from(2),
+                }),
+            })
+            .unwrap();
+        server.apply_config_changes();
+        server.dispatch(commands);
+        if server.runtime.take_stepped_down() {
+            server.purge_pending();
+        }
+        server.resolve_outputs();
+
+        // The original client must never see the unrelated command's result — either it
+        // failed fast with NotLeader (purge-on-stepdown) or it's still pending; either is
+        // fine. Only an ApiResponse::Result here would mean the wrong answer was delivered.
+        match resp_rx.try_recv() {
+            Ok(ApiResponse::Result(result)) => {
+                panic!("stranded client incorrectly received a different command's result: {result:?}")
+            }
+            Ok(ApiResponse::NotLeader) | Err(_) => {}
+        }
+    }
 }

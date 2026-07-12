@@ -15,7 +15,7 @@ pub enum LogPayload<Cmd> {
 }
 
 /// A single entry in the replicated log.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry<Cmd> {
     pub term: Term,
     pub payload: LogPayload<Cmd>,

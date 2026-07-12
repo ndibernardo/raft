@@ -33,17 +33,28 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         storage.set_voted_for(self.voted_for)?;
 
         let stored_len = storage.last_log_index()?;
-        let current_len = LogIndex::from_length(self.log.len());
+        let stored_len_usize = stored_len.to_array_index().map_or(0, |i| i + 1);
+        let common_len = stored_len_usize.min(self.log.len());
 
-        if stored_len > current_len {
-            storage.truncate_from(current_len.next())?;
+        // First position in the common prefix where the stored term differs from the
+        // in-memory term — a length-only comparison would miss same-length conflict
+        // overwrites entirely.
+        let mut divergence = None;
+        for (i, entry) in self.log.iter().enumerate().take(common_len) {
+            let index = LogIndex::from_length(i + 1);
+            if storage.term_at(index)? != Some(entry.term) {
+                divergence = Some(i);
+                break;
+            }
         }
 
-        for (idx, entry) in self.log.iter().enumerate() {
-            let log_index = LogIndex::from((idx + 1) as u64);
-            if log_index > stored_len {
-                storage.append(entry.clone())?;
-            }
+        let rewrite_from = divergence.unwrap_or(common_len);
+        if rewrite_from < stored_len_usize {
+            storage.truncate_from(LogIndex::from_length(rewrite_from + 1))?;
+        }
+
+        for entry in &self.log[rewrite_from..] {
+            storage.append(entry.clone())?;
         }
 
         Ok(())
@@ -68,6 +79,11 @@ pub enum Role {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Applied<'a, Cmd> {
     pub index: LogIndex,
+    /// Term of the entry actually committed at `index` — not necessarily the term the
+    /// submitting client saw. Callers key pending responses on `(term, index)` so a
+    /// later leader's unrelated entry landing at the same index can never be mistaken
+    /// for the original submission.
+    pub term: Term,
     pub command: &'a Cmd,
 }
 
@@ -321,9 +337,13 @@ impl<Cmd: Clone> Node<Cmd> {
             return vec![Command::ResetElectionTimer];
         }
 
+        // A vote from outside the current config must not count toward the majority —
+        // transport has no authentication, and a removed member's stale response must
+        // not be able to hand out an election win.
+        let is_member = self.config.contains(from);
         let dominated = match &mut self.role {
             Role::Candidate(candidate) => {
-                if resp.vote_granted {
+                if resp.vote_granted && is_member {
                     candidate.record_vote(from);
                     debug!(node = %self.id, term = %self.persistent.current_term, from = %from, "vote received");
                 }
@@ -642,7 +662,9 @@ impl<Cmd: Clone> Node<Cmd> {
                     let cfg = cfg.clone();
                     self.pending_committed_config_changes.push((index, cfg));
                 }
-                LogPayload::Command(command) => return Some(Applied { index, command }),
+                LogPayload::Command(command) => {
+                    return Some(Applied { index, term: entry.term, command });
+                }
             }
         }
     }
@@ -1231,6 +1253,69 @@ mod tests {
         assert!(is_follower(&restored));
     }
 
+    /// A same-length conflict overwrite must be durable. Length-only
+    /// comparison in `save()` would see stored_len == current_len and write nothing,
+    /// silently leaving the deposed entry `B` on disk instead of the new entry `C`.
+    #[test]
+    fn save_persists_same_length_conflict_overwrite() {
+        use crate::storage::MemoryStorage;
+
+        let mut storage: MemoryStorage<String> = MemoryStorage::new();
+        let mut persistent = PersistentState {
+            current_term: Term::from(1),
+            voted_for: Some(NodeId::from(1)),
+            log: vec![
+                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".to_string()) },
+                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET status=pending".to_string()) },
+            ],
+        };
+        persistent.save(&mut storage).unwrap();
+
+        // New leader (term 2) overwrites entry 2 in place — log stays the same length.
+        persistent.current_term = Term::from(2);
+        persistent.log[1] = LogEntry {
+            term: Term::from(2),
+            payload: LogPayload::Command("SET status=active".to_string()),
+        };
+        persistent.save(&mut storage).unwrap();
+
+        let reloaded: PersistentState<String> = PersistentState::load(&storage).unwrap();
+        assert_eq!(reloaded.log, persistent.log, "disk log must reflect the conflict overwrite");
+    }
+
+    /// Growing case: conflict resolution both truncates and appends new
+    /// entries beyond the old stored length. Length-only append-loop would skip the
+    /// overwritten entry, producing a frankenstein log mixing old and new entries.
+    #[test]
+    fn save_persists_conflict_overwrite_that_also_grows_the_log() {
+        use crate::storage::MemoryStorage;
+
+        let mut storage: MemoryStorage<String> = MemoryStorage::new();
+        let mut persistent = PersistentState {
+            current_term: Term::from(1),
+            voted_for: Some(NodeId::from(1)),
+            log: vec![
+                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".to_string()) },
+                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET status=pending".to_string()) },
+            ],
+        };
+        persistent.save(&mut storage).unwrap();
+
+        persistent.current_term = Term::from(2);
+        persistent.log[1] = LogEntry {
+            term: Term::from(2),
+            payload: LogPayload::Command("SET status=active".to_string()),
+        };
+        persistent.log.push(LogEntry {
+            term: Term::from(2),
+            payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+        });
+        persistent.save(&mut storage).unwrap();
+
+        let reloaded: PersistentState<String> = PersistentState::load(&storage).unwrap();
+        assert_eq!(reloaded.log, persistent.log);
+    }
+
     #[test]
     fn stale_vote_response_is_ignored() {
         let mut n = node(1, &[2, 3]);
@@ -1257,6 +1342,27 @@ mod tests {
 
         assert!(cmds.is_empty());
         assert!(is_follower(&n));
+    }
+
+    /// A vote from a node outside the current config (e.g. a removed
+    /// member, or a spoofed envelope — transport has no authentication) must not count
+    /// toward the majority `has_majority` computes over `config` size.
+    #[test]
+    fn vote_from_non_member_does_not_count_toward_majority() {
+        let mut n = node(1, &[2, 3]); // config = {1, 2, 3}, majority = 2, self-vote = 1
+        n.election_timeout();
+        assert!(is_candidate(&n));
+
+        let cmds = n.handle_request_vote_response(
+            NodeId::from(99),
+            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+        );
+
+        assert!(
+            is_candidate(&n),
+            "a vote from a non-member must not be enough to win the election"
+        );
+        assert!(cmds.is_empty());
     }
 
     #[test]

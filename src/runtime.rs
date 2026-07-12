@@ -5,7 +5,7 @@ use rand::Rng;
 use crate::command::Command;
 use crate::node::{Node, Role};
 use crate::storage::Storage;
-use crate::types::{ClusterConfig, LogIndex, Message, NodeId};
+use crate::types::{ClusterConfig, LogIndex, Message, NodeId, Term};
 
 /// Trait for state machines that can apply commands.
 pub trait StateMachine<Cmd> {
@@ -45,20 +45,29 @@ pub struct Runtime<Cmd, S: StateMachine<Cmd>, St> {
     heartbeat_deadline: Instant,
     /// Outputs produced by applying committed entries, in log order.
     /// Drained by the caller via take_outputs after each handle() call.
-    pending_outputs: Vec<(LogIndex, S::Output)>,
+    pending_outputs: Vec<(Term, LogIndex, S::Output)>,
+    /// Set when the most recent `handle()` call demoted this node from leader.
+    /// Drained by `take_stepped_down` so the caller can fail pending clients fast.
+    stepped_down: bool,
 }
 
 impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
     pub fn new(node: Node<Cmd>, state_machine: S, storage: St, config: TimerConfig) -> Self {
         let now = Instant::now();
+        // Randomize in [T, 2T) like Command::ResetElectionTimer does — an un-jittered
+        // initial deadline makes every node in a fresh cluster time out at once,
+        // reliably splitting the first election.
+        let jitter_ms = rand::rng().random_range(0..config.election_timeout.as_millis() as u64);
+        let election_deadline = now + config.election_timeout + Duration::from_millis(jitter_ms);
         Self {
             node,
             state_machine,
             storage,
-            election_deadline: now + config.election_timeout,
+            election_deadline,
             heartbeat_deadline: now + config.heartbeat_interval,
             config,
             pending_outputs: Vec::new(),
+            stepped_down: false,
         }
     }
 
@@ -90,17 +99,30 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
     /// Callers must not transmit responses before this returns — §5.1 requires durable state
     /// before responding to any RPC.
     pub fn handle(&mut self, event: Event<Cmd>) -> Result<Vec<Command<Cmd>>, St::Error> {
+        let was_leader = matches!(self.node.role, Role::Leader(_));
+
         let commands = match event {
             Event::ElectionTimeout => self.node.election_timeout(),
             Event::HeartbeatTimeout => self.node.heartbeat_timeout(),
             Event::Message { from, message } => self.handle_message(from, message),
         };
 
+        if was_leader && !matches!(self.node.role, Role::Leader(_)) {
+            self.stepped_down = true;
+        }
+
         self.process_commands(&commands);
         self.node.save(&mut self.storage)?;
         self.apply_committed();
 
         Ok(commands)
+    }
+
+    /// True if the most recent `handle()` call demoted this node from leader.
+    /// Callers must purge any pending client responses on a true result — an
+    /// entry a caller is waiting on may never commit under the new leader.
+    pub fn take_stepped_down(&mut self) -> bool {
+        std::mem::replace(&mut self.stepped_down, false)
     }
 
     /// §5.2: leaders check the heartbeat deadline; others check the election deadline.
@@ -181,8 +203,10 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         }
     }
 
-    /// Returns (log_index, output) pairs in commit order since the last call; drains the buffer.
-    pub fn take_outputs(&mut self) -> Vec<(LogIndex, S::Output)> {
+    /// Returns (term, log_index, output) triples in commit order since the last call;
+    /// drains the buffer. The term identifies which submission actually committed at
+    /// that index — see `Applied::term`.
+    pub fn take_outputs(&mut self) -> Vec<(Term, LogIndex, S::Output)> {
         std::mem::take(&mut self.pending_outputs)
     }
 
@@ -191,7 +215,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         while let Some(applied) = self.node.take_entry_to_apply() {
             tracing::debug!(node = %node_id, index = %applied.index, "entry applied");
             let output = self.state_machine.apply(applied.command.clone());
-            self.pending_outputs.push((applied.index, output));
+            self.pending_outputs.push((applied.term, applied.index, output));
         }
     }
 }
@@ -304,8 +328,9 @@ mod tests {
         // take_outputs should return exactly the Set result at index 2.
         let outputs = rt.take_outputs();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].0, LogIndex::from(2));
-        assert_eq!(outputs[0].1, KvResult::Ok);
+        assert_eq!(outputs[0].0, Term::from(1));
+        assert_eq!(outputs[0].1, LogIndex::from(2));
+        assert_eq!(outputs[0].2, KvResult::Ok);
 
         // Subsequent call returns nothing until new commits arrive.
         assert!(rt.take_outputs().is_empty());
@@ -346,14 +371,44 @@ mod tests {
         assert!(matches!(restored.node().role, Role::Follower(_)));
     }
 
+    /// An un-jittered initial deadline means every node in a fresh
+    /// cluster times out at exactly the same instant, reliably producing a split vote
+    /// on cold start. Probabilistic: with jitter in [0, T) at millisecond granularity,
+    /// 20 identical-by-chance draws is astronomically unlikely.
+    #[test]
+    fn initial_election_deadline_is_randomized_not_fixed_at_exactly_t() {
+        let base = TimerConfig::default().election_timeout;
+
+        let saw_jitter = (0..20).any(|_| {
+            let node = Node::new(NodeId::from(1), test_config(1, &[2, 3]));
+            let before = Instant::now();
+            let rt: Runtime<KvCommand, KvStore, MemoryStorage<KvCommand>> =
+                Runtime::new(node, KvStore::new(), MemoryStorage::new(), TimerConfig::default());
+            // 5ms comfortably exceeds constructor call overhead but is well inside the
+            // [0, 300ms) jitter range, so this only trips on real jitter, not clock drift.
+            rt.election_deadline.duration_since(before) > base + Duration::from_millis(5)
+        });
+
+        assert!(
+            saw_jitter,
+            "initial election deadline must be randomized in [T, 2T), not fixed at exactly T"
+        );
+    }
+
     #[test]
     fn timer_reset_on_election_timeout() {
         let mut rt = runtime(1, &[2, 3]);
-        let initial_deadline = rt.election_deadline;
 
-        std::thread::sleep(Duration::from_millis(10));
+        // Comparing against the pre-handle deadline would be flaky now that the initial
+        // deadline is itself jittered — a small initial jitter draw could otherwise
+        // land before a large one. The real invariant: handling ElectionTimeout always
+        // pushes the deadline at least a full election_timeout past "now".
+        let before = Instant::now();
         rt.handle(Event::ElectionTimeout).unwrap();
 
-        assert!(rt.election_deadline > initial_deadline);
+        assert!(
+            rt.election_deadline >= before + TimerConfig::default().election_timeout,
+            "handling ElectionTimeout must reset the deadline to at least T in the future"
+        );
     }
 }

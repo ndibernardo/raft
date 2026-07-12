@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use crate::kv::{KvCommand, KvResult};
 use crate::types::NodeId;
 
+#[derive(Debug)]
 pub enum ApiResponse {
     Result(KvResult),
     NotLeader,
