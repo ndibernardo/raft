@@ -67,7 +67,7 @@ fn re_election_after_leader_steps_down() {
 
     assert_eq!(cluster.leader(), Some(1), "node 1 must win the new election");
     assert!(
-        matches!(cluster.runtime(0).node().role, Role::Follower(_)),
+        matches!(cluster.runtime(0).node().role(), Role::Follower(_)),
         "former leader must be a follower"
     );
 }
@@ -81,9 +81,9 @@ fn followers_track_leader_identity() {
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
-    let leader_id = cluster.runtime(0).node().id;
+    let leader_id = cluster.runtime(0).node().id();
     for i in 1..3 {
-        if let Role::Follower(f) = &cluster.runtime(i).node().role {
+        if let Role::Follower(f) = cluster.runtime(i).node().role() {
             assert_eq!(
                 f.leader_id(),
                 Some(leader_id),
@@ -145,8 +145,8 @@ fn three_consecutive_re_elections() {
 
     assert_eq!(cluster.leader(), Some(2));
     assert_eq!(cluster.role_counts(), (2, 0, 1));
-    assert!(matches!(cluster.runtime(0).node().role, Role::Follower(_)));
-    assert!(matches!(cluster.runtime(1).node().role, Role::Follower(_)));
+    assert!(matches!(cluster.runtime(0).node().role(), Role::Follower(_)));
+    assert!(matches!(cluster.runtime(1).node().role(), Role::Follower(_)));
 }
 
 /// Leader appends a no-op on election (§8) plus the submitted command.
@@ -163,7 +163,7 @@ fn command_replicated_to_all_followers_after_one_heartbeat() {
 
     for i in 0..3 {
         assert_eq!(
-            cluster.runtime(i).node().persistent.log.len(),
+            cluster.runtime(i).node().persistent().log.len(),
             2, // no-op at index 1, command at index 2
             "node {i} must have both log entries"
         );
@@ -184,7 +184,7 @@ fn command_committed_and_applied_on_all_nodes() {
     cluster.deliver_all();
 
     assert_eq!(
-        cluster.runtime(0).node().volatile.commit_index,
+        cluster.runtime(0).node().volatile().commit_index,
         LogIndex::from(2),
         "leader must have committed both entries"
     );
@@ -195,7 +195,7 @@ fn command_committed_and_applied_on_all_nodes() {
 
     for i in 1..3 {
         assert_eq!(
-            cluster.runtime(i).node().volatile.commit_index,
+            cluster.runtime(i).node().volatile().commit_index,
             LogIndex::from(2),
             "follower {i} must have received the updated commit index"
         );
@@ -252,7 +252,7 @@ fn new_leader_accepts_commands_after_re_election() {
     cluster.deliver_all();
 
     assert_eq!(
-        cluster.runtime(1).node().volatile.commit_index,
+        cluster.runtime(1).node().volatile().commit_index,
         index.unwrap(),
         "new leader must commit its own command"
     );

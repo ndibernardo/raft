@@ -24,7 +24,11 @@ pub struct Cluster<Cmd, S: StateMachine<Cmd>> {
 
 impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     /// Create a cluster with the given number of nodes.
+    ///
+    /// # Panics
+    /// If `size` is 0 — a cluster harness with no nodes isn't a meaningful test fixture.
     pub fn new(size: usize) -> Self {
+        assert!(size > 0, "Cluster::new requires at least one node");
         let ids: Vec<NodeId> = (1..=size).map(|i| NodeId::from(i as u64)).collect();
 
         // Shared config: all nodes start with the same full membership.
@@ -37,12 +41,16 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
                 (id, addr)
             })
             .collect();
+        let config = match ClusterConfig::new(members) {
+            Ok(config) => config,
+            // `size > 0` was asserted above, so `members` is never empty.
+            Err(_) => unreachable!("Cluster::new asserts size > 0, so members is non-empty"),
+        };
 
         let runtimes = ids
             .iter()
             .map(|&id| {
-                let config = ClusterConfig::new(members.clone());
-                let node = Node::new(id, config);
+                let node = Node::new(id, config.clone());
                 Runtime::new(node, S::default(), MemoryStorage::new(), TimerConfig::default())
             })
             .collect();
@@ -112,7 +120,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
 
     /// Queue outgoing commands from a node.
     fn queue_commands(&mut self, from_index: usize, commands: Vec<Command<Cmd>>) {
-        let from_id = self.runtimes[from_index].node().id;
+        let from_id = self.runtimes[from_index].node().id();
         for command in commands {
             if let Command::Send { to, message } = command {
                 self.messages.push_back(InFlight {
@@ -126,14 +134,14 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
 
     /// Find runtime index by node ID.
     fn node_index(&self, id: NodeId) -> Option<usize> {
-        self.runtimes.iter().position(|rt| rt.node().id == id)
+        self.runtimes.iter().position(|rt| rt.node().id() == id)
     }
 
     /// Find the current leader, if any.
     pub fn leader(&self) -> Option<usize> {
         self.runtimes
             .iter()
-            .position(|rt| matches!(rt.node().role, Role::Leader(_)))
+            .position(|rt| matches!(rt.node().role(), Role::Leader(_)))
     }
 
     /// Count nodes in each role.
@@ -143,7 +151,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         let mut leaders = 0;
 
         for rt in &self.runtimes {
-            match rt.node().role {
+            match rt.node().role() {
                 Role::Follower(_) => followers += 1,
                 Role::Candidate(_) => candidates += 1,
                 Role::Leader(_) => leaders += 1,
@@ -212,8 +220,8 @@ mod proptest_tests {
         let mut leaders: HashMap<crate::types::Term, usize> = HashMap::new();
         for i in 0..N {
             let node = cluster.runtime(i).node();
-            if matches!(node.role, Role::Leader(_)) {
-                let term = node.persistent.current_term;
+            if matches!(node.role(), Role::Leader(_)) {
+                let term = node.persistent().current_term;
                 assert!(
                     leaders.insert(term, i).is_none(),
                     "election safety violated: two leaders in term {term}"
@@ -229,23 +237,24 @@ mod proptest_tests {
             for j in (i + 1)..N {
                 let ni = cluster.runtime(i).node();
                 let nj = cluster.runtime(j).node();
-                let min_commit = std::cmp::min(ni.volatile.commit_index, nj.volatile.commit_index);
+                let min_commit =
+                    std::cmp::min(ni.volatile().commit_index, nj.volatile().commit_index);
 
                 let mut idx = LogIndex::from(1u64);
                 while idx <= min_commit {
                     let ai = idx.to_array_index().unwrap();
-                    let ei = ni.persistent.log.get(ai).unwrap_or_else(|| {
+                    let ei = ni.persistent().log.get(ai).unwrap_or_else(|| {
                         panic!(
                             "node {i} has commit_index {min_commit} \
                              but log only has {} entries",
-                            ni.persistent.log.len()
+                            ni.persistent().log.len()
                         )
                     });
-                    let ej = nj.persistent.log.get(ai).unwrap_or_else(|| {
+                    let ej = nj.persistent().log.get(ai).unwrap_or_else(|| {
                         panic!(
                             "node {j} has commit_index {min_commit} \
                              but log only has {} entries",
-                            nj.persistent.log.len()
+                            nj.persistent().log.len()
                         )
                     });
                     assert_eq!(
@@ -328,12 +337,12 @@ mod tests {
 
         // Verify all nodes have both entries (no-op + command).
         for i in 0..3 {
-            assert_eq!(cluster.runtime(i).node().persistent.log.len(), 2);
+            assert_eq!(cluster.runtime(i).node().persistent().log.len(), 2);
         }
 
         // Verify leader committed and applied both entries.
         assert_eq!(
-            cluster.runtime(0).node().volatile.commit_index,
+            cluster.runtime(0).node().volatile().commit_index,
             LogIndex::from(2)
         );
 
@@ -374,7 +383,7 @@ mod tests {
         // Verify followers committed (no-op at 1 + command at 2).
         for i in 1..3 {
             assert_eq!(
-                cluster.runtime(i).node().volatile.commit_index,
+                cluster.runtime(i).node().volatile().commit_index,
                 LogIndex::from(2)
             );
         }

@@ -279,7 +279,7 @@ mod tests {
             NodeId::from(1),
             "127.0.0.1:9001".parse().unwrap(),
         )]);
-        let cfg = ClusterConfig::new(members);
+        let cfg = ClusterConfig::new(members).unwrap();
         let mut log: Log<String> = Log::new();
         log.append(LogEntry { term: Term::from(1), payload: LogPayload::ConfigChange(cfg.clone()) });
 

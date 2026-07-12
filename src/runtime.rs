@@ -99,7 +99,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
     /// Callers must not transmit responses before this returns — §5.1 requires durable state
     /// before responding to any RPC.
     pub fn handle(&mut self, event: Event<Cmd>) -> Result<Vec<Command<Cmd>>, St::Error> {
-        let was_leader = matches!(self.node.role, Role::Leader(_));
+        let was_leader = matches!(self.node.role(), Role::Leader(_));
 
         let commands = match event {
             Event::ElectionTimeout => self.node.election_timeout(),
@@ -107,7 +107,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
             Event::Message { from, message } => self.handle_message(from, message),
         };
 
-        if was_leader && !matches!(self.node.role, Role::Leader(_)) {
+        if was_leader && !matches!(self.node.role(), Role::Leader(_)) {
             self.stepped_down = true;
         }
 
@@ -129,7 +129,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
     pub fn poll_timers(&self) -> Option<Event<Cmd>> {
         let now = Instant::now();
 
-        if matches!(self.node.role, Role::Leader(_)) {
+        if matches!(self.node.role(), Role::Leader(_)) {
             if now >= self.heartbeat_deadline {
                 return Some(Event::HeartbeatTimeout);
             }
@@ -145,7 +145,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
 
     /// Use to avoid busy-waiting: sleep until this instant, then call poll_timers.
     pub fn next_deadline(&self) -> Instant {
-        if matches!(self.node.role, Role::Leader(_)) {
+        if matches!(self.node.role(), Role::Leader(_)) {
             self.heartbeat_deadline
         } else {
             self.election_deadline
@@ -211,7 +211,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
     }
 
     fn apply_committed(&mut self) {
-        let node_id = self.node.id;
+        let node_id = self.node.id();
         while let Some(applied) = self.node.take_entry_to_apply() {
             tracing::debug!(node = %node_id, index = %applied.index, "entry applied");
             let output = self.state_machine.apply(applied.command.clone());
@@ -238,7 +238,7 @@ mod tests {
                 (NodeId::from(i), addr)
             })
             .collect();
-        ClusterConfig::new(members)
+        ClusterConfig::new(members).unwrap()
     }
 
     fn runtime(id: u64, peers: &[u64]) -> Runtime<KvCommand, KvStore, MemoryStorage<KvCommand>> {
@@ -252,7 +252,7 @@ mod tests {
 
         let commands = rt.handle(Event::ElectionTimeout).unwrap();
 
-        assert!(matches!(rt.node().role, Role::Candidate(_)));
+        assert!(matches!(rt.node().role(), Role::Candidate(_)));
         assert!(!commands.is_empty());
     }
 
@@ -270,7 +270,7 @@ mod tests {
             }),
         })
         .unwrap();
-        assert!(matches!(rt.node().role, Role::Leader(_)));
+        assert!(matches!(rt.node().role(), Role::Leader(_)));
 
         // Submit command.
         let index = rt.submit(KvCommand::Set {
@@ -353,8 +353,8 @@ mod tests {
         .unwrap();
 
         // At this point storage holds: term=1, voted_for=1, log=[no-op@1].
-        let expected_term = rt.node().persistent.current_term;
-        let expected_log_len = rt.node().persistent.log.len();
+        let expected_term = rt.node().persistent().current_term;
+        let expected_log_len = rt.node().persistent().log.len();
 
         let storage = rt.storage;
         let restored = Runtime::from_storage(
@@ -367,9 +367,9 @@ mod tests {
         .unwrap();
 
         // Term and log are recovered from durable storage; node restarts as follower.
-        assert_eq!(restored.node().persistent.current_term, expected_term);
-        assert_eq!(restored.node().persistent.log.len(), expected_log_len);
-        assert!(matches!(restored.node().role, Role::Follower(_)));
+        assert_eq!(restored.node().persistent().current_term, expected_term);
+        assert_eq!(restored.node().persistent().log.len(), expected_log_len);
+        assert!(matches!(restored.node().role(), Role::Follower(_)));
     }
 
     /// An un-jittered initial deadline means every node in a fresh

@@ -3,7 +3,7 @@ mod log;
 mod message;
 mod primitives;
 
-pub use config::ClusterConfig;
+pub use config::{ClusterConfig, ConfigError};
 pub use log::{Log, LogEntry, LogPayload, MergeOutcome};
 pub use message::{
     AppendEntries, AppendEntriesResponse, Message, RequestVote, RequestVoteResponse,

@@ -107,16 +107,15 @@ pub struct Applied<'a, Cmd> {
 
 #[derive(Debug)]
 pub struct Node<Cmd> {
-    pub id: NodeId,
-    pub peers: Vec<NodeId>,
+    id: NodeId,
     /// Current effective cluster config (from latest ConfigChange in log, or initial_config).
-    pub config: ClusterConfig,
+    config: ClusterConfig,
     /// Config at startup — used as the floor when rescanning the log after a truncation
     /// removes all ConfigChange entries.
     initial_config: ClusterConfig,
-    pub persistent: PersistentState<Cmd>,
-    pub volatile: VolatileState,
-    pub role: Role,
+    persistent: PersistentState<Cmd>,
+    volatile: VolatileState,
+    role: Role,
     /// Configs applied on append (before commit). Drained by Runtime → Transport.
     pending_config_changes: Vec<ClusterConfig>,
     /// Configs that have just been committed. Drained by Server to resolve HTTP requests.
@@ -126,10 +125,8 @@ pub struct Node<Cmd> {
 impl<Cmd: Clone> Node<Cmd> {
     /// Starts as follower with no known leader (§5.1 initial state).
     pub fn new(id: NodeId, config: ClusterConfig) -> Self {
-        let peers = config.peer_ids(id);
         Self {
             id,
-            peers,
             initial_config: config.clone(),
             config,
             persistent: PersistentState {
@@ -155,10 +152,8 @@ impl<Cmd: Clone> Node<Cmd> {
         storage: &S,
     ) -> Result<Self, S::Error> {
         let persistent = PersistentState::load(storage)?;
-        let peers = initial_config.peer_ids(id);
         let mut node = Self {
             id,
-            peers,
             config: initial_config.clone(),
             initial_config,
             persistent,
@@ -179,6 +174,37 @@ impl<Cmd: Clone> Node<Cmd> {
     /// Must be called before responding to any RPC (§5.1 durability requirement).
     pub fn save<S: Storage<Cmd>>(&self, storage: &mut S) -> Result<(), S::Error> {
         self.persistent.save(storage)
+    }
+
+    /// This node's identifier.
+    pub fn id(&self) -> NodeId {
+        self.id
+    }
+
+    /// Current role: follower, candidate, or leader.
+    pub fn role(&self) -> &Role {
+        &self.role
+    }
+
+    /// Current effective cluster config.
+    pub fn config(&self) -> &ClusterConfig {
+        &self.config
+    }
+
+    /// Read-only view of term/vote/log — mutation is internal to `Node`.
+    pub fn persistent(&self) -> &PersistentState<Cmd> {
+        &self.persistent
+    }
+
+    /// Read-only view of commit_index/last_applied — mutation is internal to `Node`.
+    pub fn volatile(&self) -> &VolatileState {
+        &self.volatile
+    }
+
+    /// All member IDs except this node's own — derived from `config` on demand rather
+    /// than cached, so it can never desynchronize from it.
+    fn peer_ids(&self) -> Vec<NodeId> {
+        self.config.peer_ids(self.id)
     }
 
     fn last_log_index(&self) -> LogIndex {
@@ -210,10 +236,9 @@ impl<Cmd: Clone> Node<Cmd> {
     /// Apply a new cluster config: updates peers, leader tracking maps, and emits a
     /// pending notification so the transport is updated before the next heartbeat.
     fn set_config(&mut self, config: ClusterConfig) {
-        let new_peers: Vec<NodeId> = config.peer_ids(self.id);
+        let old_peers: HashSet<NodeId> = self.peer_ids().into_iter().collect();
+        let new_peers: HashSet<NodeId> = config.peer_ids(self.id).into_iter().collect();
         let last = self.persistent.log.last_index();
-        let old_peers: HashSet<NodeId> = self.peers.iter().copied().collect();
-        let new_peer_set: HashSet<NodeId> = new_peers.iter().copied().collect();
 
         if let Role::Leader(leader) = &mut self.role {
             for &peer in &new_peers {
@@ -222,13 +247,12 @@ impl<Cmd: Clone> Node<Cmd> {
                 }
             }
             for &old_peer in &old_peers {
-                if !new_peer_set.contains(&old_peer) {
+                if !new_peers.contains(&old_peer) {
                     leader.remove_peer(old_peer);
                 }
             }
         }
 
-        self.peers = new_peers;
         self.config = config.clone();
         self.pending_config_changes.push(config);
     }
@@ -264,8 +288,10 @@ impl<Cmd: Clone> Node<Cmd> {
         self.role = Role::Candidate(Candidate::new(self.id));
         info!(node = %self.id, term = %self.persistent.current_term, "election started");
 
+        let peers = self.peer_ids();
+
         // Single node cluster: already have majority with own vote.
-        let cluster_size = self.peers.len() + 1;
+        let cluster_size = peers.len() + 1;
         if cluster_size == 1 {
             return self.become_leader();
         }
@@ -278,7 +304,7 @@ impl<Cmd: Clone> Node<Cmd> {
         };
 
         let mut commands = Vec::new();
-        for &peer in &self.peers {
+        for &peer in &peers {
             commands.push(Command::Send {
                 to: peer,
                 message: Message::RequestVote(request.clone()),
@@ -356,13 +382,14 @@ impl<Cmd: Clone> Node<Cmd> {
         // transport has no authentication, and a removed member's stale response must
         // not be able to hand out an election win.
         let is_member = self.config.contains(from);
+        let cluster_size = self.peer_ids().len() + 1;
         let dominated = match &mut self.role {
             Role::Candidate(candidate) => {
                 if resp.vote_granted && is_member {
                     candidate.record_vote(from);
                     debug!(node = %self.id, term = %self.persistent.current_term, from = %from, "vote received");
                 }
-                candidate.has_majority(self.peers.len() + 1)
+                candidate.has_majority(cluster_size)
             }
             Role::Follower(_) | Role::Leader(_) => return Vec::new(),
         };
@@ -381,7 +408,7 @@ impl<Cmd: Clone> Node<Cmd> {
             term: self.persistent.current_term,
             payload: LogPayload::NoOp,
         });
-        self.role = Role::Leader(Leader::new(&self.peers, self.last_log_index()));
+        self.role = Role::Leader(Leader::new(&self.peer_ids(), self.last_log_index()));
         info!(node = %self.id, term = %self.persistent.current_term, "became leader");
         self.send_heartbeats()
     }
@@ -664,7 +691,7 @@ impl<Cmd: Clone> Node<Cmd> {
             match &entry.payload {
                 LogPayload::NoOp => {}
                 LogPayload::ConfigChange(cfg) => {
-                    // Already applied to self.config/self.peers on append.
+                    // Already applied to self.config on append.
                     // Buffer the commit notification for Server to resolve HTTP requests.
                     let cfg = cfg.clone();
                     self.pending_committed_config_changes.push((index, cfg));
@@ -737,7 +764,7 @@ mod tests {
             .chain(peer_ids.iter().copied())
             .map(|i| (NodeId::from(i), test_addr(i)))
             .collect();
-        ClusterConfig::new(members)
+        ClusterConfig::new(members).unwrap()
     }
 
     fn node(id: u64, peers: &[u64]) -> Node<String> {
@@ -1120,7 +1147,7 @@ mod tests {
             term: Term::from(1),
             payload: LogPayload::Command("SET name=miles".to_string()),
         });
-        n.role = Role::Leader(LeaderState::new(&n.peers, LogIndex::from(1)));
+        n.role = Role::Leader(LeaderState::new(&n.peer_ids(), LogIndex::from(1)));
 
         // Peer 2 reports it has replicated the old entry.
         n.handle_append_entries_response(
@@ -1456,7 +1483,7 @@ mod tests {
         assert!(index.is_ok());
 
         // Peers now include node 4.
-        assert!(n.peers.contains(&NodeId::from(4)));
+        assert!(n.peer_ids().contains(&NodeId::from(4)));
         // A ConfigChange entry was appended after the no-op.
         assert!(matches!(
             n.persistent.log.last().unwrap().payload,

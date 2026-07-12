@@ -27,6 +27,20 @@ pub enum ServerError {
     Config(String),
 }
 
+/// Why `Server::apply_membership_request` could not apply a membership change.
+#[derive(Debug)]
+enum MembershipApplyError {
+    Submit(SubmitError),
+    /// Removing this member would leave the config with zero members.
+    WouldLeaveNoMembers,
+}
+
+impl From<SubmitError> for MembershipApplyError {
+    fn from(e: SubmitError) -> Self {
+        Self::Submit(e)
+    }
+}
+
 pub struct Config {
     pub id: u64,
     pub addr: String,
@@ -65,9 +79,11 @@ impl Server {
         let peers = parse_peers(&config.peers)?;
 
         // Initial config includes self so crash-recovery can rescan the log correctly.
+        // Always non-empty: local_id is inserted unconditionally below.
         let mut members = peers.clone();
         members.insert(local_id, addr);
-        let initial_config = ClusterConfig::new(members);
+        let initial_config =
+            ClusterConfig::new(members).map_err(|e| ServerError::Config(e.to_string()))?;
 
         let storage = FileStorage::open(&config.data_dir)?;
         let runtime = Runtime::from_storage(
@@ -136,8 +152,8 @@ impl Server {
                 Ok(index) => {
                     // submit() just appended this entry as the current term, so reading
                     // the term back here is exactly the term it was submitted under.
-                    let term = self.runtime.node().persistent.current_term;
-                    tracing::debug!(node = %self.runtime.node().id, %term, %index, "client command queued");
+                    let term = self.runtime.node().persistent().current_term;
+                    tracing::debug!(node = %self.runtime.node().id(), %term, %index, "client command queued");
                     self.pending.insert((term, index), resp_tx);
                 }
                 Err(NotLeaderError { leader_hint }) => {
@@ -151,36 +167,38 @@ impl Server {
         while let Ok((req, resp_tx)) = self.membership_rx.try_recv() {
             match self.apply_membership_request(req) {
                 Ok(index) => {
-                    tracing::debug!(node = %self.runtime.node().id, %index, "membership change queued");
+                    tracing::debug!(node = %self.runtime.node().id(), %index, "membership change queued");
                     self.pending_membership.insert(index, resp_tx);
                 }
-                Err(SubmitError::NotLeader { .. }) => {
+                Err(MembershipApplyError::Submit(SubmitError::NotLeader { .. })) => {
                     let _ = resp_tx.send(MembershipResult::NotLeader);
                 }
-                Err(SubmitError::ConfigChangePending) => {
+                Err(MembershipApplyError::Submit(SubmitError::ConfigChangePending))
+                | Err(MembershipApplyError::WouldLeaveNoMembers) => {
                     let _ = resp_tx.send(MembershipResult::Rejected);
                 }
             }
         }
     }
 
-    /// Build the new config from the current one and submit it.
+    /// Build the next config from the current one and submit it.
     ///
     /// Syncs the transport peer map before returning — the new config takes effect on
     /// `Node` immediately on append (§4.1), so transport must not lag behind it even by
     /// one event-loop iteration, or the next heartbeat sends to a peer transport doesn't
     /// know about yet.
-    fn apply_membership_request(&mut self, req: MembershipRequest) -> Result<LogIndex, SubmitError> {
-        let mut new_members = self.runtime.node().config.members.clone();
-        match req {
-            MembershipRequest::Add { id, addr } => {
-                new_members.insert(id, addr);
-            }
-            MembershipRequest::Remove { id } => {
-                new_members.remove(&id);
-            }
-        }
-        let index = self.runtime.submit_config_change(ClusterConfig::new(new_members))?;
+    fn apply_membership_request(
+        &mut self,
+        req: MembershipRequest,
+    ) -> Result<LogIndex, MembershipApplyError> {
+        let current = self.runtime.node().config();
+        let new_config = match req {
+            MembershipRequest::Add { id, addr } => current.with_member(id, addr),
+            MembershipRequest::Remove { id } => current
+                .without_member(id)
+                .map_err(|_| MembershipApplyError::WouldLeaveNoMembers)?,
+        };
+        let index = self.runtime.submit_config_change(new_config)?;
         self.apply_config_changes();
         Ok(index)
     }
@@ -188,7 +206,7 @@ impl Server {
     /// Sync the transport peer map whenever a new config takes effect on append.
     fn apply_config_changes(&mut self) {
         for config in self.runtime.take_config_changes() {
-            let self_id = self.runtime.node().id;
+            let self_id = self.runtime.node().id();
             // Remove peers that are no longer in the new config.
             let to_remove: Vec<NodeId> = self
                 .transport
@@ -200,7 +218,7 @@ impl Server {
                 self.transport.remove_peer(id);
             }
             // Add or update peers from the new config.
-            for (&peer_id, &addr) in &config.members {
+            for (peer_id, addr) in config.members() {
                 if peer_id != self_id {
                     self.transport.add_peer(peer_id, addr);
                 }
@@ -278,7 +296,7 @@ mod tests {
     fn test_server(id: u64, dir: &Path) -> Server {
         let local_id = NodeId::from(id);
         let listen_addr = test_addr(0);
-        let config = ClusterConfig::new(HashMap::from([(local_id, listen_addr)]));
+        let config = ClusterConfig::new(HashMap::from([(local_id, listen_addr)])).unwrap();
 
         let storage = FileStorage::open(dir).unwrap();
         let runtime =
@@ -308,7 +326,7 @@ mod tests {
         let mut server = test_server(1, dir.path());
 
         server.runtime.handle(Event::ElectionTimeout).unwrap();
-        assert!(matches!(server.runtime.node().role, Role::Leader(_)));
+        assert!(matches!(server.runtime.node().role(), Role::Leader(_)));
 
         let new_peer = NodeId::from(2);
         let index = server.apply_membership_request(MembershipRequest::Add {
@@ -332,7 +350,7 @@ mod tests {
         let mut server = test_server(1, dir.path());
 
         server.runtime.handle(Event::ElectionTimeout).unwrap();
-        assert!(matches!(server.runtime.node().role, Role::Leader(_)));
+        assert!(matches!(server.runtime.node().role(), Role::Leader(_)));
 
         let first = server.apply_membership_request(MembershipRequest::Add {
             id: NodeId::from(2),
@@ -344,10 +362,33 @@ mod tests {
             id: NodeId::from(3),
             addr: test_addr(19998),
         });
-        assert_eq!(
-            second,
-            Err(SubmitError::ConfigChangePending),
+        assert!(
+            matches!(
+                second,
+                Err(MembershipApplyError::Submit(SubmitError::ConfigChangePending))
+            ),
             "second change must be distinguishably rejected as pending, not conflated with not-leader"
+        );
+    }
+
+    /// Before ClusterConfig::new validated non-emptiness, removing a single-node
+    /// cluster's only member was fully representable and would have poisoned quorum
+    /// math (majority of zero voters) rather than being rejected up front.
+    #[test]
+    fn removing_the_last_member_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+        assert!(matches!(server.runtime.node().role(), Role::Leader(_)));
+
+        let result = server.apply_membership_request(MembershipRequest::Remove {
+            id: NodeId::from(1),
+        });
+
+        assert!(
+            matches!(result, Err(MembershipApplyError::WouldLeaveNoMembers)),
+            "removing the last member must be rejected, not silently poison the config"
         );
     }
 
@@ -377,8 +418,8 @@ mod tests {
         // Node 1 becomes leader alone, in term 1, and a client submits a command that
         // lands at index 2 (index 1 is the leader's own no-op).
         server.runtime.handle(Event::ElectionTimeout).unwrap();
-        assert!(matches!(server.runtime.node().role, Role::Leader(_)));
-        let leader_term = server.runtime.node().persistent.current_term;
+        assert!(matches!(server.runtime.node().role(), Role::Leader(_)));
+        let leader_term = server.runtime.node().persistent().current_term;
 
         let index = server
             .runtime
@@ -408,7 +449,7 @@ mod tests {
             server.purge_pending();
         }
         server.resolve_outputs();
-        assert!(matches!(server.runtime.node().role, Role::Follower(_)));
+        assert!(matches!(server.runtime.node().role(), Role::Follower(_)));
 
         // A new leader (term 6) overwrites index 2 with an unrelated command and directs
         // node 1 to commit it immediately.
