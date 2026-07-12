@@ -1,4 +1,8 @@
-use crate::types::{Log, LogEntry, LogIndex, NodeId, Term};
+use crate::types::Log;
+use crate::types::LogEntry;
+use crate::types::LogIndex;
+use crate::types::NodeId;
+use crate::types::Term;
 
 /// §5.1: currentTerm, votedFor, and log on stable storage. Implementations must flush to
 /// durable media before returning from any write — persisting after responding violates safety.
@@ -157,7 +161,10 @@ mod tests {
         assert_eq!(idx, LogIndex::from(2));
 
         assert_eq!(storage.last_log_index().unwrap(), LogIndex::from(2));
-        assert_eq!(storage.term_at(LogIndex::from(1)).unwrap(), Some(Term::from(1)));
+        assert_eq!(
+            storage.term_at(LogIndex::from(1)).unwrap(),
+            Some(Term::from(1))
+        );
         assert_eq!(
             storage.entry(LogIndex::from(1)).unwrap().map(|e| e.payload),
             Some(LogPayload::Command("SET name=miles".to_string()))

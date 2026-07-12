@@ -1,13 +1,20 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{mpsc, Arc};
+use std::io::Read;
+use std::io::Write;
+use std::io::{self};
+use std::net::SocketAddr;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-use crate::types::{Message, NodeId};
+use crate::types::Message;
+use crate::types::NodeId;
 
 /// Error type for transport operations.
 #[derive(Debug, thiserror::Error)]
@@ -58,16 +65,17 @@ where
         Ok(Self::start(local_id, listener, peers))
     }
 
-    fn start(
-        local_id: NodeId,
-        listener: TcpListener,
-        peers: HashMap<NodeId, SocketAddr>,
-    ) -> Self {
+    fn start(local_id: NodeId, listener: TcpListener, peers: HashMap<NodeId, SocketAddr>) -> Self {
         let listener = Arc::new(listener);
         let (tx, rx) = mpsc::channel();
         let listener_bg = Arc::clone(&listener);
         thread::spawn(move || accept_loop::<Cmd>(listener_bg, tx));
-        Self { local_id, peers, rx, _listener: listener }
+        Self {
+            local_id,
+            peers,
+            rx,
+            _listener: listener,
+        }
     }
 
     /// Register a new peer. Overwrites the address if the peer already exists.
@@ -160,7 +168,9 @@ fn dial_and_send<Cmd: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{LogIndex, RequestVote, Term};
+    use crate::types::LogIndex;
+    use crate::types::RequestVote;
+    use crate::types::Term;
 
     fn make_pair() -> (Transport<String>, Transport<String>) {
         // Bind to port 0 first to learn the assigned addresses.
@@ -194,7 +204,9 @@ mod tests {
 
         let (from, msg) = b.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(from, NodeId::from(1));
-        let Message::RequestVote(rv) = msg else { panic!("wrong variant") };
+        let Message::RequestVote(rv) = msg else {
+            panic!("wrong variant")
+        };
         assert_eq!(rv.term, Term::from(3));
         assert_eq!(rv.candidate_id, NodeId::from(1));
     }
@@ -202,14 +214,14 @@ mod tests {
     #[test]
     fn recv_timeout_returns_none_on_silence() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let t: Transport<String> =
-            Transport::start(NodeId::from(9), listener, HashMap::new());
+        let t: Transport<String> = Transport::start(NodeId::from(9), listener, HashMap::new());
         assert!(t.recv_timeout(Duration::from_millis(50)).is_none());
     }
 
     #[test]
     fn bidirectional_exchange() {
-        use crate::types::{AppendEntries, AppendEntriesResponse};
+        use crate::types::AppendEntries;
+        use crate::types::AppendEntriesResponse;
 
         let (a, b) = make_pair();
 
@@ -243,7 +255,9 @@ mod tests {
 
         let (from, msg) = a.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(from, NodeId::from(2));
-        let Message::AppendEntriesResponse(resp) = msg else { panic!("wrong variant") };
+        let Message::AppendEntriesResponse(resp) = msg else {
+            panic!("wrong variant")
+        };
         assert!(matches!(resp, AppendEntriesResponse::Accepted { .. }));
     }
 }

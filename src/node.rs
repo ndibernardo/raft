@@ -1,14 +1,26 @@
 use std::collections::HashSet;
 
-use tracing::{debug, info};
+use tracing::debug;
+use tracing::info;
 
 use crate::command::Command;
-use crate::state::{Candidate, Follower, Leader};
+use crate::state::Candidate;
+use crate::state::Follower;
+use crate::state::Leader;
 use crate::storage::Storage;
-use crate::types::{
-    AppendEntries, AppendEntriesResponse, ClusterConfig, Log, LogEntry, LogIndex, LogPayload,
-    MergeOutcome, Message, NodeId, RequestVote, RequestVoteResponse, Term,
-};
+use crate::types::AppendEntries;
+use crate::types::AppendEntriesResponse;
+use crate::types::ClusterConfig;
+use crate::types::Log;
+use crate::types::LogEntry;
+use crate::types::LogIndex;
+use crate::types::LogPayload;
+use crate::types::MergeOutcome;
+use crate::types::Message;
+use crate::types::NodeId;
+use crate::types::RequestVote;
+use crate::types::RequestVoteResponse;
+use crate::types::Term;
 
 /// Why `Node::submit_command` refused a client command: this node isn't the leader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -71,7 +83,10 @@ impl<Cmd: Clone> PersistentState<Cmd> {
             storage.truncate_from(LogIndex::from_length(rewrite_from + 1))?;
         }
 
-        for entry in self.log.suffix_from(LogIndex::from_length(rewrite_from + 1)) {
+        for entry in self
+            .log
+            .suffix_from(LogIndex::from_length(rewrite_from + 1))
+        {
             storage.append(entry.clone())?;
         }
 
@@ -587,7 +602,9 @@ impl<Cmd: Clone> Node<Cmd> {
     /// Appends a command to the log. Errors if this node isn't the leader.
     pub fn submit_command(&mut self, command: Cmd) -> Result<LogIndex, NotLeaderError> {
         if !matches!(self.role, Role::Leader(_)) {
-            return Err(NotLeaderError { leader_hint: self.leader_hint() });
+            return Err(NotLeaderError {
+                leader_hint: self.leader_hint(),
+            });
         }
 
         let entry = LogEntry {
@@ -607,9 +624,14 @@ impl<Cmd: Clone> Node<Cmd> {
     /// `SubmitError::NotLeader` — this node isn't the leader.
     /// `SubmitError::ConfigChangePending` — another change is already uncommitted;
     /// single-server changes (§4.1) allow at most one in flight.
-    pub fn propose_config_change(&mut self, config: ClusterConfig) -> Result<LogIndex, SubmitError> {
+    pub fn propose_config_change(
+        &mut self,
+        config: ClusterConfig,
+    ) -> Result<LogIndex, SubmitError> {
         if !matches!(self.role, Role::Leader(_)) {
-            return Err(SubmitError::NotLeader { leader_hint: self.leader_hint() });
+            return Err(SubmitError::NotLeader {
+                leader_hint: self.leader_hint(),
+            });
         }
         if self.has_pending_config_change() {
             debug!(node = %self.id, "config change rejected: another change is pending");
@@ -697,7 +719,11 @@ impl<Cmd: Clone> Node<Cmd> {
                     self.pending_committed_config_changes.push((index, cfg));
                 }
                 LogPayload::Command(command) => {
-                    return Some(Applied { index, term: entry.term, command });
+                    return Some(Applied {
+                        index,
+                        term: entry.term,
+                        command,
+                    });
                 }
             }
         }
@@ -930,9 +956,10 @@ mod tests {
         };
         let cmds = n.handle_append_entries(NodeId::from(2), req);
 
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::ResetElectionTimer)));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::ResetElectionTimer))
+        );
     }
 
     #[test]
@@ -1004,7 +1031,10 @@ mod tests {
         n.handle_append_entries(NodeId::from(2), req);
 
         assert_eq!(n.persistent.log.len(), 2);
-        assert_eq!(n.persistent.log[1].payload, LogPayload::Command("SET status=active".to_string()));
+        assert_eq!(
+            n.persistent.log[1].payload,
+            LogPayload::Command("SET status=active".to_string())
+        );
         assert_eq!(n.persistent.log[1].term, Term::from(2));
     }
 
@@ -1122,7 +1152,12 @@ mod tests {
         assert!(is_follower(&n));
 
         let result = n.submit_command("SET counter=1".to_string());
-        assert_eq!(result, Err(NotLeaderError { leader_hint: Some(NodeId::from(2)) }));
+        assert_eq!(
+            result,
+            Err(NotLeaderError {
+                leader_hint: Some(NodeId::from(2))
+            })
+        );
     }
 
     /// A candidate has no leader to redirect to this term.
@@ -1287,17 +1322,10 @@ mod tests {
         let mut storage = MemoryStorage::new();
         n.save(&mut storage).unwrap();
 
-        let restored: Node<String> = Node::from_storage(
-            NodeId::from(1),
-            test_config(1, &[2, 3]),
-            &storage,
-        )
-        .unwrap();
+        let restored: Node<String> =
+            Node::from_storage(NodeId::from(1), test_config(1, &[2, 3]), &storage).unwrap();
 
-        assert_eq!(
-            restored.persistent.current_term,
-            n.persistent.current_term
-        );
+        assert_eq!(restored.persistent.current_term, n.persistent.current_term);
         assert_eq!(restored.persistent.voted_for, n.persistent.voted_for);
         assert_eq!(restored.persistent.log.len(), n.persistent.log.len());
         assert!(is_follower(&restored));
@@ -1315,8 +1343,14 @@ mod tests {
             current_term: Term::from(1),
             voted_for: Some(NodeId::from(1)),
             log: Log::from_entries(vec![
-                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".to_string()) },
-                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET status=pending".to_string()) },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".to_string()),
+                },
             ]),
         };
         persistent.save(&mut storage).unwrap();
@@ -1330,7 +1364,10 @@ mod tests {
         persistent.save(&mut storage).unwrap();
 
         let reloaded: PersistentState<String> = PersistentState::load(&storage).unwrap();
-        assert_eq!(reloaded.log, persistent.log, "disk log must reflect the conflict overwrite");
+        assert_eq!(
+            reloaded.log, persistent.log,
+            "disk log must reflect the conflict overwrite"
+        );
     }
 
     /// Growing case: conflict resolution both truncates and appends new
@@ -1345,8 +1382,14 @@ mod tests {
             current_term: Term::from(1),
             voted_for: Some(NodeId::from(1)),
             log: Log::from_entries(vec![
-                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".to_string()) },
-                LogEntry { term: Term::from(1), payload: LogPayload::Command("SET status=pending".to_string()) },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".to_string()),
+                },
             ]),
         };
         persistent.save(&mut storage).unwrap();
@@ -1373,7 +1416,10 @@ mod tests {
 
         let cmds = n.handle_request_vote_response(
             NodeId::from(2),
-            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote_granted: true,
+            },
         );
 
         assert!(cmds.is_empty());
@@ -1387,7 +1433,10 @@ mod tests {
 
         let cmds = n.handle_request_vote_response(
             NodeId::from(2),
-            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote_granted: true,
+            },
         );
 
         assert!(cmds.is_empty());
@@ -1405,7 +1454,10 @@ mod tests {
 
         let cmds = n.handle_request_vote_response(
             NodeId::from(99),
-            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote_granted: true,
+            },
         );
 
         assert!(
@@ -1474,7 +1526,10 @@ mod tests {
         n.election_timeout();
         n.handle_request_vote_response(
             NodeId::from(2),
-            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote_granted: true,
+            },
         );
         assert!(is_leader(&n));
 
@@ -1497,7 +1552,10 @@ mod tests {
         n.election_timeout();
         n.handle_request_vote_response(
             NodeId::from(2),
-            RequestVoteResponse { term: Term::from(1), vote_granted: true },
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote_granted: true,
+            },
         );
 
         let config_a = test_config(1, &[2, 3, 4]);

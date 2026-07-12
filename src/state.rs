@@ -1,5 +1,8 @@
-use crate::types::{LogIndex, NodeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+use crate::types::LogIndex;
+use crate::types::NodeId;
 
 /// §5.1: followers are passive — they issue no requests, only respond to RPCs from
 /// leaders and candidates. If a follower receives no communication, it starts an election.
@@ -58,7 +61,7 @@ impl Candidate {
 /// The leader maintains next_index and match_index for each follower to track replication.
 #[derive(Debug)]
 pub struct Leader {
-    next_index: HashMap<NodeId, LogIndex>,  // next log index to send to each server
+    next_index: HashMap<NodeId, LogIndex>, // next log index to send to each server
     match_index: HashMap<NodeId, LogIndex>, // highest log index known to be replicated
 }
 
@@ -104,7 +107,9 @@ impl Leader {
     /// Register a new peer. Idempotent — calling twice with the same ID does not
     /// reset an already-advanced next_index.
     pub fn add_peer(&mut self, peer: NodeId, last_log_index: LogIndex) {
-        self.next_index.entry(peer).or_insert_with(|| last_log_index.next());
+        self.next_index
+            .entry(peer)
+            .or_insert_with(|| last_log_index.next());
         self.match_index.entry(peer).or_default();
     }
 
@@ -124,9 +129,18 @@ mod tests {
         let peers = vec![NodeId::from(1), NodeId::from(2), NodeId::from(3)];
         let leader = Leader::new(&peers, LogIndex::from(5));
 
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(6)));
-        assert_eq!(leader.next_index_for(NodeId::from(2)), Some(LogIndex::from(6)));
-        assert_eq!(leader.next_index_for(NodeId::from(3)), Some(LogIndex::from(6)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(6))
+        );
+        assert_eq!(
+            leader.next_index_for(NodeId::from(2)),
+            Some(LogIndex::from(6))
+        );
+        assert_eq!(
+            leader.next_index_for(NodeId::from(3)),
+            Some(LogIndex::from(6))
+        );
 
         let match_indices: Vec<_> = leader.match_indices().collect();
         assert_eq!(match_indices.len(), 3);
@@ -150,7 +164,10 @@ mod tests {
 
         let match_indices: Vec<_> = leader.match_indices().collect();
         assert!(match_indices.contains(&LogIndex::from(5)));
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(6)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(6))
+        );
     }
 
     #[test]
@@ -161,7 +178,10 @@ mod tests {
         leader.record_success(NodeId::from(1), LogIndex::from(5));
 
         // peer 2 should remain unchanged
-        assert_eq!(leader.next_index_for(NodeId::from(2)), Some(LogIndex::from(1)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(2)),
+            Some(LogIndex::from(1))
+        );
     }
 
     #[test]
@@ -169,13 +189,22 @@ mod tests {
         let peers = vec![NodeId::from(1)];
         let mut leader = Leader::new(&peers, LogIndex::from(10));
 
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(11)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(11))
+        );
 
         leader.record_failure(NodeId::from(1));
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(10)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(10))
+        );
 
         leader.record_failure(NodeId::from(1));
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(9)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(9))
+        );
     }
 
     #[test]
@@ -184,10 +213,16 @@ mod tests {
         let mut leader = Leader::new(&peers, LogIndex::from(0));
 
         leader.record_failure(NodeId::from(1));
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(0)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(0))
+        );
 
         leader.record_failure(NodeId::from(1));
-        assert_eq!(leader.next_index_for(NodeId::from(1)), Some(LogIndex::from(0)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(0))
+        );
     }
 
     #[test]
@@ -213,11 +248,10 @@ mod tests {
         let mut match_indices: Vec<_> = leader.match_indices().collect();
         match_indices.sort();
 
-        assert_eq!(match_indices, vec![
-            LogIndex::from(3),
-            LogIndex::from(4),
-            LogIndex::from(5),
-        ]);
+        assert_eq!(
+            match_indices,
+            vec![LogIndex::from(3), LogIndex::from(4), LogIndex::from(5),]
+        );
     }
 
     #[test]
@@ -227,7 +261,10 @@ mod tests {
 
         leader.record_success(NodeId::from(99), LogIndex::from(10));
 
-        assert_eq!(leader.next_index_for(NodeId::from(99)), Some(LogIndex::from(11)));
+        assert_eq!(
+            leader.next_index_for(NodeId::from(99)),
+            Some(LogIndex::from(11))
+        );
         let match_indices: Vec<_> = leader.match_indices().collect();
         assert!(match_indices.contains(&LogIndex::from(10)));
     }

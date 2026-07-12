@@ -1,13 +1,17 @@
-use std::collections::VecDeque;
-
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 
 use crate::command::Command;
-use crate::node::{Node, Role};
-use crate::runtime::{Runtime, StateMachine, TimerConfig};
+use crate::node::Node;
+use crate::node::Role;
+use crate::runtime::Runtime;
+use crate::runtime::StateMachine;
+use crate::runtime::TimerConfig;
 use crate::storage::MemoryStorage;
-use crate::types::{ClusterConfig, Message, NodeId};
+use crate::types::ClusterConfig;
+use crate::types::Message;
+use crate::types::NodeId;
 
 /// A message in flight between nodes.
 struct InFlight<Cmd> {
@@ -51,7 +55,12 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
             .iter()
             .map(|&id| {
                 let node = Node::new(id, config.clone());
-                Runtime::new(node, S::default(), MemoryStorage::new(), TimerConfig::default())
+                Runtime::new(
+                    node,
+                    S::default(),
+                    MemoryStorage::new(),
+                    TimerConfig::default(),
+                )
             })
             .collect();
 
@@ -169,7 +178,8 @@ mod proptest_tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::kv::{KvCommand, KvStore};
+    use crate::kv::KvCommand;
+    use crate::kv::KvStore;
     use crate::node::Role;
     use crate::types::LogIndex;
 
@@ -287,7 +297,9 @@ mod proptest_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kv::{KvCommand, KvResult, KvStore};
+    use crate::kv::KvCommand;
+    use crate::kv::KvResult;
+    use crate::kv::KvStore;
     use crate::types::LogIndex;
 
     #[test]

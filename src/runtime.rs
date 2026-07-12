@@ -1,11 +1,19 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use rand::Rng;
 
 use crate::command::Command;
-use crate::node::{Node, NotLeaderError, Role, SubmitError};
+use crate::node::Node;
+use crate::node::NotLeaderError;
+use crate::node::Role;
+use crate::node::SubmitError;
 use crate::storage::Storage;
-use crate::types::{ClusterConfig, LogIndex, Message, NodeId, Term};
+use crate::types::ClusterConfig;
+use crate::types::LogIndex;
+use crate::types::Message;
+use crate::types::NodeId;
+use crate::types::Term;
 
 /// Trait for state machines that can apply commands.
 pub trait StateMachine<Cmd> {
@@ -175,7 +183,9 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
     fn handle_message(&mut self, from: NodeId, message: Message<Cmd>) -> Vec<Command<Cmd>> {
         match message {
             Message::RequestVote(req) => self.node.handle_request_vote(from, req),
-            Message::RequestVoteResponse(resp) => self.node.handle_request_vote_response(from, resp),
+            Message::RequestVoteResponse(resp) => {
+                self.node.handle_request_vote_response(from, resp)
+            }
             Message::AppendEntries(req) => self.node.handle_append_entries(from, req),
             Message::AppendEntriesResponse(resp) => {
                 self.node.handle_append_entries_response(from, resp)
@@ -191,7 +201,8 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
                     // preventing repeated split votes when multiple candidates start at once.
                     let base = self.config.election_timeout;
                     let jitter_ms = rand::rng().random_range(0..base.as_millis() as u64);
-                    self.election_deadline = Instant::now() + base + Duration::from_millis(jitter_ms);
+                    self.election_deadline =
+                        Instant::now() + base + Duration::from_millis(jitter_ms);
                 }
                 Command::ResetHeartbeatTimer => {
                     self.heartbeat_deadline = Instant::now() + self.config.heartbeat_interval;
@@ -215,7 +226,8 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         while let Some(applied) = self.node.take_entry_to_apply() {
             tracing::debug!(node = %node_id, index = %applied.index, "entry applied");
             let output = self.state_machine.apply(applied.command.clone());
-            self.pending_outputs.push((applied.term, applied.index, output));
+            self.pending_outputs
+                .push((applied.term, applied.index, output));
         }
     }
 }
@@ -226,9 +238,13 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::kv::{KvCommand, KvResult, KvStore};
+    use crate::kv::KvCommand;
+    use crate::kv::KvResult;
+    use crate::kv::KvStore;
     use crate::storage::MemoryStorage;
-    use crate::types::{AppendEntriesResponse, RequestVoteResponse, Term};
+    use crate::types::AppendEntriesResponse;
+    use crate::types::RequestVoteResponse;
+    use crate::types::Term;
 
     fn test_config(id: u64, peers: &[u64]) -> ClusterConfig {
         let members: HashMap<NodeId, SocketAddr> = std::iter::once(id)
@@ -243,7 +259,12 @@ mod tests {
 
     fn runtime(id: u64, peers: &[u64]) -> Runtime<KvCommand, KvStore, MemoryStorage<KvCommand>> {
         let node = Node::new(NodeId::from(id), test_config(id, peers));
-        Runtime::new(node, KvStore::new(), MemoryStorage::new(), TimerConfig::default())
+        Runtime::new(
+            node,
+            KvStore::new(),
+            MemoryStorage::new(),
+            TimerConfig::default(),
+        )
     }
 
     #[test]
@@ -383,8 +404,12 @@ mod tests {
         let saw_jitter = (0..20).any(|_| {
             let node = Node::new(NodeId::from(1), test_config(1, &[2, 3]));
             let before = Instant::now();
-            let rt: Runtime<KvCommand, KvStore, MemoryStorage<KvCommand>> =
-                Runtime::new(node, KvStore::new(), MemoryStorage::new(), TimerConfig::default());
+            let rt: Runtime<KvCommand, KvStore, MemoryStorage<KvCommand>> = Runtime::new(
+                node,
+                KvStore::new(),
+                MemoryStorage::new(),
+                TimerConfig::default(),
+            );
             // 5ms comfortably exceeds constructor call overhead but is well inside the
             // [0, 300ms) jitter range, so this only trips on real jitter, not clock drift.
             rt.election_deadline.duration_since(before) > base + Duration::from_millis(5)

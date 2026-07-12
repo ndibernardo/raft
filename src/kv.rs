@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::runtime::StateMachine;
 
@@ -66,7 +67,9 @@ mod tests {
             value: "miles".to_string(),
         });
 
-        let result = store.apply(KvCommand::Get { key: "username".to_string() });
+        let result = store.apply(KvCommand::Get {
+            key: "username".to_string(),
+        });
 
         assert_eq!(result, KvResult::Value(Some("miles".to_string())));
     }
@@ -75,7 +78,9 @@ mod tests {
     fn get_returns_none_for_absent_key() {
         let mut store = KvStore::new();
 
-        let result = store.apply(KvCommand::Get { key: "username".to_string() });
+        let result = store.apply(KvCommand::Get {
+            key: "username".to_string(),
+        });
 
         assert_eq!(result, KvResult::Value(None));
     }
@@ -88,9 +93,13 @@ mod tests {
             key: "username".to_string(),
             value: "miles".to_string(),
         });
-        store.apply(KvCommand::Delete { key: "username".to_string() });
+        store.apply(KvCommand::Delete {
+            key: "username".to_string(),
+        });
 
-        let result = store.apply(KvCommand::Get { key: "username".to_string() });
+        let result = store.apply(KvCommand::Get {
+            key: "username".to_string(),
+        });
 
         assert_eq!(result, KvResult::Value(None));
     }
@@ -99,7 +108,9 @@ mod tests {
     fn delete_on_absent_key_returns_ok() {
         let mut store = KvStore::new();
 
-        let result = store.apply(KvCommand::Delete { key: "username".to_string() });
+        let result = store.apply(KvCommand::Delete {
+            key: "username".to_string(),
+        });
 
         assert_eq!(result, KvResult::Ok);
     }

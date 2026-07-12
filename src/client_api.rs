@@ -3,14 +3,21 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::Json;
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::Path;
+use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post, put};
-use axum::{Json, Router, body::Bytes};
+use axum::routing::delete;
+use axum::routing::get;
+use axum::routing::post;
+use axum::routing::put;
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
-use crate::kv::{KvCommand, KvResult};
+use crate::kv::KvCommand;
+use crate::kv::KvResult;
 use crate::types::NodeId;
 
 #[derive(Debug)]
@@ -49,11 +56,9 @@ pub fn start(
     kv_tx: mpsc::Sender<Pending>,
     membership_tx: mpsc::Sender<MembershipPending>,
 ) {
-    thread::spawn(move || {
-        match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt.block_on(serve(addr, kv_tx, membership_tx)),
-            Err(e) => eprintln!("client api: failed to start tokio runtime: {e}"),
-        }
+    thread::spawn(move || match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(serve(addr, kv_tx, membership_tx)),
+        Err(e) => eprintln!("client api: failed to start tokio runtime: {e}"),
     });
 }
 
@@ -62,7 +67,10 @@ async fn serve(
     kv_tx: mpsc::Sender<Pending>,
     membership_tx: mpsc::Sender<MembershipPending>,
 ) {
-    let state = AppState { kv_tx, membership_tx };
+    let state = AppState {
+        kv_tx,
+        membership_tx,
+    };
     let app = Router::new()
         .route("/kv/{key}", get(handle_get))
         .route("/kv/{key}", put(handle_put))
@@ -122,9 +130,17 @@ async fn handle_add_member(
 ) -> (StatusCode, String) {
     let addr: SocketAddr = match body.addr.parse() {
         Ok(a) => a,
-        Err(_) => return (StatusCode::BAD_REQUEST, format!("invalid addr: {}", body.addr)),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid addr: {}", body.addr),
+            );
+        }
     };
-    let req = MembershipRequest::Add { id: NodeId::from(body.id), addr };
+    let req = MembershipRequest::Add {
+        id: NodeId::from(body.id),
+        addr,
+    };
     submit_membership(state.membership_tx, req).await
 }
 
@@ -132,7 +148,9 @@ async fn handle_remove_member(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> (StatusCode, String) {
-    let req = MembershipRequest::Remove { id: NodeId::from(id) };
+    let req = MembershipRequest::Remove {
+        id: NodeId::from(id),
+    };
     submit_membership(state.membership_tx, req).await
 }
 
@@ -141,7 +159,10 @@ async fn submit_kv(tx: mpsc::Sender<Pending>, command: KvCommand) -> (StatusCode
     let (resp_tx, resp_rx) = oneshot::channel::<ApiResponse>();
 
     if tx.send((command, resp_tx)).is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down".into());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down".into(),
+        );
     }
 
     let result = tokio::time::timeout(Duration::from_secs(5), resp_rx).await;
@@ -152,7 +173,9 @@ async fn submit_kv(tx: mpsc::Sender<Pending>, command: KvCommand) -> (StatusCode
         Ok(Ok(ApiResponse::Result(KvResult::Value(None)))) => {
             (StatusCode::NOT_FOUND, String::new())
         }
-        Ok(Ok(ApiResponse::NotLeader { leader_hint: Some(id) })) => (
+        Ok(Ok(ApiResponse::NotLeader {
+            leader_hint: Some(id),
+        })) => (
             StatusCode::SERVICE_UNAVAILABLE,
             format!("not the leader; leader hint: node {}", id.value()),
         ),
@@ -170,7 +193,10 @@ async fn submit_membership(
     let (resp_tx, resp_rx) = oneshot::channel::<MembershipResult>();
 
     if tx.send((req, resp_tx)).is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down".into());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down".into(),
+        );
     }
 
     let result = tokio::time::timeout(Duration::from_secs(10), resp_rx).await;
@@ -180,9 +206,10 @@ async fn submit_membership(
         Ok(Ok(MembershipResult::NotLeader)) => {
             (StatusCode::SERVICE_UNAVAILABLE, "not the leader".into())
         }
-        Ok(Ok(MembershipResult::Rejected)) => {
-            (StatusCode::CONFLICT, "another config change is pending".into())
-        }
+        Ok(Ok(MembershipResult::Rejected)) => (
+            StatusCode::CONFLICT,
+            "another config change is pending".into(),
+        ),
         Ok(Err(_)) | Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout".into()),
     }
 }

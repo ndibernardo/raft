@@ -1,10 +1,16 @@
 use raft::cluster::Cluster;
-use raft::kv::{KvCommand, KvResult, KvStore};
+use raft::kv::KvCommand;
+use raft::kv::KvResult;
+use raft::kv::KvStore;
 use raft::node::Role;
-use raft::types::{LogIndex, Term};
+use raft::types::LogIndex;
+use raft::types::Term;
 
 fn set(key: &str, value: &str) -> KvCommand {
-    KvCommand::Set { key: key.to_string(), value: value.to_string() }
+    KvCommand::Set {
+        key: key.to_string(),
+        value: value.to_string(),
+    }
 }
 
 /// Drive node `i` to win an election and deliver all resulting messages.
@@ -21,7 +27,11 @@ fn single_node_becomes_leader_without_messages() {
 
     cluster.election_timeout(0);
 
-    assert_eq!(cluster.leader(), Some(0), "single node must win its own election");
+    assert_eq!(
+        cluster.leader(),
+        Some(0),
+        "single node must win its own election"
+    );
     assert_eq!(cluster.role_counts(), (0, 0, 1));
 }
 
@@ -65,7 +75,11 @@ fn re_election_after_leader_steps_down() {
     // Node 0 receives the higher-term RequestVote, steps down, grants vote.
     elect(&mut cluster, 1);
 
-    assert_eq!(cluster.leader(), Some(1), "node 1 must win the new election");
+    assert_eq!(
+        cluster.leader(),
+        Some(1),
+        "node 1 must win the new election"
+    );
     assert!(
         matches!(cluster.runtime(0).node().role(), Role::Follower(_)),
         "former leader must be a follower"
@@ -99,7 +113,10 @@ fn state_machine_reflects_committed_command() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("city", "amsterdam")).unwrap();
+    cluster
+        .runtime_mut(0)
+        .submit(set("city", "amsterdam"))
+        .unwrap();
 
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
@@ -107,7 +124,9 @@ fn state_machine_reflects_committed_command() {
     let result = cluster
         .runtime_mut(0)
         .state_machine_mut()
-        .apply(KvCommand::Get { key: "city".to_string() });
+        .apply(KvCommand::Get {
+            key: "city".to_string(),
+        });
     assert_eq!(result, KvResult::Value(Some("amsterdam".to_string())));
 }
 
@@ -117,7 +136,10 @@ fn outputs_empty_before_commit() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("pending", "true")).unwrap();
+    cluster
+        .runtime_mut(0)
+        .submit(set("pending", "true"))
+        .unwrap();
 
     assert!(
         cluster.runtime_mut(0).take_outputs().is_empty(),
@@ -145,8 +167,14 @@ fn three_consecutive_re_elections() {
 
     assert_eq!(cluster.leader(), Some(2));
     assert_eq!(cluster.role_counts(), (2, 0, 1));
-    assert!(matches!(cluster.runtime(0).node().role(), Role::Follower(_)));
-    assert!(matches!(cluster.runtime(1).node().role(), Role::Follower(_)));
+    assert!(matches!(
+        cluster.runtime(0).node().role(),
+        Role::Follower(_)
+    ));
+    assert!(matches!(
+        cluster.runtime(1).node().role(),
+        Role::Follower(_)
+    ));
 }
 
 /// Leader appends a no-op on election (§8) plus the submitted command.
@@ -156,7 +184,10 @@ fn command_replicated_to_all_followers_after_one_heartbeat() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("hostname", "node-alpha")).unwrap();
+    cluster
+        .runtime_mut(0)
+        .submit(set("hostname", "node-alpha"))
+        .unwrap();
 
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
@@ -177,7 +208,10 @@ fn command_committed_and_applied_on_all_nodes() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    cluster.runtime_mut(0).submit(set("region", "eu-west-1")).unwrap();
+    cluster
+        .runtime_mut(0)
+        .submit(set("region", "eu-west-1"))
+        .unwrap();
 
     // First heartbeat: replicate entries; leader commits (majority = self + one ack).
     cluster.heartbeat_timeout(0);

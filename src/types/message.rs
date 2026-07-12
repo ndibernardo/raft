@@ -1,7 +1,10 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::log::LogEntry;
-use super::primitives::{LogIndex, NodeId, Term};
+use super::primitives::LogIndex;
+use super::primitives::NodeId;
+use super::primitives::Term;
 
 /// RequestVote RPC arguments.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,9 +36,14 @@ pub struct AppendEntries<Cmd> {
 /// AppendEntries RPC response.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AppendEntriesResponse {
-    Accepted { term: Term, match_index: LogIndex },
+    Accepted {
+        term: Term,
+        match_index: LogIndex,
+    },
     /// Term mismatch or log inconsistency; match_index is undefined.
-    Rejected { term: Term },
+    Rejected {
+        term: Term,
+    },
 }
 
 impl AppendEntriesResponse {

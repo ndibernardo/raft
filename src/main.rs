@@ -5,7 +5,8 @@ use std::sync::mpsc;
 
 use clap::Parser;
 use raft::client_api;
-use raft::server::{Config, Server};
+use raft::server::Config;
+use raft::server::Server;
 use raft::types::NodeId;
 
 /// One `--peer` entry in `ID=ADDR` form.
@@ -38,7 +39,10 @@ impl FromStr for PeerSpec {
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| PeerSpecError::InvalidAddr(addr_str.to_string(), e))?;
-        Ok(Self { id: NodeId::from(id), addr })
+        Ok(Self {
+            id: NodeId::from(id),
+            addr,
+        })
     }
 }
 
@@ -76,8 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let peers: HashMap<NodeId, SocketAddr> =
-        args.peers.iter().map(|p| (p.id, p.addr)).collect();
+    let peers: HashMap<NodeId, SocketAddr> = args.peers.iter().map(|p| (p.id, p.addr)).collect();
 
     let (client_tx, client_rx) = mpsc::channel::<client_api::Pending>();
     let (membership_tx, membership_rx) = mpsc::channel::<client_api::MembershipPending>();

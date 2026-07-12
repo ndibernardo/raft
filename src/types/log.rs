@@ -1,9 +1,12 @@
-use std::ops::{Index, IndexMut};
+use std::ops::Index;
+use std::ops::IndexMut;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::config::ClusterConfig;
-use super::primitives::{LogIndex, Term};
+use super::primitives::LogIndex;
+use super::primitives::Term;
 
 /// The data carried by a log entry. §8: leaders append a NoOp on election to commit
 /// prior-term entries via Log Matching without direct commitment of old terms.
@@ -175,7 +178,10 @@ mod tests {
     use crate::types::NodeId;
 
     fn entry(term: u64, cmd: &str) -> LogEntry<String> {
-        LogEntry { term: Term::from(term), payload: LogPayload::Command(cmd.to_string()) }
+        LogEntry {
+            term: Term::from(term),
+            payload: LogPayload::Command(cmd.to_string()),
+        }
     }
 
     fn log_with(entries: Vec<LogEntry<String>>) -> Log<String> {
@@ -195,7 +201,10 @@ mod tests {
 
     #[test]
     fn merge_truncates_on_same_length_conflict() {
-        let mut log = log_with(vec![entry(1, "SET name=miles"), entry(1, "SET status=pending")]);
+        let mut log = log_with(vec![
+            entry(1, "SET name=miles"),
+            entry(1, "SET status=pending"),
+        ]);
 
         let outcome = log.merge(LogIndex::from(1), vec![entry(2, "SET status=active")]);
 
@@ -206,11 +215,17 @@ mod tests {
 
     #[test]
     fn merge_truncates_and_grows_the_log() {
-        let mut log = log_with(vec![entry(1, "SET name=miles"), entry(1, "SET status=pending")]);
+        let mut log = log_with(vec![
+            entry(1, "SET name=miles"),
+            entry(1, "SET status=pending"),
+        ]);
 
         let outcome = log.merge(
             LogIndex::from(1),
-            vec![entry(2, "SET status=active"), entry(2, "SET region=eu-west-1")],
+            vec![
+                entry(2, "SET status=active"),
+                entry(2, "SET region=eu-west-1"),
+            ],
         );
 
         assert_eq!(outcome, MergeOutcome::Truncated);
@@ -224,7 +239,10 @@ mod tests {
         let mut log = log_with(vec![entry(1, "SET name=miles"), entry(1, "SET counter=1")]);
 
         // Retried AppendEntries: same entries, no conflict, nothing to do.
-        let outcome = log.merge(LogIndex::from(0), vec![entry(1, "SET name=miles"), entry(1, "SET counter=1")]);
+        let outcome = log.merge(
+            LogIndex::from(0),
+            vec![entry(1, "SET name=miles"), entry(1, "SET counter=1")],
+        );
 
         assert_eq!(outcome, MergeOutcome::Appended);
         assert_eq!(log.len(), 2);
@@ -275,13 +293,14 @@ mod tests {
 
     #[test]
     fn config_change_payload_round_trips_through_entry() {
-        let members = std::collections::HashMap::from([(
-            NodeId::from(1),
-            "127.0.0.1:9001".parse().unwrap(),
-        )]);
+        let members =
+            std::collections::HashMap::from([(NodeId::from(1), "127.0.0.1:9001".parse().unwrap())]);
         let cfg = ClusterConfig::new(members).unwrap();
         let mut log: Log<String> = Log::new();
-        log.append(LogEntry { term: Term::from(1), payload: LogPayload::ConfigChange(cfg.clone()) });
+        log.append(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::ConfigChange(cfg.clone()),
+        });
 
         assert!(matches!(&log[0].payload, LogPayload::ConfigChange(c) if c == &cfg));
     }

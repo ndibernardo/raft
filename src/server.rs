@@ -2,20 +2,33 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use tokio::sync::oneshot;
 
-use crate::client_api::{
-    ApiResponse, MembershipPending, MembershipRequest, MembershipResult, Pending,
-};
+use crate::client_api::ApiResponse;
+use crate::client_api::MembershipPending;
+use crate::client_api::MembershipRequest;
+use crate::client_api::MembershipResult;
+use crate::client_api::Pending;
 use crate::command::Command;
-use crate::file_storage::{FileStorage, FileStorageError};
-use crate::kv::{KvCommand, KvStore};
-use crate::node::{NotLeaderError, SubmitError};
-use crate::runtime::{Event, Runtime, TimerConfig};
-use crate::transport::{Transport, TransportError};
-use crate::types::{ClusterConfig, ConfigError, LogIndex, NodeId, Term};
+use crate::file_storage::FileStorage;
+use crate::file_storage::FileStorageError;
+use crate::kv::KvCommand;
+use crate::kv::KvStore;
+use crate::node::NotLeaderError;
+use crate::node::SubmitError;
+use crate::runtime::Event;
+use crate::runtime::Runtime;
+use crate::runtime::TimerConfig;
+use crate::transport::Transport;
+use crate::transport::TransportError;
+use crate::types::ClusterConfig;
+use crate::types::ConfigError;
+use crate::types::LogIndex;
+use crate::types::NodeId;
+use crate::types::Term;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -264,9 +277,13 @@ mod tests {
 
     use super::*;
     use crate::node::Role;
-    use crate::types::{
-        AppendEntries, AppendEntriesResponse, LogEntry, LogPayload, Message, RequestVote, Term,
-    };
+    use crate::types::AppendEntries;
+    use crate::types::AppendEntriesResponse;
+    use crate::types::LogEntry;
+    use crate::types::LogPayload;
+    use crate::types::Message;
+    use crate::types::RequestVote;
+    use crate::types::Term;
 
     fn test_addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -279,9 +296,14 @@ mod tests {
         let config = ClusterConfig::new(HashMap::from([(local_id, listen_addr)])).unwrap();
 
         let storage = FileStorage::open(dir).unwrap();
-        let runtime =
-            Runtime::from_storage(local_id, config, KvStore::new(), storage, TimerConfig::default())
-                .unwrap();
+        let runtime = Runtime::from_storage(
+            local_id,
+            config,
+            KvStore::new(),
+            storage,
+            TimerConfig::default(),
+        )
+        .unwrap();
         let transport = Transport::bind(local_id, listen_addr, HashMap::new()).unwrap();
         let (_client_tx, client_rx) = mpsc::channel();
         let (_membership_tx, membership_rx) = mpsc::channel();
@@ -345,7 +367,9 @@ mod tests {
         assert!(
             matches!(
                 second,
-                Err(MembershipApplyError::Submit(SubmitError::ConfigChangePending))
+                Err(MembershipApplyError::Submit(
+                    SubmitError::ConfigChangePending
+                ))
             ),
             "second change must be distinguishably rejected as pending, not conflated with not-leader"
         );
@@ -384,7 +408,10 @@ mod tests {
             match_index: LogIndex::default(),
         });
 
-        server.dispatch(vec![Command::Send { to: NodeId::from(99), message }]);
+        server.dispatch(vec![Command::Send {
+            to: NodeId::from(99),
+            message,
+        }]);
     }
 
     /// If leadership changes before a submitted command commits, a
@@ -403,7 +430,10 @@ mod tests {
 
         let index = server
             .runtime
-            .submit(KvCommand::Set { key: "username".to_string(), value: "miles".to_string() })
+            .submit(KvCommand::Set {
+                key: "username".to_string(),
+                value: "miles".to_string(),
+            })
             .unwrap();
         assert_eq!(index, LogIndex::from(2));
         let (resp_tx, mut resp_rx) = oneshot::channel();
@@ -465,7 +495,9 @@ mod tests {
         // fine. Only an ApiResponse::Result here would mean the wrong answer was delivered.
         match resp_rx.try_recv() {
             Ok(ApiResponse::Result(result)) => {
-                panic!("stranded client incorrectly received a different command's result: {result:?}")
+                panic!(
+                    "stranded client incorrectly received a different command's result: {result:?}"
+                )
             }
             Ok(ApiResponse::NotLeader { .. }) | Err(_) => {}
         }

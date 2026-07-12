@@ -37,16 +37,20 @@
               "rust-analyzer"
             ];
           };
+          nightlyRustfmt = pkgs.rust-bin.nightly.latest.rustfmt;
         in
         {
           devShells.default = pkgs.mkShell {
             packages = [
               rustToolchain
+              nightlyRustfmt
               pkgs.nixd
               pkgs.nixfmt-rfc-style
             ];
 
             shellHook = ''
+              export RUSTFMT="${nightlyRustfmt}/bin/rustfmt"
+
               echo "Raft-rs development environment"
               echo "Rust version: $(rustc --version)"
             '';

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::primitives::NodeId;
 
@@ -123,6 +124,9 @@ mod tests {
     #[test]
     fn without_member_rejects_removing_the_last_member() {
         let config = single_member_config();
-        assert_eq!(config.without_member(NodeId::from(1)), Err(ConfigError::Empty));
+        assert_eq!(
+            config.without_member(NodeId::from(1)),
+            Err(ConfigError::Empty)
+        );
     }
 }
