@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::Storage;
-use crate::types::{LogEntry, LogIndex, NodeId, Term};
+use crate::types::{Log, LogEntry, LogIndex, MergeOutcome, NodeId, Term};
 
 /// Error type for FileStorage operations.
 #[derive(Debug, thiserror::Error)]
@@ -34,7 +34,7 @@ pub struct FileStorage<Cmd> {
     dir: PathBuf,
     current_term: Term,
     voted_for: Option<NodeId>,
-    log: Vec<LogEntry<Cmd>>,
+    log: Log<Cmd>,
 }
 
 impl<Cmd> FileStorage<Cmd>
@@ -51,7 +51,7 @@ where
             dir: dir.to_path_buf(),
             current_term: meta.current_term,
             voted_for: meta.voted_for,
-            log,
+            log: Log::from_entries(log),
         })
     }
 
@@ -129,7 +129,7 @@ where
     fn rewrite_log_file(&self) -> Result<(), FileStorageError> {
         let tmp = self.dir.join("log.jsonl.tmp");
         let mut file = File::create(&tmp)?;
-        for entry in &self.log {
+        for entry in self.log.iter() {
             let mut line = serde_json::to_string(entry)?;
             line.push('\n');
             file.write_all(line.as_bytes())?;
@@ -167,81 +167,53 @@ where
     }
 
     fn last_log_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(LogIndex::from_length(self.log.len()))
+        Ok(self.log.last_index())
     }
 
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
-        match index.to_array_index() {
-            None => Ok(Some(Term::default())),
-            Some(idx) => Ok(self.log.get(idx).map(|e| e.term)),
-        }
+        Ok(self.log.term_at(index))
     }
 
     fn entry(&self, index: LogIndex) -> Result<Option<LogEntry<Cmd>>, Self::Error> {
-        match index.to_array_index() {
-            None => Ok(None),
-            Some(idx) => Ok(self.log.get(idx).cloned()),
-        }
+        Ok(self.log.entry(index).cloned())
     }
 
     fn entries_from(&self, start: LogIndex) -> Result<Vec<LogEntry<Cmd>>, Self::Error> {
-        match start.to_array_index() {
-            None => Ok(self.log.clone()),
-            Some(idx) => Ok(self.log.get(idx..).unwrap_or_default().to_vec()),
-        }
+        Ok(self.log.suffix_from(start).to_vec())
     }
 
     fn append(&mut self, entry: LogEntry<Cmd>) -> Result<LogIndex, Self::Error> {
         self.append_to_log_file(&entry)?;
-        self.log.push(entry);
-        Ok(LogIndex::from_length(self.log.len()))
+        Ok(self.log.append(entry))
     }
 
     fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error> {
-        if let Some(idx) = index.to_array_index() {
-            self.log.truncate(idx);
-        }
+        self.log.truncate_from(index);
         self.rewrite_log_file()
     }
 
-    /// Append entries per Raft rules (§5.3): if an existing entry conflicts with
-    /// a new one (same index, different term), delete it and everything after.
-    /// On a conflict the whole log is rewritten atomically; on a pure append
-    /// each new entry is fsynced individually, keeping the common path fast.
+    /// Append entries per Raft rules (§5.3): conflict detection and truncation is
+    /// delegated to `Log::merge`. On a conflict the whole log is rewritten atomically;
+    /// on a pure append only the new suffix is fsynced individually, keeping the
+    /// common path fast without a second duplicated conflict-resolution loop.
     fn append_entries(
         &mut self,
         prev_log_index: LogIndex,
         entries: Vec<LogEntry<Cmd>>,
     ) -> Result<(), Self::Error> {
-        let mut insert_index = prev_log_index.next();
-        let mut conflict_found = false;
+        let before_len = self.log.len();
+        let outcome = self.log.merge(prev_log_index, entries);
 
-        for entry in entries {
-            match insert_index.to_array_index() {
-                Some(idx) if idx < self.log.len() => {
-                    if self.log[idx].term != entry.term {
-                        self.log.truncate(idx);
-                        self.log.push(entry);
-                        conflict_found = true;
-                    }
-                    // Same term at this index: already present, skip.
+        match outcome {
+            MergeOutcome::Truncated => self.rewrite_log_file(),
+            MergeOutcome::Appended => {
+                let new_start = LogIndex::from_length(before_len).next();
+                for entry in self.log.suffix_from(new_start) {
+                    self.append_to_log_file(entry)?;
                 }
-                _ => {
-                    if !conflict_found {
-                        // Pure append path: persist incrementally.
-                        self.append_to_log_file(&entry)?;
-                    }
-                    self.log.push(entry);
-                }
+                Ok(())
             }
-            insert_index = insert_index.next();
         }
-
-        if conflict_found {
-            self.rewrite_log_file()?;
-        }
-
-        Ok(())
     }
 }
 

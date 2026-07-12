@@ -6,8 +6,8 @@ use crate::command::Command;
 use crate::state::{Candidate, Follower, Leader};
 use crate::storage::Storage;
 use crate::types::{
-    AppendEntries, AppendEntriesResponse, ClusterConfig, LogEntry, LogIndex, LogPayload, Message,
-    NodeId, RequestVote, RequestVoteResponse, Term,
+    AppendEntries, AppendEntriesResponse, ClusterConfig, Log, LogEntry, LogIndex, LogPayload,
+    MergeOutcome, Message, NodeId, RequestVote, RequestVoteResponse, Term,
 };
 
 /// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
@@ -16,7 +16,7 @@ use crate::types::{
 pub struct PersistentState<Cmd> {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
-    pub log: Vec<LogEntry<Cmd>>,
+    pub log: Log<Cmd>,
 }
 
 impl<Cmd: Clone> PersistentState<Cmd> {
@@ -24,7 +24,7 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         Ok(Self {
             current_term: storage.current_term()?,
             voted_for: storage.voted_for()?,
-            log: storage.entries_from(LogIndex::from(1))?,
+            log: Log::from_entries(storage.entries_from(LogIndex::from(1))?),
         })
     }
 
@@ -53,7 +53,7 @@ impl<Cmd: Clone> PersistentState<Cmd> {
             storage.truncate_from(LogIndex::from_length(rewrite_from + 1))?;
         }
 
-        for entry in &self.log[rewrite_from..] {
+        for entry in self.log.suffix_from(LogIndex::from_length(rewrite_from + 1)) {
             storage.append(entry.clone())?;
         }
 
@@ -117,7 +117,7 @@ impl<Cmd: Clone> Node<Cmd> {
             persistent: PersistentState {
                 current_term: Term::default(),
                 voted_for: None,
-                log: Vec::new(),
+                log: Log::new(),
             },
             volatile: VolatileState {
                 commit_index: LogIndex::default(),
@@ -164,7 +164,7 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     fn last_log_index(&self) -> LogIndex {
-        LogIndex::from_length(self.persistent.log.len())
+        self.persistent.log.last_index()
     }
 
     /// Convert to follower state. Only resets voted_for when moving to a newer term —
@@ -186,17 +186,14 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     fn last_log_term(&self) -> Term {
-        self.persistent
-            .log
-            .last()
-            .map_or(Term::default(), |entry| entry.term)
+        self.persistent.log.last_term()
     }
 
     /// Apply a new cluster config: updates peers, leader tracking maps, and emits a
     /// pending notification so the transport is updated before the next heartbeat.
     fn set_config(&mut self, config: ClusterConfig) {
         let new_peers: Vec<NodeId> = config.peer_ids(self.id);
-        let last = LogIndex::from_length(self.persistent.log.len());
+        let last = self.persistent.log.last_index();
         let old_peers: HashSet<NodeId> = self.peers.iter().copied().collect();
         let new_peer_set: HashSet<NodeId> = new_peers.iter().copied().collect();
 
@@ -362,7 +359,7 @@ impl<Cmd: Clone> Node<Cmd> {
     /// §8: no-op entry commits prior-term entries indirectly via Log Matching, avoiding the
     /// Figure 8 anomaly where a leader cannot directly commit entries from previous terms.
     fn become_leader(&mut self) -> Vec<Command<Cmd>> {
-        self.persistent.log.push(LogEntry {
+        self.persistent.log.append(LogEntry {
             term: self.persistent.current_term,
             payload: LogPayload::NoOp,
         });
@@ -422,22 +419,11 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     fn term_at(&self, index: LogIndex) -> Term {
-        match index.to_array_index() {
-            None => Term::default(),
-            Some(idx) => self
-                .persistent
-                .log
-                .get(idx)
-                .map(|e| e.term)
-                .unwrap_or_default(),
-        }
+        self.persistent.log.term_at(index).unwrap_or_default()
     }
 
     fn entries_from(&self, start: LogIndex) -> Vec<LogEntry<Cmd>> {
-        match start.to_array_index() {
-            None => self.persistent.log.clone(),
-            Some(idx) => self.persistent.log.get(idx..).unwrap_or_default().to_vec(),
-        }
+        self.persistent.log.suffix_from(start).to_vec()
     }
 
     /// §Figure 2 AppendEntries RPC — receiver implementation.
@@ -506,15 +492,7 @@ impl<Cmd: Clone> Node<Cmd> {
 
     /// §5.3 Log Matching: reject if prev_log_index/term don't match our log (Figure 2 §2).
     fn check_log_consistency(&self, prev_log_index: LogIndex, prev_log_term: Term) -> bool {
-        match prev_log_index.to_array_index() {
-            // Index 0 is the implicit sentinel: term must also be 0.
-            None => prev_log_term == Term::default(),
-            Some(idx) => self
-                .persistent
-                .log
-                .get(idx)
-                .is_some_and(|entry| entry.term == prev_log_term),
-        }
+        self.persistent.log.matches(prev_log_index, prev_log_term)
     }
 
     /// Non-leaders and stale terms are no-ops; leaders update replication progress.
@@ -562,8 +540,7 @@ impl<Cmd: Clone> Node<Cmd> {
             term: self.persistent.current_term,
             payload: LogPayload::Command(command),
         };
-        self.persistent.log.push(entry);
-        let index = self.last_log_index();
+        let index = self.persistent.log.append(entry);
         debug!(node = %self.id, term = %self.persistent.current_term, index = %index, "command appended to log");
         Some(index)
     }
@@ -584,8 +561,7 @@ impl<Cmd: Clone> Node<Cmd> {
             term: self.persistent.current_term,
             payload: LogPayload::ConfigChange(config.clone()),
         };
-        self.persistent.log.push(entry);
-        let index = self.last_log_index();
+        let index = self.persistent.log.append(entry);
         // Takes effect immediately on append — quorum calculations use the new config
         // before the entry is committed.
         self.set_config(config);
@@ -598,7 +574,7 @@ impl<Cmd: Clone> Node<Cmd> {
     fn has_pending_config_change(&self) -> bool {
         let committed = self.volatile.commit_index;
         self.persistent.log.iter().enumerate().any(|(i, e)| {
-            let index = LogIndex::from((i + 1) as u64);
+            let index = LogIndex::from_length(i + 1);
             index > committed && matches!(e.payload, LogPayload::ConfigChange(_))
         })
     }
@@ -624,9 +600,10 @@ impl<Cmd: Clone> Node<Cmd> {
 
         // Only commit if entry is from current term (Figure 8 safety).
         let has_higher_index = majority_index > self.volatile.commit_index;
-        let is_current_term = majority_index
-            .to_array_index()
-            .and_then(|idx| self.persistent.log.get(idx))
+        let is_current_term = self
+            .persistent
+            .log
+            .entry(majority_index)
             .is_some_and(|e| e.term == self.persistent.current_term);
 
         if has_higher_index && is_current_term {
@@ -651,8 +628,7 @@ impl<Cmd: Clone> Node<Cmd> {
             self.volatile.last_applied = self.volatile.last_applied.next();
             let index = self.volatile.last_applied;
 
-            let idx = index.to_array_index()?;
-            let entry = self.persistent.log.get(idx)?;
+            let entry = self.persistent.log.entry(index)?;
 
             match &entry.payload {
                 LogPayload::NoOp => {}
@@ -685,33 +661,18 @@ impl<Cmd: Clone> Node<Cmd> {
     /// Calls apply_latest_config_from_log if a truncation occurred or a ConfigChange was added,
     /// because a truncation may have removed a previously active config.
     fn append_entries(&mut self, prev_log_index: LogIndex, entries: Vec<LogEntry<Cmd>>) {
-        let mut insert_index = prev_log_index.next();
-        let mut config_updated = false;
+        let has_config_entry = entries
+            .iter()
+            .any(|e| matches!(e.payload, LogPayload::ConfigChange(_)));
 
-        for entry in entries {
-            let is_config = matches!(entry.payload, LogPayload::ConfigChange(_));
-            match insert_index.to_array_index() {
-                Some(idx) if idx < self.persistent.log.len() => {
-                    if self.persistent.log[idx].term != entry.term {
-                        debug!(node = %self.id, truncate_from = idx + 1, "log truncated on conflict");
-                        self.persistent.log.truncate(idx);
-                        self.persistent.log.push(entry);
-                        // Truncation may have removed a ConfigChange; rescan needed.
-                        config_updated = true;
-                    }
-                    // Same term at this index: entry already present, skip.
-                }
-                _ => {
-                    self.persistent.log.push(entry);
-                    if is_config {
-                        config_updated = true;
-                    }
-                }
-            }
-            insert_index = insert_index.next();
+        let outcome = self.persistent.log.merge(prev_log_index, entries);
+        if let MergeOutcome::Truncated = outcome {
+            debug!(node = %self.id, prev_index = %prev_log_index, "log truncated on conflict");
         }
 
-        if config_updated {
+        // A truncation may have removed a previously active ConfigChange; a newly
+        // appended ConfigChange must also trigger a rescan to become the active config.
+        if matches!(outcome, MergeOutcome::Truncated) || has_config_entry {
             self.apply_latest_config_from_log();
         }
     }
@@ -728,7 +689,7 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     fn push_entry(&mut self, entry: LogEntry<Cmd>) {
-        self.persistent.log.push(entry);
+        self.persistent.log.append(entry);
     }
 }
 
@@ -1264,10 +1225,10 @@ mod tests {
         let mut persistent = PersistentState {
             current_term: Term::from(1),
             voted_for: Some(NodeId::from(1)),
-            log: vec![
+            log: Log::from_entries(vec![
                 LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".to_string()) },
                 LogEntry { term: Term::from(1), payload: LogPayload::Command("SET status=pending".to_string()) },
-            ],
+            ]),
         };
         persistent.save(&mut storage).unwrap();
 
@@ -1294,10 +1255,10 @@ mod tests {
         let mut persistent = PersistentState {
             current_term: Term::from(1),
             voted_for: Some(NodeId::from(1)),
-            log: vec![
+            log: Log::from_entries(vec![
                 LogEntry { term: Term::from(1), payload: LogPayload::Command("SET name=miles".to_string()) },
                 LogEntry { term: Term::from(1), payload: LogPayload::Command("SET status=pending".to_string()) },
-            ],
+            ]),
         };
         persistent.save(&mut storage).unwrap();
 
@@ -1306,7 +1267,7 @@ mod tests {
             term: Term::from(2),
             payload: LogPayload::Command("SET status=active".to_string()),
         };
-        persistent.log.push(LogEntry {
+        persistent.log.append(LogEntry {
             term: Term::from(2),
             payload: LogPayload::Command("SET region=eu-west-1".to_string()),
         });

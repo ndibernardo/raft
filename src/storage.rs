@@ -1,4 +1,4 @@
-use crate::types::{LogEntry, LogIndex, NodeId, Term};
+use crate::types::{Log, LogEntry, LogIndex, NodeId, Term};
 
 /// §5.1: currentTerm, votedFor, and log on stable storage. Implementations must flush to
 /// durable media before returning from any write — persisting after responding violates safety.
@@ -42,7 +42,7 @@ pub trait Storage<Cmd> {
 pub struct MemoryStorage<Cmd> {
     current_term: Term,
     voted_for: Option<NodeId>,
-    log: Vec<LogEntry<Cmd>>,
+    log: Log<Cmd>,
 }
 
 impl<Cmd> MemoryStorage<Cmd> {
@@ -50,7 +50,7 @@ impl<Cmd> MemoryStorage<Cmd> {
         Self {
             current_term: Term::default(),
             voted_for: None,
-            log: Vec::new(),
+            log: Log::new(),
         }
     }
 }
@@ -83,39 +83,27 @@ impl<Cmd: Clone> Storage<Cmd> for MemoryStorage<Cmd> {
     }
 
     fn last_log_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(LogIndex::from_length(self.log.len()))
+        Ok(self.log.last_index())
     }
 
     fn term_at(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
-        match index.to_array_index() {
-            None => Ok(Some(Term::default())),
-            Some(idx) => Ok(self.log.get(idx).map(|e| e.term)),
-        }
+        Ok(self.log.term_at(index))
     }
 
     fn entry(&self, index: LogIndex) -> Result<Option<LogEntry<Cmd>>, Self::Error> {
-        match index.to_array_index() {
-            None => Ok(None),
-            Some(idx) => Ok(self.log.get(idx).cloned()),
-        }
+        Ok(self.log.entry(index).cloned())
     }
 
     fn entries_from(&self, start: LogIndex) -> Result<Vec<LogEntry<Cmd>>, Self::Error> {
-        match start.to_array_index() {
-            None => Ok(self.log.clone()),
-            Some(idx) => Ok(self.log.get(idx..).unwrap_or_default().to_vec()),
-        }
+        Ok(self.log.suffix_from(start).to_vec())
     }
 
     fn append(&mut self, entry: LogEntry<Cmd>) -> Result<LogIndex, Self::Error> {
-        self.log.push(entry);
-        Ok(LogIndex::from_length(self.log.len()))
+        Ok(self.log.append(entry))
     }
 
     fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error> {
-        if let Some(idx) = index.to_array_index() {
-            self.log.truncate(idx);
-        }
+        self.log.truncate_from(index);
         Ok(())
     }
 
@@ -124,22 +112,7 @@ impl<Cmd: Clone> Storage<Cmd> for MemoryStorage<Cmd> {
         prev_log_index: LogIndex,
         entries: Vec<LogEntry<Cmd>>,
     ) -> Result<(), Self::Error> {
-        let mut insert_index = prev_log_index.next();
-
-        for entry in entries {
-            match insert_index.to_array_index() {
-                Some(idx) if idx < self.log.len() => {
-                    if self.log[idx].term != entry.term {
-                        self.log.truncate(idx);
-                        self.log.push(entry);
-                    }
-                }
-                _ => {
-                    self.log.push(entry);
-                }
-            }
-            insert_index = insert_index.next();
-        }
+        self.log.merge(prev_log_index, entries);
         Ok(())
     }
 }
