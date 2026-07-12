@@ -15,7 +15,7 @@ use crate::kv::{KvCommand, KvStore};
 use crate::node::{NotLeaderError, SubmitError};
 use crate::runtime::{Event, Runtime, TimerConfig};
 use crate::transport::{Transport, TransportError};
-use crate::types::{ClusterConfig, LogIndex, NodeId, Term};
+use crate::types::{ClusterConfig, ConfigError, LogIndex, NodeId, Term};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -24,7 +24,7 @@ pub enum ServerError {
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
     #[error("config: {0}")]
-    Config(String),
+    Config(#[from] ConfigError),
 }
 
 /// Why `Server::apply_membership_request` could not apply a membership change.
@@ -41,12 +41,13 @@ impl From<SubmitError> for MembershipApplyError {
     }
 }
 
+/// Boundary-validated startup config: every field is already a valid domain type,
+/// parsed once at the CLI (see `main.rs`), so `Server::start` never re-parses strings.
 pub struct Config {
-    pub id: u64,
-    pub addr: String,
-    pub peers: HashMap<String, String>,
+    pub id: NodeId,
+    pub addr: SocketAddr,
+    pub peers: HashMap<NodeId, SocketAddr>,
     pub data_dir: PathBuf,
-    pub client_addr: Option<String>,
 }
 
 /// A running Raft KV node: persistent log on disk, RPCs over TCP.
@@ -69,21 +70,14 @@ impl Server {
         client_rx: mpsc::Receiver<Pending>,
         membership_rx: mpsc::Receiver<MembershipPending>,
     ) -> Result<Self, ServerError> {
-        let local_id = NodeId::from(config.id);
-
-        let addr: SocketAddr = config
-            .addr
-            .parse()
-            .map_err(|e| ServerError::Config(format!("invalid addr '{}': {e}", config.addr)))?;
-
-        let peers = parse_peers(&config.peers)?;
+        let local_id = config.id;
+        let addr = config.addr;
 
         // Initial config includes self so crash-recovery can rescan the log correctly.
         // Always non-empty: local_id is inserted unconditionally below.
-        let mut members = peers.clone();
+        let mut members = config.peers.clone();
         members.insert(local_id, addr);
-        let initial_config =
-            ClusterConfig::new(members).map_err(|e| ServerError::Config(e.to_string()))?;
+        let initial_config = ClusterConfig::new(members)?;
 
         let storage = FileStorage::open(&config.data_dir)?;
         let runtime = Runtime::from_storage(
@@ -95,7 +89,7 @@ impl Server {
         )?;
 
         // Transport only tracks peers (not self).
-        let transport = Transport::bind(local_id, addr, peers)?;
+        let transport = Transport::bind(local_id, addr, config.peers)?;
 
         tracing::info!(node = %local_id, addr = %addr, "raft listener bound");
 
@@ -262,20 +256,6 @@ impl Server {
             }
         }
     }
-}
-
-fn parse_peers(raw: &HashMap<String, String>) -> Result<HashMap<NodeId, SocketAddr>, ServerError> {
-    raw.iter()
-        .map(|(id_str, addr_str)| {
-            let id: u64 = id_str
-                .parse()
-                .map_err(|_| ServerError::Config(format!("invalid peer id: {id_str}")))?;
-            let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                ServerError::Config(format!("invalid peer addr '{addr_str}': {e}"))
-            })?;
-            Ok((NodeId::from(id), addr))
-        })
-        .collect()
 }
 
 #[cfg(test)]
