@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
-use crate::command::Command;
-use crate::node::Node;
-use crate::node::Role;
-use crate::runtime::Runtime;
-use crate::runtime::StateMachine;
-use crate::runtime::TimerConfig;
-use crate::storage::MemoryStorage;
-use crate::types::ClusterConfig;
-use crate::types::Message;
-use crate::types::NodeId;
+use raft::Command;
+use raft::MemoryStorage;
+use raft::Node;
+use raft::Role;
+use raft::Runtime;
+use raft::StateMachine;
+use raft::TimerConfig;
+use raft::types::ClusterConfig;
+use raft::types::Message;
+use raft::types::NodeId;
 
 /// A message in flight between nodes.
 struct InFlight<Cmd> {
@@ -83,7 +83,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     /// Trigger election timeout on a specific node.
     pub fn election_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
-            .handle(crate::runtime::Event::ElectionTimeout)
+            .handle(raft::Event::ElectionTimeout)
             .unwrap_or_else(|e| match e {});
         self.queue_commands(index, commands);
     }
@@ -91,7 +91,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     /// Trigger heartbeat timeout on a specific node.
     pub fn heartbeat_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
-            .handle(crate::runtime::Event::HeartbeatTimeout)
+            .handle(raft::Event::HeartbeatTimeout)
             .unwrap_or_else(|e| match e {});
         self.queue_commands(index, commands);
     }
@@ -118,7 +118,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         let to_index = self.node_index(inflight.to);
         if let Some(index) = to_index {
             let commands = self.runtimes[index]
-                .handle(crate::runtime::Event::Message {
+                .handle(raft::Event::Message {
                     from: inflight.from,
                     message: inflight.message,
                 })
@@ -176,12 +176,12 @@ mod proptest_tests {
     use std::collections::HashMap;
 
     use proptest::prelude::*;
+    use raft::Role;
+    use raft::kv::KvCommand;
+    use raft::kv::KvStore;
+    use raft::types::LogIndex;
 
     use super::*;
-    use crate::kv::KvCommand;
-    use crate::kv::KvStore;
-    use crate::node::Role;
-    use crate::types::LogIndex;
 
     const N: usize = 3;
 
@@ -227,7 +227,7 @@ mod proptest_tests {
 
     /// §5.2 Election Safety: at most one leader per term at any point in time.
     fn check_election_safety(cluster: &Cluster<KvCommand, KvStore>) {
-        let mut leaders: HashMap<crate::types::Term, usize> = HashMap::new();
+        let mut leaders: HashMap<raft::types::Term, usize> = HashMap::new();
         for i in 0..N {
             let node = cluster.runtime(i).node();
             if matches!(node.role(), Role::Leader(_)) {
@@ -296,11 +296,12 @@ mod proptest_tests {
 
 #[cfg(test)]
 mod tests {
+    use raft::kv::KvCommand;
+    use raft::kv::KvResult;
+    use raft::kv::KvStore;
+    use raft::types::LogIndex;
+
     use super::*;
-    use crate::kv::KvCommand;
-    use crate::kv::KvResult;
-    use crate::kv::KvStore;
-    use crate::types::LogIndex;
 
     #[test]
     fn single_node_becomes_leader() {

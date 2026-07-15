@@ -3,6 +3,16 @@ name = "raft"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["kv"]
+# Demo key-value state machine and its HTTP client API
+kv = []
+
+[[bin]]
+name = "raft"
+path = "src/main.rs"
+required-features = ["kv"]
+
 [dependencies]
 thiserror = "2"
 rand = "0.9"

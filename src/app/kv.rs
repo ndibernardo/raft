@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::runtime::StateMachine;
+use crate::app::runtime::StateMachine;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCommand {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::types::LogIndex;
-use crate::types::NodeId;
+use crate::core::types::LogIndex;
+use crate::core::types::NodeId;
 
 /// §5.1: followers are passive — they issue no requests, only respond to RPCs from
 /// leaders and candidates. If a follower receives no communication, it starts an election.

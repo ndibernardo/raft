@@ -3,17 +3,17 @@ use std::time::Instant;
 
 use rand::Rng;
 
-use crate::command::Command;
-use crate::node::Node;
-use crate::node::NotLeaderError;
-use crate::node::Role;
-use crate::node::SubmitError;
+use crate::core::command::Command;
+use crate::core::node::Node;
+use crate::core::node::NotLeaderError;
+use crate::core::node::Role;
+use crate::core::node::SubmitError;
+use crate::core::types::ClusterConfig;
+use crate::core::types::LogIndex;
+use crate::core::types::Message;
+use crate::core::types::NodeId;
+use crate::core::types::Term;
 use crate::storage::Storage;
-use crate::types::ClusterConfig;
-use crate::types::LogIndex;
-use crate::types::Message;
-use crate::types::NodeId;
-use crate::types::Term;
 
 /// Trait for state machines that can apply commands.
 pub trait StateMachine<Cmd> {
@@ -238,14 +238,14 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::kv::KvCommand;
-    use crate::kv::KvResult;
-    use crate::kv::KvStore;
+    use crate::app::kv::KvCommand;
+    use crate::app::kv::KvResult;
+    use crate::app::kv::KvStore;
+    use crate::core::types::AppendEntriesResponse;
+    use crate::core::types::RequestVoteResponse;
+    use crate::core::types::Term;
+    use crate::core::types::Vote;
     use crate::storage::MemoryStorage;
-    use crate::types::AppendEntriesResponse;
-    use crate::types::RequestVoteResponse;
-    use crate::types::Term;
-    use crate::types::Vote;
 
     fn test_config(id: u64, peers: &[u64]) -> ClusterConfig {
         let members: HashMap<NodeId, SocketAddr> = std::iter::once(id)

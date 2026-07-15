@@ -4,9 +4,10 @@ use std::str::FromStr;
 use std::sync::mpsc;
 
 use clap::Parser;
+use raft::Config;
+use raft::Server;
 use raft::client_api;
-use raft::server::Config;
-use raft::server::Server;
+use raft::kv::KvStore;
 use raft::types::NodeId;
 
 /// One `--peer` entry in `ID=ADDR` form.
@@ -83,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peers: HashMap<NodeId, SocketAddr> = args.peers.iter().map(|p| (p.id, p.addr)).collect();
 
     let (client_tx, client_rx) = mpsc::channel::<client_api::Pending>();
-    let (membership_tx, membership_rx) = mpsc::channel::<client_api::MembershipPending>();
+    let (membership_tx, membership_rx) = mpsc::channel::<raft::MembershipPending>();
 
     let config = Config {
         id: NodeId::from(args.id),
@@ -96,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_api::start(addr, client_tx.clone(), membership_tx.clone());
     }
 
-    Server::start(config, client_rx, membership_rx)?.run()?;
+    Server::start(config, KvStore::new(), client_rx, membership_rx)?.run()?;
 
     Ok(())
 }

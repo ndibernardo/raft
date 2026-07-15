@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::core::types::Log;
+use crate::core::types::LogEntry;
+use crate::core::types::LogIndex;
+use crate::core::types::NodeId;
+use crate::core::types::Term;
 use crate::storage::LoadedState;
 use crate::storage::Storage;
-use crate::types::Log;
-use crate::types::LogEntry;
-use crate::types::LogIndex;
-use crate::types::NodeId;
-use crate::types::Term;
 
 /// Error type for FileStorage operations.
 #[derive(Debug, thiserror::Error)]
@@ -197,8 +197,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LogPayload;
-    use crate::types::Term;
+    use crate::core::types::LogPayload;
+    use crate::core::types::Term;
 
     fn open_fresh(dir: &Path) -> FileStorage<String> {
         FileStorage::open(dir).expect("open failed")

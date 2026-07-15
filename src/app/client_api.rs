@@ -16,33 +16,16 @@ use axum::routing::put;
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
-use crate::kv::KvCommand;
-use crate::kv::KvResult;
-use crate::types::NodeId;
-
-#[derive(Debug)]
-pub enum ApiResponse {
-    Result(KvResult),
-    NotLeader { leader_hint: Option<NodeId> },
-}
+use crate::app::kv::KvCommand;
+use crate::app::kv::KvResult;
+use crate::app::server::ApiResponse;
+use crate::app::server::MembershipPending;
+use crate::app::server::MembershipRequest;
+use crate::app::server::MembershipResult;
+use crate::core::types::NodeId;
 
 /// KV command paired with the channel to deliver its result.
-pub type Pending = (KvCommand, oneshot::Sender<ApiResponse>);
-
-pub enum MembershipRequest {
-    Add { id: NodeId, addr: SocketAddr },
-    Remove { id: NodeId },
-}
-
-pub enum MembershipResult {
-    Ok,
-    NotLeader,
-    /// Another config change is already uncommitted.
-    Rejected,
-}
-
-/// Membership request paired with the channel to deliver its result.
-pub type MembershipPending = (MembershipRequest, oneshot::Sender<MembershipResult>);
+pub type Pending = crate::app::server::Pending<KvCommand, KvResult>;
 
 #[derive(Clone)]
 struct AppState {
@@ -164,7 +147,7 @@ async fn handle_remove_member(
 
 /// 5-second timeout; SERVICE_UNAVAILABLE on timeout or channel error.
 async fn submit_kv(tx: mpsc::Sender<Pending>, command: KvCommand) -> (StatusCode, String) {
-    let (resp_tx, resp_rx) = oneshot::channel::<ApiResponse>();
+    let (resp_tx, resp_rx) = oneshot::channel::<ApiResponse<KvResult>>();
 
     if tx.send((command, resp_tx)).is_err() {
         return (

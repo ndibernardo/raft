@@ -177,7 +177,7 @@ impl<Cmd> IndexMut<usize> for Log<Cmd> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::NodeId;
+    use crate::core::types::NodeId;
 
     fn entry(term: u64, cmd: &str) -> LogEntry<String> {
         LogEntry {

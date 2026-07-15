@@ -3,26 +3,26 @@ use std::collections::HashSet;
 use tracing::debug;
 use tracing::info;
 
-use crate::command::Command;
-use crate::state::Candidate;
-use crate::state::Follower;
-use crate::state::Leader;
+use crate::core::command::Command;
+use crate::core::state::Candidate;
+use crate::core::state::Follower;
+use crate::core::state::Leader;
+use crate::core::types::AppendEntries;
+use crate::core::types::AppendEntriesResponse;
+use crate::core::types::ClusterConfig;
+use crate::core::types::Log;
+use crate::core::types::LogEntry;
+use crate::core::types::LogIndex;
+use crate::core::types::LogPayload;
+use crate::core::types::Membership;
+use crate::core::types::MergeOutcome;
+use crate::core::types::Message;
+use crate::core::types::NodeId;
+use crate::core::types::RequestVote;
+use crate::core::types::RequestVoteResponse;
+use crate::core::types::Term;
+use crate::core::types::Vote;
 use crate::storage::Storage;
-use crate::types::AppendEntries;
-use crate::types::AppendEntriesResponse;
-use crate::types::ClusterConfig;
-use crate::types::Log;
-use crate::types::LogEntry;
-use crate::types::LogIndex;
-use crate::types::LogPayload;
-use crate::types::Membership;
-use crate::types::MergeOutcome;
-use crate::types::Message;
-use crate::types::NodeId;
-use crate::types::RequestVote;
-use crate::types::RequestVoteResponse;
-use crate::types::Term;
-use crate::types::Vote;
 
 /// Why `Node::submit_command` refused a client command: this node isn't the leader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn leader_does_not_commit_entries_from_previous_term() {
-        use crate::state::Leader as LeaderState;
+        use crate::core::state::Leader as LeaderState;
 
         let mut n = node(1, &[2, 3]);
         n.force_term(Term::from(2));

@@ -1,8 +1,10 @@
-use raft::cluster::Cluster;
+mod common;
+
+use common::Cluster;
+use raft::Role;
 use raft::kv::KvCommand;
 use raft::kv::KvResult;
 use raft::kv::KvStore;
-use raft::node::Role;
 use raft::types::LogIndex;
 use raft::types::Term;
 

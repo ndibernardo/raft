@@ -5,30 +5,26 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
 
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::oneshot;
 
-use crate::client_api::ApiResponse;
-use crate::client_api::MembershipPending;
-use crate::client_api::MembershipRequest;
-use crate::client_api::MembershipResult;
-use crate::client_api::Pending;
-use crate::command::Command;
-use crate::file_storage::FileStorage;
-use crate::file_storage::FileStorageError;
-use crate::kv::KvCommand;
-use crate::kv::KvStore;
-use crate::node::NotLeaderError;
-use crate::node::SubmitError;
-use crate::runtime::Event;
-use crate::runtime::Runtime;
-use crate::runtime::TimerConfig;
-use crate::transport::Transport;
-use crate::transport::TransportError;
-use crate::types::ClusterConfig;
-use crate::types::ConfigError;
-use crate::types::LogIndex;
-use crate::types::NodeId;
-use crate::types::Term;
+use crate::app::runtime::Event;
+use crate::app::runtime::Runtime;
+use crate::app::runtime::StateMachine;
+use crate::app::runtime::TimerConfig;
+use crate::app::transport::Transport;
+use crate::app::transport::TransportError;
+use crate::core::command::Command;
+use crate::core::node::NotLeaderError;
+use crate::core::node::SubmitError;
+use crate::core::types::ClusterConfig;
+use crate::core::types::ConfigError;
+use crate::core::types::LogIndex;
+use crate::core::types::NodeId;
+use crate::core::types::Term;
+use crate::storage::file::FileStorage;
+use crate::storage::file::FileStorageError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -39,6 +35,31 @@ pub enum ServerError {
     #[error("config: {0}")]
     Config(#[from] ConfigError),
 }
+
+/// Outcome of a submitted client command, delivered back over its response channel.
+#[derive(Debug)]
+pub enum ApiResponse<Output> {
+    Result(Output),
+    NotLeader { leader_hint: Option<NodeId> },
+}
+
+/// A submitted command paired with the channel to deliver its result.
+pub type Pending<Cmd, Output> = (Cmd, oneshot::Sender<ApiResponse<Output>>);
+
+pub enum MembershipRequest {
+    Add { id: NodeId, addr: SocketAddr },
+    Remove { id: NodeId },
+}
+
+pub enum MembershipResult {
+    Ok,
+    NotLeader,
+    /// Another config change is already uncommitted.
+    Rejected,
+}
+
+/// Membership request paired with the channel to deliver its result.
+pub type MembershipPending = (MembershipRequest, oneshot::Sender<MembershipResult>);
 
 /// Why `Server::apply_membership_request` could not apply a membership change.
 #[derive(Debug)]
@@ -63,24 +84,30 @@ pub struct Config {
     pub data_dir: PathBuf,
 }
 
-/// A running Raft KV node: persistent log on disk, RPCs over TCP.
-pub struct Server {
-    runtime: Runtime<KvCommand, KvStore, FileStorage<KvCommand>>,
-    transport: Transport<KvCommand>,
-    client_rx: mpsc::Receiver<Pending>,
+/// A running Raft node: persistent log on disk, RPCs over TCP. Generic over the
+/// submitted command type and the state machine that applies it.
+pub struct Server<Cmd, SM: StateMachine<Cmd>> {
+    runtime: Runtime<Cmd, SM, FileStorage<Cmd>>,
+    transport: Transport<Cmd>,
+    client_rx: mpsc::Receiver<Pending<Cmd, SM::Output>>,
     /// Keyed by (term, index) of the submitted entry, not index alone — if leadership
     /// changes before commit, a different entry can later land at the same index, and
     /// a bare-index key would deliver that unrelated result to this client.
-    pending: HashMap<(Term, LogIndex), oneshot::Sender<ApiResponse>>,
+    pending: HashMap<(Term, LogIndex), oneshot::Sender<ApiResponse<SM::Output>>>,
     membership_rx: mpsc::Receiver<MembershipPending>,
     pending_membership: HashMap<LogIndex, oneshot::Sender<MembershipResult>>,
 }
 
-impl Server {
+impl<Cmd, SM> Server<Cmd, SM>
+where
+    Cmd: Clone + Send + 'static + Serialize + for<'de> Deserialize<'de>,
+    SM: StateMachine<Cmd>,
+{
     /// Restores persistent state from disk and binds the Raft listener.
     pub fn start(
         config: Config,
-        client_rx: mpsc::Receiver<Pending>,
+        state_machine: SM,
+        client_rx: mpsc::Receiver<Pending<Cmd, SM::Output>>,
         membership_rx: mpsc::Receiver<MembershipPending>,
     ) -> Result<Self, ServerError> {
         let local_id = config.id;
@@ -96,7 +123,7 @@ impl Server {
         let runtime = Runtime::from_storage(
             local_id,
             initial_config,
-            KvStore::new(),
+            state_machine,
             storage,
             TimerConfig::default(),
         )?;
@@ -260,7 +287,7 @@ impl Server {
 
     /// Sends are fire-and-forget (`transport.rs` doc comment) — a single unreachable or
     /// unknown peer must never take down the event loop.
-    fn dispatch(&self, commands: Vec<Command<KvCommand>>) {
+    fn dispatch(&self, commands: Vec<Command<Cmd>>) {
         for command in commands {
             if let Command::Send { to, message } = command
                 && let Err(err) = self.transport.send(to, message)
@@ -271,26 +298,28 @@ impl Server {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "kv"))]
 mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::node::Role;
-    use crate::types::AppendEntries;
-    use crate::types::AppendEntriesResponse;
-    use crate::types::LogEntry;
-    use crate::types::LogPayload;
-    use crate::types::Message;
-    use crate::types::RequestVote;
-    use crate::types::Term;
+    use crate::app::kv::KvCommand;
+    use crate::app::kv::KvStore;
+    use crate::core::node::Role;
+    use crate::core::types::AppendEntries;
+    use crate::core::types::AppendEntriesResponse;
+    use crate::core::types::LogEntry;
+    use crate::core::types::LogPayload;
+    use crate::core::types::Message;
+    use crate::core::types::RequestVote;
+    use crate::core::types::Term;
 
     fn test_addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
     }
 
     /// Single-node server: config contains only itself, listener on an ephemeral port.
-    fn test_server(id: u64, dir: &Path) -> Server {
+    fn test_server(id: u64, dir: &Path) -> Server<KvCommand, KvStore> {
         let local_id = NodeId::from(id);
         let listen_addr = test_addr(0);
         let config = ClusterConfig::new(HashMap::from([(local_id, listen_addr)])).unwrap();

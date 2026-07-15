@@ -13,8 +13,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::types::Message;
-use crate::types::NodeId;
+use crate::core::types::Message;
+use crate::core::types::NodeId;
 
 /// Error type for transport operations.
 #[derive(Debug, thiserror::Error)]
@@ -168,9 +168,9 @@ fn dial_and_send<Cmd: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LogIndex;
-    use crate::types::RequestVote;
-    use crate::types::Term;
+    use crate::core::types::LogIndex;
+    use crate::core::types::RequestVote;
+    use crate::core::types::Term;
 
     fn make_pair() -> (Transport<String>, Transport<String>) {
         // Bind to port 0 first to learn the assigned addresses.
@@ -220,8 +220,8 @@ mod tests {
 
     #[test]
     fn bidirectional_exchange() {
-        use crate::types::AppendEntries;
-        use crate::types::AppendEntriesResponse;
+        use crate::core::types::AppendEntries;
+        use crate::core::types::AppendEntriesResponse;
 
         let (a, b) = make_pair();
 
