@@ -231,7 +231,7 @@ mod proptest_tests {
         for i in 0..N {
             let node = cluster.runtime(i).node();
             if matches!(node.role(), Role::Leader(_)) {
-                let term = node.persistent().current_term;
+                let term = node.persistent().current_term();
                 assert!(
                     leaders.insert(term, i).is_none(),
                     "election safety violated: two leaders in term {term}"
@@ -253,18 +253,18 @@ mod proptest_tests {
                 let mut idx = LogIndex::from(1u64);
                 while idx <= min_commit {
                     let ai = idx.to_array_index().unwrap();
-                    let ei = ni.persistent().log.get(ai).unwrap_or_else(|| {
+                    let ei = ni.persistent().log().get(ai).unwrap_or_else(|| {
                         panic!(
                             "node {i} has commit_index {min_commit} \
                              but log only has {} entries",
-                            ni.persistent().log.len()
+                            ni.persistent().log().len()
                         )
                     });
-                    let ej = nj.persistent().log.get(ai).unwrap_or_else(|| {
+                    let ej = nj.persistent().log().get(ai).unwrap_or_else(|| {
                         panic!(
                             "node {j} has commit_index {min_commit} \
                              but log only has {} entries",
-                            nj.persistent().log.len()
+                            nj.persistent().log().len()
                         )
                     });
                     assert_eq!(
@@ -349,7 +349,7 @@ mod tests {
 
         // Verify all nodes have both entries (no-op + command).
         for i in 0..3 {
-            assert_eq!(cluster.runtime(i).node().persistent().log.len(), 2);
+            assert_eq!(cluster.runtime(i).node().persistent().log().len(), 2);
         }
 
         // Verify leader committed and applied both entries.

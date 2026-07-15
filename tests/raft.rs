@@ -194,7 +194,7 @@ fn command_replicated_to_all_followers_after_one_heartbeat() {
 
     for i in 0..3 {
         assert_eq!(
-            cluster.runtime(i).node().persistent().log.len(),
+            cluster.runtime(i).node().persistent().log().len(),
             2, // no-op at index 1, command at index 2
             "node {i} must have both log entries"
         );

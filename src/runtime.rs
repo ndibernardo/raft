@@ -375,8 +375,8 @@ mod tests {
         .unwrap();
 
         // At this point storage holds: term=1, voted_for=1, log=[no-op@1].
-        let expected_term = rt.node().persistent().current_term;
-        let expected_log_len = rt.node().persistent().log.len();
+        let expected_term = rt.node().persistent().current_term();
+        let expected_log_len = rt.node().persistent().log().len();
 
         let storage = rt.storage;
         let restored = Runtime::from_storage(
@@ -389,8 +389,8 @@ mod tests {
         .unwrap();
 
         // Term and log are recovered from durable storage; node restarts as follower.
-        assert_eq!(restored.node().persistent().current_term, expected_term);
-        assert_eq!(restored.node().persistent().log.len(), expected_log_len);
+        assert_eq!(restored.node().persistent().current_term(), expected_term);
+        assert_eq!(restored.node().persistent().log().len(), expected_log_len);
         assert!(matches!(restored.node().role(), Role::Follower(_)));
     }
 

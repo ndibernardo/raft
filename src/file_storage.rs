@@ -11,11 +11,11 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::storage::LoadedState;
 use crate::storage::Storage;
 use crate::types::Log;
 use crate::types::LogEntry;
 use crate::types::LogIndex;
-use crate::types::MergeOutcome;
 use crate::types::NodeId;
 use crate::types::Term;
 
@@ -160,43 +160,21 @@ where
 {
     type Error = FileStorageError;
 
-    fn current_term(&self) -> Result<Term, Self::Error> {
-        Ok(self.current_term)
+    fn load(&self) -> Result<LoadedState<Cmd>, Self::Error> {
+        Ok((
+            self.current_term,
+            self.voted_for,
+            self.log.iter().cloned().collect(),
+        ))
     }
 
-    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error> {
+    /// Single `flush_meta` call — one fsync for both fields, not two. `Node` only
+    /// calls this when term or vote actually changed, so a steady-state heartbeat
+    /// with nothing to persist costs zero fsyncs.
+    fn set_meta(&mut self, term: Term, voted_for: Option<NodeId>) -> Result<(), Self::Error> {
         self.current_term = term;
+        self.voted_for = voted_for;
         self.flush_meta()
-    }
-
-    fn voted_for(&self) -> Result<Option<NodeId>, Self::Error> {
-        Ok(self.voted_for)
-    }
-
-    fn set_voted_for(&mut self, candidate: Option<NodeId>) -> Result<(), Self::Error> {
-        self.voted_for = candidate;
-        self.flush_meta()
-    }
-
-    fn last_log_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(self.log.last_index())
-    }
-
-    fn term_at(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
-        Ok(self.log.term_at(index))
-    }
-
-    fn entry(&self, index: LogIndex) -> Result<Option<LogEntry<Cmd>>, Self::Error> {
-        Ok(self.log.entry(index).cloned())
-    }
-
-    fn entries_from(&self, start: LogIndex) -> Result<Vec<LogEntry<Cmd>>, Self::Error> {
-        Ok(self.log.suffix_from(start).to_vec())
-    }
-
-    fn append(&mut self, entry: LogEntry<Cmd>) -> Result<LogIndex, Self::Error> {
-        self.append_to_log_file(&entry)?;
-        Ok(self.log.append(entry))
     }
 
     fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error> {
@@ -204,28 +182,15 @@ where
         self.rewrite_log_file()
     }
 
-    /// Append entries per Raft rules (§5.3): conflict detection and truncation is
-    /// delegated to `Log::merge`. On a conflict the whole log is rewritten atomically;
-    /// on a pure append only the new suffix is fsynced individually, keeping the
-    /// common path fast without a second duplicated conflict-resolution loop.
-    fn append_entries(
-        &mut self,
-        prev_log_index: LogIndex,
-        entries: Vec<LogEntry<Cmd>>,
-    ) -> Result<(), Self::Error> {
-        let before_len = self.log.len();
-        let outcome = self.log.merge(prev_log_index, entries);
-
-        match outcome {
-            MergeOutcome::Truncated => self.rewrite_log_file(),
-            MergeOutcome::Appended => {
-                let new_start = LogIndex::from_length(before_len).next();
-                for entry in self.log.suffix_from(new_start) {
-                    self.append_to_log_file(entry)?;
-                }
-                Ok(())
-            }
+    /// `Node` already resolved any conflict in memory and hands us exactly the
+    /// suffix to persist — append each entry individually so a crash mid-batch
+    /// leaves the file with a valid (if partial) prefix rather than none of it.
+    fn append(&mut self, entries: &[LogEntry<Cmd>]) -> Result<(), Self::Error> {
+        for entry in entries {
+            self.append_to_log_file(entry)?;
+            self.log.append(entry.clone());
         }
+        Ok(())
     }
 }
 
@@ -244,12 +209,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            s.set_current_term(Term::from(7)).expect("set term");
-            s.set_voted_for(Some(NodeId::from(2))).expect("set vote");
+            s.set_meta(Term::from(7), Some(NodeId::from(2)))
+                .expect("set meta");
         }
         let s = open_fresh(tmp.path());
-        assert_eq!(s.current_term().expect("term"), Term::from(7));
-        assert_eq!(s.voted_for().expect("vote"), Some(NodeId::from(2)));
+        let (term, voted_for, _) = s.load().expect("load");
+        assert_eq!(term, Term::from(7));
+        assert_eq!(voted_for, Some(NodeId::from(2)));
     }
 
     #[test]
@@ -257,30 +223,28 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            s.append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET name=miles".into()),
-            })
-            .expect("append");
-            s.append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET counter=1".into()),
-            })
+            s.append(&[
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".into()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET counter=1".into()),
+                },
+            ])
             .expect("append");
         }
         let s = open_fresh(tmp.path());
-        assert_eq!(s.last_log_index().expect("idx"), LogIndex::from(2));
+        let (_, _, entries) = s.load().expect("load");
+        assert_eq!(entries.len(), 2);
         assert_eq!(
-            s.entry(LogIndex::from(1))
-                .expect("entry")
-                .map(|e| e.payload),
-            Some(LogPayload::Command("SET name=miles".into()))
+            entries[0].payload,
+            LogPayload::Command("SET name=miles".into())
         );
         assert_eq!(
-            s.entry(LogIndex::from(2))
-                .expect("entry")
-                .map(|e| e.payload),
-            Some(LogPayload::Command("SET counter=1".into()))
+            entries[1].payload,
+            LogPayload::Command("SET counter=1".into())
         );
     }
 
@@ -289,57 +253,58 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            for cmd in ["SET name=miles", "SET counter=1", "SET price=100"] {
-                s.append(LogEntry {
-                    term: Term::from(1),
-                    payload: LogPayload::Command(cmd.into()),
-                })
-                .expect("append");
-            }
+            let entries: Vec<LogEntry<String>> =
+                ["SET name=miles", "SET counter=1", "SET price=100"]
+                    .into_iter()
+                    .map(|cmd| LogEntry {
+                        term: Term::from(1),
+                        payload: LogPayload::Command(cmd.into()),
+                    })
+                    .collect();
+            s.append(&entries).expect("append");
             s.truncate_from(LogIndex::from(2)).expect("truncate");
         }
         let s = open_fresh(tmp.path());
-        assert_eq!(s.last_log_index().expect("idx"), LogIndex::from(1));
+        let (_, _, entries) = s.load().expect("load");
+        assert_eq!(entries.len(), 1);
         assert_eq!(
-            s.entry(LogIndex::from(1))
-                .expect("entry")
-                .map(|e| e.payload),
-            Some(LogPayload::Command("SET name=miles".into()))
+            entries[0].payload,
+            LogPayload::Command("SET name=miles".into())
         );
     }
 
     #[test]
-    fn conflict_replaces_entries_and_survives_reopen() {
+    fn truncate_then_append_replaces_entries_and_survives_reopen() {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            s.append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET name=miles".into()),
-            })
+            s.append(&[
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".into()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".into()),
+                },
+            ])
             .expect("append");
-            s.append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET status=pending".into()),
-            })
+            // Entry at index 2 conflicts (term 2 vs 1): Node resolves the conflict
+            // in memory and tells storage to truncate from there, then append the
+            // replacement suffix — storage never has to detect the conflict itself.
+            s.truncate_from(LogIndex::from(2)).expect("truncate");
+            s.append(&[LogEntry {
+                term: Term::from(2),
+                payload: LogPayload::Command("SET status=active".into()),
+            }])
             .expect("append");
-            // Entry at index 2 conflicts (term 2 vs 1): truncate and replace.
-            s.append_entries(
-                LogIndex::from(1),
-                vec![LogEntry {
-                    term: Term::from(2),
-                    payload: LogPayload::Command("SET status=active".into()),
-                }],
-            )
-            .expect("append_entries");
         }
         let s = open_fresh(tmp.path());
-        assert_eq!(s.last_log_index().expect("idx"), LogIndex::from(2));
+        let (_, _, entries) = s.load().expect("load");
+        assert_eq!(entries.len(), 2);
         assert_eq!(
-            s.entry(LogIndex::from(2))
-                .expect("entry")
-                .map(|e| e.payload),
-            Some(LogPayload::Command("SET status=active".into()))
+            entries[1].payload,
+            LogPayload::Command("SET status=active".into())
         );
     }
 
@@ -359,18 +324,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s: FileStorage<String> = open_fresh(tmp.path());
-            s.append(LogEntry {
+            s.append(&[LogEntry {
                 term: Term::from(1),
                 payload: LogPayload::NoOp,
-            })
+            }])
             .expect("append noop");
         }
         let s: FileStorage<String> = open_fresh(tmp.path());
-        assert_eq!(
-            s.entry(LogIndex::from(1))
-                .expect("entry")
-                .map(|e| e.payload),
-            Some(LogPayload::NoOp)
-        );
+        let (_, _, entries) = s.load().expect("load");
+        assert_eq!(entries[0].payload, LogPayload::NoOp);
     }
 }

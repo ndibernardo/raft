@@ -44,54 +44,113 @@ pub enum SubmitError {
 
 /// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
 /// responding to any RPC — persisting after responding violates Raft's safety guarantees.
+///
+/// `Node` is the single owner of the log; `save` never re-derives what changed by
+/// diffing against storage, which would silently drop a same-length conflict
+/// overwrite. Every mutation records precisely what happened — `set_term`/
+/// `set_voted_for` flag the meta dirty, `append_entry`/`merge_entries` record the
+/// exact truncation point and appended suffix — and `save` just replays that
+/// record to storage, then clears it.
 #[derive(Debug)]
 pub struct PersistentState<Cmd> {
-    pub current_term: Term,
-    pub voted_for: Option<NodeId>,
-    pub log: Log<Cmd>,
+    current_term: Term,
+    voted_for: Option<NodeId>,
+    log: Log<Cmd>,
+    meta_dirty: bool,
+    truncated_from: Option<LogIndex>,
+    pending_append: Vec<LogEntry<Cmd>>,
 }
 
 impl<Cmd: Clone> PersistentState<Cmd> {
-    pub fn load<S: Storage<Cmd>>(storage: &S) -> Result<Self, S::Error> {
-        Ok(Self {
-            current_term: storage.current_term()?,
-            voted_for: storage.voted_for()?,
-            log: Log::from_entries(storage.entries_from(LogIndex::from(1))?),
-        })
+    fn new() -> Self {
+        Self {
+            current_term: Term::default(),
+            voted_for: None,
+            log: Log::new(),
+            meta_dirty: false,
+            truncated_from: None,
+            pending_append: Vec::new(),
+        }
     }
 
-    pub fn save<S: Storage<Cmd>>(&self, storage: &mut S) -> Result<(), S::Error> {
-        storage.set_current_term(self.current_term)?;
-        storage.set_voted_for(self.voted_for)?;
+    pub fn current_term(&self) -> Term {
+        self.current_term
+    }
 
-        let stored_len = storage.last_log_index()?;
-        let stored_len_usize = stored_len.to_array_index().map_or(0, |i| i + 1);
-        let common_len = stored_len_usize.min(self.log.len());
+    pub fn voted_for(&self) -> Option<NodeId> {
+        self.voted_for
+    }
 
-        // First position in the common prefix where the stored term differs from the
-        // in-memory term — a length-only comparison would miss same-length conflict
-        // overwrites entirely.
-        let mut divergence = None;
-        for (i, entry) in self.log.iter().enumerate().take(common_len) {
-            let index = LogIndex::from_length(i + 1);
-            if storage.term_at(index)? != Some(entry.term) {
-                divergence = Some(i);
-                break;
+    pub fn log(&self) -> &Log<Cmd> {
+        &self.log
+    }
+
+    fn set_term(&mut self, term: Term) {
+        if term != self.current_term {
+            self.current_term = term;
+            self.meta_dirty = true;
+        }
+    }
+
+    fn set_voted_for(&mut self, candidate: Option<NodeId>) {
+        if candidate != self.voted_for {
+            self.voted_for = candidate;
+            self.meta_dirty = true;
+        }
+    }
+
+    /// Leader-side: append one entry to the tail. Returns its assigned index.
+    fn append_entry(&mut self, entry: LogEntry<Cmd>) -> LogIndex {
+        let index = self.log.append(entry.clone());
+        self.pending_append.push(entry);
+        index
+    }
+
+    /// Follower-side §5.3 conflict resolution — delegates to `Log::merge` and
+    /// records exactly what it did so `save` can tell storage the same thing.
+    fn merge_entries(&mut self, prev_index: LogIndex, entries: Vec<LogEntry<Cmd>>) -> MergeOutcome {
+        let before_len = self.log.len();
+        let outcome = self.log.merge(prev_index, entries);
+
+        match outcome {
+            MergeOutcome::Truncated { from } => {
+                self.truncated_from = Some(from);
+                self.pending_append = self.log.suffix_from(from).to_vec();
+            }
+            MergeOutcome::Appended => {
+                let new_start = LogIndex::from_length(before_len).next();
+                self.pending_append
+                    .extend(self.log.suffix_from(new_start).iter().cloned());
             }
         }
 
-        let rewrite_from = divergence.unwrap_or(common_len);
-        if rewrite_from < stored_len_usize {
-            storage.truncate_from(LogIndex::from_length(rewrite_from + 1))?;
-        }
+        outcome
+    }
 
-        for entry in self
-            .log
-            .suffix_from(LogIndex::from_length(rewrite_from + 1))
-        {
-            storage.append(entry.clone())?;
-        }
+    pub fn load<S: Storage<Cmd>>(storage: &S) -> Result<Self, S::Error> {
+        let (current_term, voted_for, entries) = storage.load()?;
+        Ok(Self {
+            current_term,
+            voted_for,
+            log: Log::from_entries(entries),
+            meta_dirty: false,
+            truncated_from: None,
+            pending_append: Vec::new(),
+        })
+    }
 
+    pub fn save<S: Storage<Cmd>>(&mut self, storage: &mut S) -> Result<(), S::Error> {
+        if self.meta_dirty {
+            storage.set_meta(self.current_term, self.voted_for)?;
+            self.meta_dirty = false;
+        }
+        if let Some(from) = self.truncated_from.take() {
+            storage.truncate_from(from)?;
+        }
+        if !self.pending_append.is_empty() {
+            storage.append(&self.pending_append)?;
+            self.pending_append.clear();
+        }
         Ok(())
     }
 }
@@ -146,11 +205,7 @@ impl<Cmd: Clone> Node<Cmd> {
             id,
             initial_config: config.clone(),
             config,
-            persistent: PersistentState {
-                current_term: Term::default(),
-                voted_for: None,
-                log: Log::new(),
-            },
+            persistent: PersistentState::new(),
             volatile: VolatileState {
                 commit_index: LogIndex::default(),
                 last_applied: LogIndex::default(),
@@ -189,7 +244,7 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     /// Must be called before responding to any RPC (§5.1 durability requirement).
-    pub fn save<S: Storage<Cmd>>(&self, storage: &mut S) -> Result<(), S::Error> {
+    pub fn save<S: Storage<Cmd>>(&mut self, storage: &mut S) -> Result<(), S::Error> {
         self.persistent.save(storage)
     }
 
@@ -233,8 +288,8 @@ impl<Cmd: Clone> Node<Cmd> {
     /// must preserve the existing vote to uphold the at-most-one-vote-per-term invariant.
     fn become_follower(&mut self, term: Term, leader_id: Option<NodeId>) {
         if term > self.persistent.current_term {
-            self.persistent.current_term = term;
-            self.persistent.voted_for = None;
+            self.persistent.set_term(term);
+            self.persistent.set_voted_for(None);
         }
         let mut follower = Follower::new();
         if let Some(id) = leader_id {
@@ -300,8 +355,9 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     fn start_election(&mut self) -> Vec<Command<Cmd>> {
-        self.persistent.current_term = self.persistent.current_term.next();
-        self.persistent.voted_for = Some(self.id);
+        self.persistent
+            .set_term(self.persistent.current_term.next());
+        self.persistent.set_voted_for(Some(self.id));
         self.role = Role::Candidate(Candidate::new(self.id));
         info!(node = %self.id, term = %self.persistent.current_term, "election started");
 
@@ -340,7 +396,7 @@ impl<Cmd: Clone> Node<Cmd> {
         }
 
         let vote = if self.should_grant_vote(&req) {
-            self.persistent.voted_for = Some(req.candidate_id);
+            self.persistent.set_voted_for(Some(req.candidate_id));
             reset_timer = true;
             info!(node = %self.id, term = %self.persistent.current_term, candidate = %req.candidate_id, "vote granted");
             Vote::Granted
@@ -427,7 +483,7 @@ impl<Cmd: Clone> Node<Cmd> {
     /// §8: no-op entry commits prior-term entries indirectly via Log Matching, avoiding the
     /// Figure 8 anomaly where a leader cannot directly commit entries from previous terms.
     fn become_leader(&mut self) -> Vec<Command<Cmd>> {
-        self.persistent.log.append(LogEntry {
+        self.persistent.append_entry(LogEntry {
             term: self.persistent.current_term,
             payload: LogPayload::NoOp,
         });
@@ -619,7 +675,7 @@ impl<Cmd: Clone> Node<Cmd> {
             term: self.persistent.current_term,
             payload: LogPayload::Command(command),
         };
-        let index = self.persistent.log.append(entry);
+        let index = self.persistent.append_entry(entry);
         debug!(node = %self.id, term = %self.persistent.current_term, index = %index, "command appended to log");
         Ok(index)
     }
@@ -649,7 +705,7 @@ impl<Cmd: Clone> Node<Cmd> {
             term: self.persistent.current_term,
             payload: LogPayload::ConfigChange(config.clone()),
         };
-        let index = self.persistent.log.append(entry);
+        let index = self.persistent.append_entry(entry);
         // Takes effect immediately on append — quorum calculations use the new config
         // before the entry is committed.
         self.set_config(config);
@@ -757,14 +813,14 @@ impl<Cmd: Clone> Node<Cmd> {
             .iter()
             .any(|e| matches!(e.payload, LogPayload::ConfigChange(_)));
 
-        let outcome = self.persistent.log.merge(prev_log_index, entries);
-        if let MergeOutcome::Truncated = outcome {
+        let outcome = self.persistent.merge_entries(prev_log_index, entries);
+        if let MergeOutcome::Truncated { .. } = outcome {
             debug!(node = %self.id, prev_index = %prev_log_index, "log truncated on conflict");
         }
 
         // A truncation may have removed a previously active ConfigChange; a newly
         // appended ConfigChange must also trigger a rescan to become the active config.
-        if matches!(outcome, MergeOutcome::Truncated) || has_config_entry {
+        if matches!(outcome, MergeOutcome::Truncated { .. }) || has_config_entry {
             self.apply_latest_config_from_log();
         }
     }
@@ -773,15 +829,15 @@ impl<Cmd: Clone> Node<Cmd> {
 #[cfg(test)]
 impl<Cmd: Clone> Node<Cmd> {
     fn force_term(&mut self, term: Term) {
-        self.persistent.current_term = term;
+        self.persistent.set_term(term);
     }
 
     fn force_vote(&mut self, candidate: NodeId) {
-        self.persistent.voted_for = Some(candidate);
+        self.persistent.set_voted_for(Some(candidate));
     }
 
     fn push_entry(&mut self, entry: LogEntry<Cmd>) {
-        self.persistent.log.append(entry);
+        self.persistent.append_entry(entry);
     }
 }
 
@@ -1333,9 +1389,12 @@ mod tests {
         let restored: Node<String> =
             Node::from_storage(NodeId::from(1), test_config(1, &[2, 3]), &storage).unwrap();
 
-        assert_eq!(restored.persistent.current_term, n.persistent.current_term);
-        assert_eq!(restored.persistent.voted_for, n.persistent.voted_for);
-        assert_eq!(restored.persistent.log.len(), n.persistent.log.len());
+        assert_eq!(
+            restored.persistent.current_term(),
+            n.persistent.current_term()
+        );
+        assert_eq!(restored.persistent.voted_for(), n.persistent.voted_for());
+        assert_eq!(restored.persistent.log().len(), n.persistent.log().len());
         assert!(is_follower(&restored));
     }
 
@@ -1347,28 +1406,28 @@ mod tests {
         use crate::storage::MemoryStorage;
 
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
-        let mut persistent = PersistentState {
-            current_term: Term::from(1),
-            voted_for: Some(NodeId::from(1)),
-            log: Log::from_entries(vec![
-                LogEntry {
-                    term: Term::from(1),
-                    payload: LogPayload::Command("SET name=miles".to_string()),
-                },
-                LogEntry {
-                    term: Term::from(1),
-                    payload: LogPayload::Command("SET status=pending".to_string()),
-                },
-            ]),
-        };
+        let mut persistent: PersistentState<String> = PersistentState::new();
+        persistent.set_term(Term::from(1));
+        persistent.set_voted_for(Some(NodeId::from(1)));
+        persistent.append_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        persistent.append_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
         persistent.save(&mut storage).unwrap();
 
         // New leader (term 2) overwrites entry 2 in place — log stays the same length.
-        persistent.current_term = Term::from(2);
-        persistent.log[1] = LogEntry {
-            term: Term::from(2),
-            payload: LogPayload::Command("SET status=active".to_string()),
-        };
+        persistent.set_term(Term::from(2));
+        persistent.merge_entries(
+            LogIndex::from(1),
+            vec![LogEntry {
+                term: Term::from(2),
+                payload: LogPayload::Command("SET status=active".to_string()),
+            }],
+        );
         persistent.save(&mut storage).unwrap();
 
         let reloaded: PersistentState<String> = PersistentState::load(&storage).unwrap();
@@ -1386,31 +1445,33 @@ mod tests {
         use crate::storage::MemoryStorage;
 
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
-        let mut persistent = PersistentState {
-            current_term: Term::from(1),
-            voted_for: Some(NodeId::from(1)),
-            log: Log::from_entries(vec![
-                LogEntry {
-                    term: Term::from(1),
-                    payload: LogPayload::Command("SET name=miles".to_string()),
-                },
-                LogEntry {
-                    term: Term::from(1),
-                    payload: LogPayload::Command("SET status=pending".to_string()),
-                },
-            ]),
-        };
+        let mut persistent: PersistentState<String> = PersistentState::new();
+        persistent.set_term(Term::from(1));
+        persistent.set_voted_for(Some(NodeId::from(1)));
+        persistent.append_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        persistent.append_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
         persistent.save(&mut storage).unwrap();
 
-        persistent.current_term = Term::from(2);
-        persistent.log[1] = LogEntry {
-            term: Term::from(2),
-            payload: LogPayload::Command("SET status=active".to_string()),
-        };
-        persistent.log.append(LogEntry {
-            term: Term::from(2),
-            payload: LogPayload::Command("SET region=eu-west-1".to_string()),
-        });
+        persistent.set_term(Term::from(2));
+        persistent.merge_entries(
+            LogIndex::from(1),
+            vec![
+                LogEntry {
+                    term: Term::from(2),
+                    payload: LogPayload::Command("SET status=active".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(2),
+                    payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+                },
+            ],
+        );
         persistent.save(&mut storage).unwrap();
 
         let reloaded: PersistentState<String> = PersistentState::load(&storage).unwrap();

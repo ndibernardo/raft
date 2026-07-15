@@ -4,45 +4,32 @@ use crate::types::LogIndex;
 use crate::types::NodeId;
 use crate::types::Term;
 
-/// §5.1: currentTerm, votedFor, and log on stable storage. Implementations must flush to
-/// durable media before returning from any write — persisting after responding violates safety.
+/// Term, vote, and log as read back from durable storage on startup.
+pub type LoadedState<Cmd> = (Term, Option<NodeId>, Vec<LogEntry<Cmd>>);
+
+/// §5.1: currentTerm, votedFor, and log on stable storage. A dumb durable sink —
+/// `Node` owns the log and tells storage exactly what changed; storage never
+/// re-derives a diff from lengths or terms, which would silently drop a
+/// same-length conflict overwrite.
 pub trait Storage<Cmd> {
     type Error;
 
-    fn current_term(&self) -> Result<Term, Self::Error>;
+    /// Full persisted state, read once at startup.
+    fn load(&self) -> Result<LoadedState<Cmd>, Self::Error>;
 
     /// Must be durable before returning (§5.1).
-    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error>;
+    fn set_meta(&mut self, term: Term, voted_for: Option<NodeId>) -> Result<(), Self::Error>;
 
-    fn voted_for(&self) -> Result<Option<NodeId>, Self::Error>;
-
-    /// Must be durable before returning (§5.1).
-    fn set_voted_for(&mut self, candidate: Option<NodeId>) -> Result<(), Self::Error>;
-
-    fn last_log_index(&self) -> Result<LogIndex, Self::Error>;
-
-    /// Index 0 returns Some(Term::default()); out-of-bounds returns None.
-    fn term_at(&self, index: LogIndex) -> Result<Option<Term>, Self::Error>;
-
-    fn entry(&self, index: LogIndex) -> Result<Option<LogEntry<Cmd>>, Self::Error>;
-
-    fn entries_from(&self, start: LogIndex) -> Result<Vec<LogEntry<Cmd>>, Self::Error>;
-
-    /// Returns the index of the appended entry.
-    fn append(&mut self, entry: LogEntry<Cmd>) -> Result<LogIndex, Self::Error>;
-
-    /// Inclusive: the entry at index is also removed.
+    /// Inclusive: the entry at `index` is also removed. No-op if `index` is past the end.
     fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error>;
 
-    /// On conflict (same index, different term), truncates and replaces per §5.3.
-    fn append_entries(
-        &mut self,
-        prev_log_index: LogIndex,
-        entries: Vec<LogEntry<Cmd>>,
-    ) -> Result<(), Self::Error>;
+    /// Appends to the tail. Caller guarantees `entries` is exactly the suffix that
+    /// follows what's already durable — no conflict detection happens here.
+    fn append(&mut self, entries: &[LogEntry<Cmd>]) -> Result<(), Self::Error>;
 }
 
-/// In-memory storage for testing.
+/// In-memory storage. Legitimate as a standalone backend (single-process clusters,
+/// tests) — not durable across restarts by construction, which is the point.
 pub struct MemoryStorage<Cmd> {
     current_term: Term,
     voted_for: Option<NodeId>,
@@ -68,42 +55,18 @@ impl<Cmd> Default for MemoryStorage<Cmd> {
 impl<Cmd: Clone> Storage<Cmd> for MemoryStorage<Cmd> {
     type Error = std::convert::Infallible;
 
-    fn current_term(&self) -> Result<Term, Self::Error> {
-        Ok(self.current_term)
+    fn load(&self) -> Result<LoadedState<Cmd>, Self::Error> {
+        Ok((
+            self.current_term,
+            self.voted_for,
+            self.log.iter().cloned().collect(),
+        ))
     }
 
-    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error> {
+    fn set_meta(&mut self, term: Term, voted_for: Option<NodeId>) -> Result<(), Self::Error> {
         self.current_term = term;
+        self.voted_for = voted_for;
         Ok(())
-    }
-
-    fn voted_for(&self) -> Result<Option<NodeId>, Self::Error> {
-        Ok(self.voted_for)
-    }
-
-    fn set_voted_for(&mut self, candidate: Option<NodeId>) -> Result<(), Self::Error> {
-        self.voted_for = candidate;
-        Ok(())
-    }
-
-    fn last_log_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(self.log.last_index())
-    }
-
-    fn term_at(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
-        Ok(self.log.term_at(index))
-    }
-
-    fn entry(&self, index: LogIndex) -> Result<Option<LogEntry<Cmd>>, Self::Error> {
-        Ok(self.log.entry(index).cloned())
-    }
-
-    fn entries_from(&self, start: LogIndex) -> Result<Vec<LogEntry<Cmd>>, Self::Error> {
-        Ok(self.log.suffix_from(start).to_vec())
-    }
-
-    fn append(&mut self, entry: LogEntry<Cmd>) -> Result<LogIndex, Self::Error> {
-        Ok(self.log.append(entry))
     }
 
     fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error> {
@@ -111,12 +74,10 @@ impl<Cmd: Clone> Storage<Cmd> for MemoryStorage<Cmd> {
         Ok(())
     }
 
-    fn append_entries(
-        &mut self,
-        prev_log_index: LogIndex,
-        entries: Vec<LogEntry<Cmd>>,
-    ) -> Result<(), Self::Error> {
-        self.log.merge(prev_log_index, entries);
+    fn append(&mut self, entries: &[LogEntry<Cmd>]) -> Result<(), Self::Error> {
+        for entry in entries {
+            self.log.append(entry.clone());
+        }
         Ok(())
     }
 }
@@ -130,44 +91,45 @@ mod tests {
     fn term_and_vote_round_trip_through_storage() {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
-        assert_eq!(storage.current_term().unwrap(), Term::default());
-        assert_eq!(storage.voted_for().unwrap(), None);
+        let (term, voted_for, _) = storage.load().unwrap();
+        assert_eq!(term, Term::default());
+        assert_eq!(voted_for, None);
 
-        storage.set_current_term(Term::from(5)).unwrap();
-        storage.set_voted_for(Some(NodeId::from(3))).unwrap();
+        storage
+            .set_meta(Term::from(5), Some(NodeId::from(3)))
+            .unwrap();
 
-        assert_eq!(storage.current_term().unwrap(), Term::from(5));
-        assert_eq!(storage.voted_for().unwrap(), Some(NodeId::from(3)));
+        let (term, voted_for, _) = storage.load().unwrap();
+        assert_eq!(term, Term::from(5));
+        assert_eq!(voted_for, Some(NodeId::from(3)));
     }
 
     #[test]
-    fn appended_entry_is_readable_by_index() {
+    fn appended_entries_are_readable_after_load() {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
-        let idx = storage
-            .append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET name=miles".to_string()),
-            })
+        storage
+            .append(&[
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET counter=1".to_string()),
+                },
+            ])
             .unwrap();
-        assert_eq!(idx, LogIndex::from(1));
 
-        let idx = storage
-            .append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET counter=1".to_string()),
-            })
-            .unwrap();
-        assert_eq!(idx, LogIndex::from(2));
-
-        assert_eq!(storage.last_log_index().unwrap(), LogIndex::from(2));
+        let (_, _, entries) = storage.load().unwrap();
+        assert_eq!(entries.len(), 2);
         assert_eq!(
-            storage.term_at(LogIndex::from(1)).unwrap(),
-            Some(Term::from(1))
+            entries[0].payload,
+            LogPayload::Command("SET name=miles".to_string())
         );
         assert_eq!(
-            storage.entry(LogIndex::from(1)).unwrap().map(|e| e.payload),
-            Some(LogPayload::Command("SET name=miles".to_string()))
+            entries[1].payload,
+            LogPayload::Command("SET counter=1".to_string())
         );
     }
 
@@ -176,60 +138,58 @@ mod tests {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
         storage
-            .append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET name=miles".to_string()),
-            })
-            .unwrap();
-        storage
-            .append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET counter=1".to_string()),
-            })
-            .unwrap();
-        storage
-            .append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET price=100".to_string()),
-            })
+            .append(&[
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET counter=1".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET price=100".to_string()),
+                },
+            ])
             .unwrap();
 
         storage.truncate_from(LogIndex::from(2)).unwrap();
 
-        assert_eq!(storage.last_log_index().unwrap(), LogIndex::from(1));
+        let (_, _, entries) = storage.load().unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
-    fn append_entries_replaces_conflicting_entry_and_trims_tail() {
+    fn truncate_then_append_replaces_the_tail() {
         let mut storage: MemoryStorage<String> = MemoryStorage::new();
 
         storage
-            .append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET name=miles".to_string()),
-            })
-            .unwrap();
-        storage
-            .append(LogEntry {
-                term: Term::from(1),
-                payload: LogPayload::Command("SET status=pending".to_string()),
-            })
-            .unwrap();
-
-        storage
-            .append_entries(
-                LogIndex::from(1),
-                vec![LogEntry {
-                    term: Term::from(2),
-                    payload: LogPayload::Command("SET status=active".to_string()),
-                }],
-            )
+            .append(&[
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".to_string()),
+                },
+            ])
             .unwrap();
 
-        assert_eq!(storage.last_log_index().unwrap(), LogIndex::from(2));
+        storage.truncate_from(LogIndex::from(2)).unwrap();
+        storage
+            .append(&[LogEntry {
+                term: Term::from(2),
+                payload: LogPayload::Command("SET status=active".to_string()),
+            }])
+            .unwrap();
+
+        let (_, _, entries) = storage.load().unwrap();
+        assert_eq!(entries.len(), 2);
         assert_eq!(
-            storage.entry(LogIndex::from(2)).unwrap().map(|e| e.payload),
-            Some(LogPayload::Command("SET status=active".to_string()))
+            entries[1].payload,
+            LogPayload::Command("SET status=active".to_string())
         );
     }
 }

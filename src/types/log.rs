@@ -28,19 +28,19 @@ pub struct LogEntry<Cmd> {
 
 /// Whether `Log::merge` found a conflicting entry and truncated the log.
 /// Callers use this to decide whether a config rescan is needed (a truncation
-/// may have removed the entry holding the currently active `ConfigChange`).
+/// may have removed the entry holding the currently active `ConfigChange`), and
+/// to tell durable storage exactly what changed instead of re-deriving it later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeOutcome {
     /// No conflicting entries; any new entries were appended after the existing suffix.
     Appended,
-    /// A conflicting entry (same index, different term) was found; the log was
-    /// truncated at that point and the new suffix appended in its place.
-    Truncated,
+    /// A conflicting entry (same index, different term) was found at `from`; the log
+    /// was truncated there and the new suffix appended in its place.
+    Truncated { from: LogIndex },
 }
 
 /// The 1-based replicated log. Owns all index arithmetic so callers never touch
-/// array offsets directly (§2.4 audit finding: `to_array_index` bridging was
-/// scattered across `node.rs`, `storage.rs`, and `file_storage.rs`).
+/// array offsets directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Log<Cmd>(Vec<LogEntry<Cmd>>);
 
@@ -139,7 +139,9 @@ impl<Cmd> Log<Cmd> {
                     if self.0[idx].term != entry.term {
                         self.0.truncate(idx);
                         self.0.push(entry);
-                        outcome = MergeOutcome::Truncated;
+                        outcome = MergeOutcome::Truncated {
+                            from: LogIndex::from_length(idx + 1),
+                        };
                     }
                     // Same term at this index: entry already present, skip.
                 }
@@ -208,7 +210,12 @@ mod tests {
 
         let outcome = log.merge(LogIndex::from(1), vec![entry(2, "SET status=active")]);
 
-        assert_eq!(outcome, MergeOutcome::Truncated);
+        assert_eq!(
+            outcome,
+            MergeOutcome::Truncated {
+                from: LogIndex::from(2)
+            }
+        );
         assert_eq!(log.len(), 2);
         assert_eq!(log[1], entry(2, "SET status=active"));
     }
@@ -228,7 +235,12 @@ mod tests {
             ],
         );
 
-        assert_eq!(outcome, MergeOutcome::Truncated);
+        assert_eq!(
+            outcome,
+            MergeOutcome::Truncated {
+                from: LogIndex::from(2)
+            }
+        );
         assert_eq!(log.len(), 3);
         assert_eq!(log[1], entry(2, "SET status=active"));
         assert_eq!(log[2], entry(2, "SET region=eu-west-1"));

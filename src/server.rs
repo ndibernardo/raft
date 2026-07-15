@@ -159,7 +159,7 @@ impl Server {
                 Ok(index) => {
                     // submit() just appended this entry as the current term, so reading
                     // the term back here is exactly the term it was submitted under.
-                    let term = self.runtime.node().persistent().current_term;
+                    let term = self.runtime.node().persistent().current_term();
                     tracing::debug!(node = %self.runtime.node().id(), %term, %index, "client command queued");
                     self.pending.insert((term, index), resp_tx);
                 }
@@ -426,7 +426,7 @@ mod tests {
         // lands at index 2 (index 1 is the leader's own no-op).
         server.runtime.handle(Event::ElectionTimeout).unwrap();
         assert!(matches!(server.runtime.node().role(), Role::Leader(_)));
-        let leader_term = server.runtime.node().persistent().current_term;
+        let leader_term = server.runtime.node().persistent().current_term();
 
         let index = server
             .runtime
