@@ -106,7 +106,15 @@ async fn handle_put(
     Path(key): Path<String>,
     body: Bytes,
 ) -> (StatusCode, String) {
-    let value = String::from_utf8_lossy(&body).into_owned();
+    let value = match String::from_utf8(body.to_vec()) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "value must be valid UTF-8".to_string(),
+            );
+        }
+    };
     submit_kv(state.kv_tx, KvCommand::Set { key, value }).await
 }
 
@@ -211,5 +219,66 @@ async fn submit_membership(
             "another config change is pending".into(),
         ),
         Ok(Err(_)) | Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::Path;
+    use axum::extract::State;
+
+    use super::*;
+
+    fn app_state() -> (AppState, mpsc::Receiver<Pending>) {
+        let (kv_tx, kv_rx) = mpsc::channel();
+        let (membership_tx, _membership_rx) = mpsc::channel();
+        (
+            AppState {
+                kv_tx,
+                membership_tx,
+            },
+            kv_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn handle_put_rejects_a_body_that_is_not_valid_utf8() {
+        let (state, _kv_rx) = app_state();
+        let invalid_utf8 = Bytes::from_static(&[0xff, 0xfe, 0xfd]);
+
+        let (status, body) =
+            handle_put(State(state), Path("region".to_string()), invalid_utf8).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "value must be valid UTF-8");
+    }
+
+    #[tokio::test]
+    async fn handle_put_accepts_a_valid_utf8_body() {
+        let (state, kv_rx) = app_state();
+        let responder = std::thread::spawn(move || {
+            let (command, resp_tx) = kv_rx.recv().expect("kv command sent");
+            assert_eq!(
+                command,
+                KvCommand::Set {
+                    key: "region".to_string(),
+                    value: "eu-west-1".to_string(),
+                }
+            );
+            resp_tx
+                .send(ApiResponse::Result(KvResult::Ok))
+                .expect("response channel open");
+        });
+
+        let (status, body) = handle_put(
+            State(state),
+            Path("region".to_string()),
+            Bytes::from_static(b"eu-west-1"),
+        )
+        .await;
+
+        responder.join().expect("responder thread panicked");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok");
     }
 }
