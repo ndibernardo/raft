@@ -89,7 +89,19 @@ curl -X DELETE http://127.0.0.1:8001/cluster/members/4               # ok
 cargo test
 ```
 
-Unit tests in `src/` cover node protocol logic, storage, state machine, and transport. Property tests in `src/cluster.rs` run randomised operation sequences verified against election-safety and state-machine-safety invariants. Integration tests in `tests/` exercise end-to-end scenarios (election, replication, commit propagation, re-election) through the public API only.
+Unit tests in `src/` cover node protocol logic, storage, state machine, and transport. Property tests in `tests/common/cluster.rs` run randomised operation sequences verified against election-safety and state-machine-safety invariants. Integration tests in `tests/` exercise end-to-end scenarios (election, replication, commit propagation, re-election) through the public API only.
+
+## To be implemented
+
+The core protocol — leader election, log replication, the safety rules, persistence, and single-server membership changes — is complete. Still missing from the paper and dissertation:
+
+- Log compaction and snapshotting (paper section 7, dissertation chapter 5)
+- Read-only queries without log writes (dissertation section 6.4)
+- Client sessions and request de-duplication (dissertation section 6.3)
+- Pre-vote (dissertation section 9.6)
+- Leader self-removal step-down (dissertation section 4.2.2)
+- Joint consensus (paper section 6)
+- Accelerated log backtracking (paper section 5.3)
 
 ## References
 
