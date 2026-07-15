@@ -15,7 +15,7 @@ pub struct Term {
 }
 
 impl Term {
-    pub fn increment(self) -> Term {
+    pub fn next(self) -> Term {
         Term {
             value: self.value.saturating_add(1),
         }
@@ -120,13 +120,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn term_increment_increases_by_one() {
-        assert_eq!(Term::from(3).increment(), Term::from(4));
+    fn term_next_increases_by_one() {
+        assert_eq!(Term::from(3).next(), Term::from(4));
     }
 
     #[test]
-    fn term_increment_saturates_at_max() {
-        assert_eq!(Term::from(u64::MAX).increment(), Term::from(u64::MAX));
+    fn term_next_saturates_at_max() {
+        assert_eq!(Term::from(u64::MAX).next(), Term::from(u64::MAX));
     }
 
     #[test]

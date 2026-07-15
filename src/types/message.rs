@@ -19,7 +19,14 @@ pub struct RequestVote {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RequestVoteResponse {
     pub term: Term,
-    pub vote_granted: bool,
+    pub vote: Vote,
+}
+
+/// Outcome of a RequestVote decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Vote {
+    Granted,
+    Denied,
 }
 
 /// AppendEntries RPC arguments.

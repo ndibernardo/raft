@@ -76,6 +76,24 @@ impl ClusterConfig {
     pub fn contains(&self, id: NodeId) -> bool {
         self.members.contains_key(&id)
     }
+
+    /// Whether `id` currently holds a voting seat — a removed or spoofed
+    /// `NodeId` must not be silently treated as `false` where the caller needs
+    /// to branch on cluster membership as a domain outcome.
+    pub fn membership_of(&self, id: NodeId) -> Membership {
+        if self.contains(id) {
+            Membership::Member
+        } else {
+            Membership::NonMember
+        }
+    }
+}
+
+/// Whether a `NodeId` holds a voting seat in a `ClusterConfig`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Membership {
+    Member,
+    NonMember,
 }
 
 #[cfg(test)]

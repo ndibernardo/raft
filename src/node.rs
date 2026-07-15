@@ -15,12 +15,14 @@ use crate::types::Log;
 use crate::types::LogEntry;
 use crate::types::LogIndex;
 use crate::types::LogPayload;
+use crate::types::Membership;
 use crate::types::MergeOutcome;
 use crate::types::Message;
 use crate::types::NodeId;
 use crate::types::RequestVote;
 use crate::types::RequestVoteResponse;
 use crate::types::Term;
+use crate::types::Vote;
 
 /// Why `Node::submit_command` refused a client command: this node isn't the leader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -298,7 +300,7 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     fn start_election(&mut self) -> Vec<Command<Cmd>> {
-        self.persistent.current_term = self.persistent.current_term.increment();
+        self.persistent.current_term = self.persistent.current_term.next();
         self.persistent.voted_for = Some(self.id);
         self.role = Role::Candidate(Candidate::new(self.id));
         info!(node = %self.id, term = %self.persistent.current_term, "election started");
@@ -337,14 +339,15 @@ impl<Cmd: Clone> Node<Cmd> {
             reset_timer = true;
         }
 
-        let vote_granted = self.should_grant_vote(&req);
-        if vote_granted {
+        let vote = if self.should_grant_vote(&req) {
             self.persistent.voted_for = Some(req.candidate_id);
             reset_timer = true;
             info!(node = %self.id, term = %self.persistent.current_term, candidate = %req.candidate_id, "vote granted");
+            Vote::Granted
         } else {
             debug!(node = %self.id, term = %self.persistent.current_term, candidate = %req.candidate_id, "vote denied");
-        }
+            Vote::Denied
+        };
 
         let mut commands = Vec::new();
         if reset_timer {
@@ -354,7 +357,7 @@ impl<Cmd: Clone> Node<Cmd> {
             to: from,
             message: Message::RequestVoteResponse(RequestVoteResponse {
                 term: self.persistent.current_term,
-                vote_granted,
+                vote,
             }),
         });
         commands
@@ -396,13 +399,18 @@ impl<Cmd: Clone> Node<Cmd> {
         // A vote from outside the current config must not count toward the majority —
         // transport has no authentication, and a removed member's stale response must
         // not be able to hand out an election win.
-        let is_member = self.config.contains(from);
+        let membership = self.config.membership_of(from);
         let cluster_size = self.peer_ids().len() + 1;
         let dominated = match &mut self.role {
             Role::Candidate(candidate) => {
-                if resp.vote_granted && is_member {
-                    candidate.record_vote(from);
-                    debug!(node = %self.id, term = %self.persistent.current_term, from = %from, "vote received");
+                match (resp.vote, membership) {
+                    (Vote::Granted, Membership::Member) => {
+                        candidate.record_vote(from);
+                        debug!(node = %self.id, term = %self.persistent.current_term, from = %from, "vote received");
+                    }
+                    (Vote::Granted, Membership::NonMember)
+                    | (Vote::Denied, Membership::Member)
+                    | (Vote::Denied, Membership::NonMember) => {}
                 }
                 candidate.has_majority(cluster_size)
             }
@@ -815,7 +823,7 @@ mod tests {
                 Command::Send {
                     message: Message::RequestVoteResponse(r),
                     ..
-                } => Some(r.vote_granted),
+                } => Some(r.vote == Vote::Granted),
                 _ => None,
             })
             .unwrap()
@@ -864,7 +872,7 @@ mod tests {
 
         let resp = RequestVoteResponse {
             term: Term::from(1),
-            vote_granted: true,
+            vote: Vote::Granted,
         };
         n.handle_request_vote_response(NodeId::from(2), resp);
 
@@ -878,7 +886,7 @@ mod tests {
 
         let resp = RequestVoteResponse {
             term: Term::from(1),
-            vote_granted: true,
+            vote: Vote::Granted,
         };
         n.handle_request_vote_response(NodeId::from(2), resp);
 
@@ -1066,7 +1074,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
         assert!(is_leader(&n));
@@ -1096,7 +1104,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
         assert!(is_leader(&n));
@@ -1251,7 +1259,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
 
@@ -1313,7 +1321,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
         n.submit_command("SET name=miles".to_string()).unwrap();
@@ -1418,7 +1426,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
 
@@ -1435,7 +1443,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
 
@@ -1456,7 +1464,7 @@ mod tests {
             NodeId::from(99),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
 
@@ -1528,7 +1536,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
         assert!(is_leader(&n));
@@ -1554,7 +1562,7 @@ mod tests {
             NodeId::from(2),
             RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             },
         );
 

@@ -5,6 +5,7 @@ mod primitives;
 
 pub use config::ClusterConfig;
 pub use config::ConfigError;
+pub use config::Membership;
 pub use log::Log;
 pub use log::LogEntry;
 pub use log::LogPayload;
@@ -14,6 +15,7 @@ pub use message::AppendEntriesResponse;
 pub use message::Message;
 pub use message::RequestVote;
 pub use message::RequestVoteResponse;
+pub use message::Vote;
 pub use primitives::LogIndex;
 pub use primitives::NodeId;
 pub use primitives::Term;

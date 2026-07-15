@@ -245,6 +245,7 @@ mod tests {
     use crate::types::AppendEntriesResponse;
     use crate::types::RequestVoteResponse;
     use crate::types::Term;
+    use crate::types::Vote;
 
     fn test_config(id: u64, peers: &[u64]) -> ClusterConfig {
         let members: HashMap<NodeId, SocketAddr> = std::iter::once(id)
@@ -287,7 +288,7 @@ mod tests {
             from: NodeId::from(2),
             message: Message::RequestVoteResponse(RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             }),
         })
         .unwrap();
@@ -327,7 +328,7 @@ mod tests {
             from: NodeId::from(2),
             message: Message::RequestVoteResponse(RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             }),
         })
         .unwrap();
@@ -368,7 +369,7 @@ mod tests {
             from: NodeId::from(2),
             message: Message::RequestVoteResponse(RequestVoteResponse {
                 term: Term::from(1),
-                vote_granted: true,
+                vote: Vote::Granted,
             }),
         })
         .unwrap();
