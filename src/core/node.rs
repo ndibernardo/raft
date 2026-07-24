@@ -129,11 +129,11 @@ impl<Cmd: Clone> PersistentState<Cmd> {
     }
 
     pub fn load<S: Storage<Cmd>>(storage: &S) -> Result<Self, S::Error> {
-        let (current_term, voted_for, entries) = storage.load()?;
+        let loaded = storage.load()?;
         Ok(Self {
-            current_term,
-            voted_for,
-            log: Log::from_entries(entries),
+            current_term: loaded.current_term,
+            voted_for: loaded.voted_for,
+            log: Log::from_entries(loaded.entries),
             meta_dirty: false,
             truncated_from: None,
             pending_append: Vec::new(),

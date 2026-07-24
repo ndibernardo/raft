@@ -77,6 +77,22 @@ impl<Cmd> Log<Cmd> {
         }
     }
 
+    /// Reconstructs a log from a persisted snapshot boundary and the surviving
+    /// suffix, which the caller guarantees starts at `snapshot_last_index + 1`.
+    /// For storage backends restoring state at startup; other callers reach a
+    /// compacted state via `compact_through`/`reset_to_snapshot` instead.
+    pub fn from_snapshot_and_suffix(
+        snapshot_last_index: LogIndex,
+        snapshot_last_term: Term,
+        entries: Vec<LogEntry<Cmd>>,
+    ) -> Self {
+        Self {
+            snapshot_last_index,
+            snapshot_last_term,
+            entries,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
