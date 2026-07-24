@@ -186,7 +186,6 @@ mod proptest_tests {
     use raft::Role;
     use raft::kv::KvCommand;
     use raft::kv::KvStore;
-    use raft::types::LogIndex;
 
     use super::*;
 
@@ -249,6 +248,11 @@ mod proptest_tests {
 
     /// §5.4.3 State Machine Safety: if two nodes have both committed up to some
     /// index, the committed entries at every position must be identical.
+    ///
+    /// Once either node has compacted, entries below its `first_index()` are gone;
+    /// that prefix is proven equal by the snapshot invariant itself; the comparison
+    /// only needs to cover the overlap of both nodes' retained ranges, plus a term
+    /// check at the boundary where the overlap begins.
     fn check_state_machine_safety(cluster: &Cluster<KvCommand, KvStore>) {
         for i in 0..N {
             for j in (i + 1)..N {
@@ -256,8 +260,23 @@ mod proptest_tests {
                 let nj = cluster.runtime(j).node();
                 let min_commit =
                     std::cmp::min(ni.volatile().commit_index, nj.volatile().commit_index);
+                let overlap_start = std::cmp::max(
+                    ni.persistent().log().first_index(),
+                    nj.persistent().log().first_index(),
+                );
 
-                let mut idx = LogIndex::from(1u64);
+                if let Some(boundary) = overlap_start.prev()
+                    && boundary <= min_commit
+                {
+                    assert_eq!(
+                        ni.persistent().log().term_at(boundary),
+                        nj.persistent().log().term_at(boundary),
+                        "state machine safety violated at compaction boundary {boundary}: \
+                         nodes {i} and {j} disagree on the term of their common prefix"
+                    );
+                }
+
+                let mut idx = overlap_start;
                 while idx <= min_commit {
                     let ei = ni.persistent().log().entry(idx).unwrap_or_else(|| {
                         panic!(
