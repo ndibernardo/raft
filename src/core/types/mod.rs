@@ -2,6 +2,7 @@ mod config;
 mod log;
 mod message;
 mod primitives;
+mod snapshot;
 
 pub use config::ClusterConfig;
 pub use config::ConfigError;
@@ -20,3 +21,6 @@ pub use message::Vote;
 pub use primitives::LogIndex;
 pub use primitives::NodeId;
 pub use primitives::Term;
+pub use snapshot::Snapshot;
+pub use snapshot::SnapshotData;
+pub use snapshot::SnapshotMeta;
