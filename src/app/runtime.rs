@@ -199,6 +199,10 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
             Message::AppendEntriesResponse(resp) => {
                 self.node.handle_append_entries_response(from, resp)
             }
+            Message::InstallSnapshot(req) => self.node.handle_install_snapshot(from, req),
+            Message::InstallSnapshotResponse(resp) => {
+                self.node.handle_install_snapshot_response(from, resp)
+            }
         }
     }
 

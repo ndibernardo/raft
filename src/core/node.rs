@@ -10,6 +10,8 @@ use crate::core::state::Leader;
 use crate::core::types::AppendEntries;
 use crate::core::types::AppendEntriesResponse;
 use crate::core::types::ClusterConfig;
+use crate::core::types::InstallSnapshot;
+use crate::core::types::InstallSnapshotResponse;
 use crate::core::types::Log;
 use crate::core::types::LogEntry;
 use crate::core::types::LogIndex;
@@ -20,6 +22,9 @@ use crate::core::types::Message;
 use crate::core::types::NodeId;
 use crate::core::types::RequestVote;
 use crate::core::types::RequestVoteResponse;
+use crate::core::types::Snapshot;
+use crate::core::types::SnapshotData;
+use crate::core::types::SnapshotMeta;
 use crate::core::types::Term;
 use crate::core::types::TermLookup;
 use crate::core::types::Vote;
@@ -43,6 +48,15 @@ pub enum SubmitError {
     ConfigChangePending,
 }
 
+/// Why `Node::compact_to_snapshot` refused to compact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CompactError {
+    /// `last_applied` is already at or below the current snapshot boundary —
+    /// nothing has been applied since the last compaction.
+    #[error("nothing to compact: last_applied is at or below the snapshot boundary")]
+    NothingToCompact,
+}
+
 /// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
 /// responding to any RPC — persisting after responding violates Raft's safety guarantees.
 ///
@@ -60,6 +74,14 @@ pub struct PersistentState<Cmd> {
     meta_dirty: bool,
     truncated_from: Option<LogIndex>,
     pending_append: Vec<LogEntry<Cmd>>,
+    /// Recorded by `compact_to_snapshot`/`handle_install_snapshot`, replayed by
+    /// `save` as `storage.install_snapshot(...)`, then cleared — same
+    /// record-then-replay pattern as `truncated_from`/`pending_append`.
+    pending_snapshot_install: Option<Snapshot>,
+    /// The most recently installed snapshot, kept for the leader send path
+    /// (building `InstallSnapshot` RPCs) — unlike `pending_snapshot_install`,
+    /// this persists for the node's lifetime, not just until the next `save`.
+    latest_snapshot: Option<Snapshot>,
 }
 
 impl<Cmd: Clone> PersistentState<Cmd> {
@@ -71,6 +93,8 @@ impl<Cmd: Clone> PersistentState<Cmd> {
             meta_dirty: false,
             truncated_from: None,
             pending_append: Vec::new(),
+            pending_snapshot_install: None,
+            latest_snapshot: None,
         }
     }
 
@@ -84,6 +108,10 @@ impl<Cmd: Clone> PersistentState<Cmd> {
 
     pub fn log(&self) -> &Log<Cmd> {
         &self.log
+    }
+
+    pub fn latest_snapshot(&self) -> Option<&Snapshot> {
+        self.latest_snapshot.as_ref()
     }
 
     fn set_term(&mut self, term: Term) {
@@ -130,13 +158,26 @@ impl<Cmd: Clone> PersistentState<Cmd> {
 
     pub fn load<S: Storage<Cmd>>(storage: &S) -> Result<Self, S::Error> {
         let loaded = storage.load()?;
+        // A persisted snapshot fixes the log's index offset — `from_entries`
+        // would otherwise treat the already-reconciled suffix as starting at
+        // index 1, corrupting every index arithmetic downstream.
+        let log = match &loaded.snapshot {
+            Some(snapshot) => Log::from_snapshot_and_suffix(
+                snapshot.meta.last_index,
+                snapshot.meta.last_term,
+                loaded.entries,
+            ),
+            None => Log::from_entries(loaded.entries),
+        };
         Ok(Self {
             current_term: loaded.current_term,
             voted_for: loaded.voted_for,
-            log: Log::from_entries(loaded.entries),
+            log,
             meta_dirty: false,
             truncated_from: None,
             pending_append: Vec::new(),
+            pending_snapshot_install: None,
+            latest_snapshot: loaded.snapshot,
         })
     }
 
@@ -144,6 +185,9 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         if self.meta_dirty {
             storage.set_meta(self.current_term, self.voted_for)?;
             self.meta_dirty = false;
+        }
+        if let Some(snapshot) = self.pending_snapshot_install.take() {
+            storage.install_snapshot(&snapshot)?;
         }
         if let Some(from) = self.truncated_from.take() {
             storage.truncate_from(from)?;
@@ -197,6 +241,9 @@ pub struct Node<Cmd> {
     pending_config_changes: Vec<ClusterConfig>,
     /// Configs that have just been committed. Drained by Server to resolve HTTP requests.
     pending_committed_config_changes: Vec<(LogIndex, ClusterConfig)>,
+    /// A snapshot installed via `handle_install_snapshot`, awaiting the
+    /// Runtime's `state_machine.restore()` call. Drained by `take_snapshot_to_restore`.
+    pending_snapshot_restore: Option<Snapshot>,
 }
 
 impl<Cmd: Clone> Node<Cmd> {
@@ -214,6 +261,7 @@ impl<Cmd: Clone> Node<Cmd> {
             role: Role::Follower(Follower::new()),
             pending_config_changes: Vec::new(),
             pending_committed_config_changes: Vec::new(),
+            pending_snapshot_restore: None,
         }
     }
 
@@ -237,6 +285,7 @@ impl<Cmd: Clone> Node<Cmd> {
             role: Role::Follower(Follower::new()),
             pending_config_changes: Vec::new(),
             pending_committed_config_changes: Vec::new(),
+            pending_snapshot_restore: None,
         };
         // Replay the latest config from the restored log so peers and transport
         // are updated correctly on restart.
@@ -332,7 +381,9 @@ impl<Cmd: Clone> Node<Cmd> {
 
     /// Scan the log backward for the latest ConfigChange entry and apply it.
     /// Called after a truncation (which may have removed a previously active config)
-    /// and on startup (to replay the config from a recovered log).
+    /// and on startup (to replay the config from a recovered log). Falls back to the
+    /// snapshot's config (if any) before `initial_config` — a compacted prefix may
+    /// have discarded the only ConfigChange entry that ever existed.
     fn apply_latest_config_from_log(&mut self) {
         let latest = self.persistent.log.iter().rev().find_map(|e| {
             if let LogPayload::ConfigChange(c) = &e.payload {
@@ -341,7 +392,14 @@ impl<Cmd: Clone> Node<Cmd> {
                 None
             }
         });
-        let config = latest.unwrap_or_else(|| self.initial_config.clone());
+        let config = latest
+            .or_else(|| {
+                self.persistent
+                    .latest_snapshot
+                    .as_ref()
+                    .map(|s| s.meta.config.clone())
+            })
+            .unwrap_or_else(|| self.initial_config.clone());
         if config != self.config {
             self.set_config(config);
         }
@@ -518,6 +576,23 @@ impl<Cmd: Clone> Node<Cmd> {
                 .next_index_for(peer)
                 .unwrap_or_else(|| self.last_log_index().next());
 
+            // The entry at next_index - 1 has already been compacted away: an
+            // AppendEntries here could never carry a valid prev_log_index, so
+            // the peer needs the whole compacted prefix via InstallSnapshot instead.
+            if next_index <= self.persistent.log.snapshot_last_index()
+                && let Some(snapshot) = &self.persistent.latest_snapshot
+            {
+                commands.push(Command::Send {
+                    to: peer,
+                    message: Message::InstallSnapshot(InstallSnapshot {
+                        term: self.persistent.current_term,
+                        leader_id: self.id,
+                        snapshot: snapshot.clone(),
+                    }),
+                });
+                continue;
+            }
+
             let prev_log_index = next_index.prev().unwrap_or_default();
             let prev_log_term = self.term_at(prev_log_index);
 
@@ -546,8 +621,9 @@ impl<Cmd: Clone> Node<Cmd> {
     fn term_at(&self, index: LogIndex) -> Term {
         match self.persistent.log.term_at(index) {
             TermLookup::Known(term) => term,
-            // Pre-compaction the snapshot boundary is 0/0, so `Compacted` cannot occur
-            // yet; both fall back to the sentinel term, matching pre-Phase-1 behavior.
+            // send_heartbeats routes any next_index at or below the snapshot boundary
+            // to InstallSnapshot instead, so prev_log_index here is always above the
+            // boundary — Compacted cannot occur. BeyondEnd falls back defensively.
             TermLookup::Compacted | TermLookup::BeyondEnd => Term::default(),
         }
     }
@@ -748,13 +824,15 @@ impl<Cmd: Clone> Node<Cmd> {
         let majority_pos = match_indices.len() / 2;
         let majority_index = match_indices[majority_pos];
 
-        // Only commit if entry is from current term (Figure 8 safety).
+        // Only commit if entry is from current term (Figure 8 safety). Uses
+        // term_at (not entry()) so a majority_index sitting exactly at the
+        // snapshot boundary — its entry gone via compaction — is still checked
+        // correctly via the boundary's preserved term.
         let has_higher_index = majority_index > self.volatile.commit_index;
-        let is_current_term = self
-            .persistent
-            .log
-            .entry(majority_index)
-            .is_some_and(|e| e.term == self.persistent.current_term);
+        let is_current_term = matches!(
+            self.persistent.log.term_at(majority_index),
+            TermLookup::Known(term) if term == self.persistent.current_term
+        );
 
         if has_higher_index && is_current_term {
             self.volatile.commit_index = majority_index;
@@ -829,6 +907,180 @@ impl<Cmd: Clone> Node<Cmd> {
         if matches!(outcome, MergeOutcome::Truncated { .. }) || has_config_entry {
             self.apply_latest_config_from_log();
         }
+    }
+
+    /// The cluster config active as of `index`, without reading past it. `self.config`
+    /// reflects config changes as of the log tail (changes take effect on append, not
+    /// commit — dissertation §4.1), so it cannot be used directly whenever a later
+    /// ConfigChange exists beyond `index`; this rescans the prefix in that case.
+    fn config_as_of(&self, index: LogIndex) -> ClusterConfig {
+        let has_later_config_change = self
+            .persistent
+            .log
+            .suffix_from(index.next())
+            .iter()
+            .any(|e| matches!(e.payload, LogPayload::ConfigChange(_)));
+
+        if !has_later_config_change {
+            return self.config.clone();
+        }
+
+        let first = self.persistent.log.first_index();
+        self.persistent
+            .log
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (first.advance_by(i as u64), e))
+            .take_while(|(entry_index, _)| *entry_index <= index)
+            .filter_map(|(_, e)| match &e.payload {
+                LogPayload::ConfigChange(c) => Some(c.clone()),
+                _ => None,
+            })
+            .last()
+            .unwrap_or_else(|| self.initial_config.clone())
+    }
+
+    /// Compacts the log through `last_applied`, using the serialized state machine
+    /// data the caller (Runtime, which owns the state machine) supplies.
+    ///
+    /// # Errors
+    /// `CompactError::NothingToCompact` — nothing has been applied since the last
+    /// compaction.
+    pub fn compact_to_snapshot(&mut self, data: SnapshotData) -> Result<Snapshot, CompactError> {
+        let last_index = self.volatile.last_applied;
+        if last_index <= self.persistent.log.snapshot_last_index() {
+            return Err(CompactError::NothingToCompact);
+        }
+        let last_term = self.term_at(last_index);
+        let config = self.config_as_of(last_index);
+
+        let snapshot = Snapshot {
+            meta: SnapshotMeta {
+                last_index,
+                last_term,
+                config,
+            },
+            data,
+        };
+
+        self.persistent.log.compact_through(last_index, last_term);
+        self.persistent.pending_snapshot_install = Some(snapshot.clone());
+        self.persistent.latest_snapshot = Some(snapshot.clone());
+        info!(node = %self.id, last_index = %last_index, "log compacted to snapshot");
+
+        Ok(snapshot)
+    }
+
+    /// Snapshot buffered by `handle_install_snapshot`, awaiting the Runtime's
+    /// `state_machine.restore()` call. Drained so a re-poll doesn't restore twice.
+    pub fn take_snapshot_to_restore(&mut self) -> Option<Snapshot> {
+        self.pending_snapshot_restore.take()
+    }
+
+    /// §7 InstallSnapshot RPC — receiver implementation (single-message variant,
+    /// no offset/done chunking).
+    pub fn handle_install_snapshot(
+        &mut self,
+        from: NodeId,
+        req: InstallSnapshot,
+    ) -> Vec<Command<Cmd>> {
+        if req.term < self.persistent.current_term {
+            debug!(node = %self.id, our_term = %self.persistent.current_term, their_term = %req.term, leader = %from, "install snapshot rejected: stale term");
+            return vec![Command::Send {
+                to: from,
+                message: Message::InstallSnapshotResponse(InstallSnapshotResponse::Rejected {
+                    term: self.persistent.current_term,
+                }),
+            }];
+        }
+
+        if req.term > self.persistent.current_term {
+            self.become_follower(req.term, Some(req.leader_id));
+        }
+        // §5.2: a candidate that hears from a leader in its own term must step down.
+        if matches!(self.role, Role::Candidate(_)) {
+            self.become_follower(req.term, Some(req.leader_id));
+        }
+        if let Role::Follower(follower) = &mut self.role {
+            follower.set_leader(req.leader_id);
+        }
+
+        let mut commands = vec![Command::ResetElectionTimer];
+
+        let last_index = req.snapshot.meta.last_index;
+        let last_term = req.snapshot.meta.last_term;
+
+        // Already have this committed — idempotent retry handling, nothing to do.
+        if last_index <= self.volatile.commit_index {
+            commands.push(Command::Send {
+                to: from,
+                message: Message::InstallSnapshotResponse(InstallSnapshotResponse::Installed {
+                    term: self.persistent.current_term,
+                    last_index,
+                }),
+            });
+            return commands;
+        }
+
+        // Retain-suffix case: our log already agrees with the snapshot boundary,
+        // so anything after it is still valid and must not be discarded.
+        let retains_suffix = matches!(
+            self.persistent.log.term_at(last_index),
+            TermLookup::Known(term) if term == last_term
+        );
+        if retains_suffix {
+            self.persistent.log.compact_through(last_index, last_term);
+        } else {
+            self.persistent.log.reset_to_snapshot(last_index, last_term);
+        }
+
+        // last_applied jumps straight to the boundary — cases above must never
+        // re-apply log entries; any surviving suffix beyond commit_index applies
+        // through the normal take_entry_to_apply path afterward.
+        self.volatile.commit_index = std::cmp::max(self.volatile.commit_index, last_index);
+        self.volatile.last_applied = last_index;
+        self.set_config(req.snapshot.meta.config.clone());
+
+        self.persistent.pending_snapshot_install = Some(req.snapshot.clone());
+        self.persistent.latest_snapshot = Some(req.snapshot.clone());
+        self.pending_snapshot_restore = Some(req.snapshot);
+        info!(node = %self.id, leader = %from, last_index = %last_index, "snapshot installed");
+
+        commands.push(Command::Send {
+            to: from,
+            message: Message::InstallSnapshotResponse(InstallSnapshotResponse::Installed {
+                term: self.persistent.current_term,
+                last_index,
+            }),
+        });
+        commands
+    }
+
+    /// Non-leaders and stale terms are no-ops; leaders in-term advance replication
+    /// progress and may complete a quorum. A `Rejected` response only ever means a
+    /// stale term — there is no lower boundary to decrement to below a snapshot.
+    pub fn handle_install_snapshot_response(
+        &mut self,
+        from: NodeId,
+        resp: InstallSnapshotResponse,
+    ) -> Vec<Command<Cmd>> {
+        let term = resp.term();
+        if term > self.persistent.current_term {
+            self.become_follower(term, None);
+            return vec![Command::ResetElectionTimer];
+        }
+        if term < self.persistent.current_term {
+            return Vec::new();
+        }
+
+        if let (Role::Leader(leader), InstallSnapshotResponse::Installed { last_index, .. }) =
+            (&mut self.role, resp)
+        {
+            leader.record_success(from, last_index);
+            self.advance_commit_index();
+        }
+
+        Vec::new()
     }
 }
 
@@ -1671,5 +1923,464 @@ mod tests {
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].0, LogIndex::from(1));
         assert_eq!(committed[0].1, new_config);
+    }
+
+    fn make_leader(id: u64, peers: &[u64]) -> Node<String> {
+        let mut n = node(id, peers);
+        n.election_timeout();
+        for &peer in peers {
+            n.handle_request_vote_response(
+                NodeId::from(peer),
+                RequestVoteResponse {
+                    term: Term::from(1),
+                    vote: Vote::Granted,
+                },
+            );
+        }
+        n
+    }
+
+    fn test_snapshot(last_index: u64, last_term: u64, config: ClusterConfig) -> Snapshot {
+        Snapshot {
+            meta: SnapshotMeta {
+                last_index: LogIndex::from(last_index),
+                last_term: Term::from(last_term),
+                config,
+            },
+            data: SnapshotData::new(vec![1, 2, 3]),
+        }
+    }
+
+    #[test]
+    fn compact_to_snapshot_errors_when_nothing_new_to_compact() {
+        let mut n = node(1, &[2, 3]);
+
+        let result = n.compact_to_snapshot(SnapshotData::new(vec![1]));
+
+        assert_eq!(result.unwrap_err(), CompactError::NothingToCompact);
+    }
+
+    #[test]
+    fn compact_to_snapshot_compacts_log_through_last_applied() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        n.volatile.commit_index = LogIndex::from(2);
+        n.volatile.last_applied = LogIndex::from(2);
+
+        let snapshot = n.compact_to_snapshot(SnapshotData::new(vec![42])).unwrap();
+
+        assert_eq!(snapshot.meta.last_index, LogIndex::from(2));
+        assert_eq!(snapshot.meta.last_term, Term::from(1));
+        assert_eq!(
+            snapshot.meta.config, n.config,
+            "no later ConfigChange exists, so the current active config is used directly"
+        );
+        assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(2));
+        assert!(n.persistent.log.is_empty());
+        assert_eq!(n.persistent.latest_snapshot, Some(snapshot));
+    }
+
+    #[test]
+    fn compact_to_snapshot_picks_config_change_at_or_before_boundary_not_a_later_one() {
+        let mut n = node(1, &[2, 3]);
+        let earlier_config = test_config(1, &[2, 3]);
+        let later_config = test_config(1, &[2, 3, 4]);
+
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::ConfigChange(earlier_config.clone()),
+        }); // index 1
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        }); // index 2, the compaction boundary
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::ConfigChange(later_config),
+        }); // index 3, beyond the boundary — must not be picked
+
+        n.volatile.commit_index = LogIndex::from(2);
+        n.volatile.last_applied = LogIndex::from(2);
+
+        let snapshot = n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
+
+        assert_eq!(snapshot.meta.config, earlier_config);
+    }
+
+    #[test]
+    fn leader_sends_install_snapshot_to_lagging_peer_and_append_entries_to_caught_up_peer() {
+        let mut n = make_leader(1, &[2, 3]);
+        n.submit_command("SET name=miles".to_string()).unwrap(); // index 2
+        n.submit_command("SET status=pending".to_string()).unwrap(); // index 3
+
+        // Peer 3 catches up to index 3; peer 2 is left behind at its initial next_index.
+        n.handle_append_entries_response(
+            NodeId::from(3),
+            AppendEntriesResponse::Accepted {
+                term: Term::from(1),
+                match_index: LogIndex::from(3),
+            },
+        );
+
+        n.volatile.commit_index = LogIndex::from(3);
+        n.volatile.last_applied = LogIndex::from(3);
+        n.compact_to_snapshot(SnapshotData::new(vec![7])).unwrap();
+
+        let commands = n.heartbeat_timeout();
+
+        let sent_to_2 = commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Send { to, message } if *to == NodeId::from(2) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(sent_to_2, Message::InstallSnapshot(_)),
+            "peer behind the compacted boundary must receive InstallSnapshot, got {sent_to_2:?}"
+        );
+
+        let sent_to_3 = commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Send { to, message } if *to == NodeId::from(3) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(sent_to_3, Message::AppendEntries(_)),
+            "caught-up peer must keep receiving AppendEntries, got {sent_to_3:?}"
+        );
+    }
+
+    #[test]
+    fn install_snapshot_response_advances_match_index_and_can_advance_commit_index() {
+        let mut n = make_leader(1, &[2, 3]);
+        n.submit_command("SET name=miles".to_string()).unwrap(); // index 2
+
+        n.handle_install_snapshot_response(
+            NodeId::from(2),
+            InstallSnapshotResponse::Installed {
+                term: Term::from(1),
+                last_index: LogIndex::from(2),
+            },
+        );
+
+        let Role::Leader(leader) = n.role() else {
+            panic!("expected leader");
+        };
+        assert_eq!(
+            leader.next_index_for(NodeId::from(2)),
+            Some(LogIndex::from(3))
+        );
+        assert_eq!(n.volatile.commit_index, LogIndex::from(2));
+    }
+
+    #[test]
+    fn install_snapshot_response_with_higher_term_steps_leader_down() {
+        let mut n = make_leader(1, &[2, 3]);
+
+        let cmds = n.handle_install_snapshot_response(
+            NodeId::from(2),
+            InstallSnapshotResponse::Rejected {
+                term: Term::from(99),
+            },
+        );
+
+        assert!(is_follower(&n));
+        assert_eq!(n.persistent.current_term, Term::from(99));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::ResetElectionTimer))
+        );
+    }
+
+    #[test]
+    fn follower_rejects_stale_term_install_snapshot() {
+        let mut n = node(1, &[2, 3]);
+        n.force_term(Term::from(5));
+
+        let req = InstallSnapshot {
+            term: Term::from(3),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(1, 1, test_config(1, &[2, 3])),
+        };
+        let cmds = n.handle_install_snapshot(NodeId::from(2), req);
+
+        let resp = cmds
+            .iter()
+            .find_map(|c| match c {
+                Command::Send {
+                    message: Message::InstallSnapshotResponse(r),
+                    ..
+                } => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(resp, InstallSnapshotResponse::Rejected { term } if *term == Term::from(5))
+        );
+    }
+
+    #[test]
+    fn candidate_steps_down_on_in_term_install_snapshot() {
+        let mut n = node(1, &[2, 3]);
+        n.election_timeout();
+        assert!(is_candidate(&n));
+
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(1, 1, test_config(1, &[2, 3])),
+        };
+        n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert!(is_follower(&n));
+    }
+
+    #[test]
+    fn follower_ignores_snapshot_at_or_below_commit_index() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.volatile.commit_index = LogIndex::from(1);
+
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(1, 1, test_config(1, &[2, 3])),
+        };
+        let cmds = n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert_eq!(
+            n.persistent.log.len(),
+            1,
+            "already-committed state untouched"
+        );
+        assert!(n.pending_snapshot_restore.is_none());
+
+        let resp = cmds
+            .iter()
+            .find_map(|c| match c {
+                Command::Send {
+                    message: Message::InstallSnapshotResponse(r),
+                    ..
+                } => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(resp, InstallSnapshotResponse::Installed { last_index, .. } if *last_index == LogIndex::from(1))
+        );
+    }
+
+    #[test]
+    fn follower_retains_suffix_when_boundary_entry_matches() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        }); // index 1
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        }); // index 2
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+        }); // index 3
+
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(2, 1, test_config(1, &[2, 3])), // term matches our entry at index 2
+        };
+        n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(2));
+        assert_eq!(n.persistent.log.len(), 1);
+        assert_eq!(
+            n.persistent.log.entry(LogIndex::from(3)).unwrap().payload,
+            LogPayload::Command("SET region=eu-west-1".to_string())
+        );
+        assert_eq!(n.volatile.last_applied, LogIndex::from(2));
+        assert!(n.pending_snapshot_restore.is_some());
+    }
+
+    #[test]
+    fn follower_discards_conflicting_log_wholesale_on_install_snapshot() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        }); // index 1
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        }); // index 2, term 1 — conflicts with the snapshot's claimed term 9
+
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(2, 9, test_config(1, &[2, 3])),
+        };
+        n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert!(n.persistent.log.is_empty());
+        assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(2));
+        assert_eq!(n.persistent.log.snapshot_last_term(), Term::from(9));
+    }
+
+    #[test]
+    fn follower_adopts_snapshot_config_on_install_snapshot() {
+        let mut n = node(1, &[2, 3]);
+        let grown_config = test_config(1, &[2, 3, 4]);
+
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(1, 1, grown_config.clone()),
+        };
+        n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert_eq!(n.config, grown_config);
+    }
+
+    #[test]
+    fn take_snapshot_to_restore_drains_pending_snapshot() {
+        let mut n = node(1, &[2, 3]);
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(1, 1, test_config(1, &[2, 3])),
+        };
+        n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert!(n.take_snapshot_to_restore().is_some());
+        assert!(n.take_snapshot_to_restore().is_none());
+    }
+
+    #[test]
+    fn save_persists_snapshot_install_before_appends() {
+        use crate::storage::LoadedState;
+        use crate::storage::MemoryStorage;
+
+        #[derive(Default)]
+        struct RecordingStorage {
+            calls: Vec<&'static str>,
+            inner: MemoryStorage<String>,
+        }
+
+        impl Storage<String> for RecordingStorage {
+            type Error = std::convert::Infallible;
+
+            fn load(&self) -> Result<LoadedState<String>, Self::Error> {
+                self.inner.load()
+            }
+
+            fn set_meta(
+                &mut self,
+                term: Term,
+                voted_for: Option<NodeId>,
+            ) -> Result<(), Self::Error> {
+                self.calls.push("set_meta");
+                self.inner.set_meta(term, voted_for)
+            }
+
+            fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error> {
+                self.calls.push("truncate_from");
+                self.inner.truncate_from(index)
+            }
+
+            fn append(&mut self, entries: &[LogEntry<String>]) -> Result<(), Self::Error> {
+                self.calls.push("append");
+                self.inner.append(entries)
+            }
+
+            fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
+                self.calls.push("install_snapshot");
+                self.inner.install_snapshot(snapshot)
+            }
+        }
+
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.volatile.commit_index = LogIndex::from(1);
+        n.volatile.last_applied = LogIndex::from(1);
+        n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
+        // A new entry appended after compaction means save() has both a pending
+        // snapshot install and a pending append to persist in the same call.
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+
+        let mut storage = RecordingStorage::default();
+        n.save(&mut storage).unwrap();
+
+        let install_pos = storage
+            .calls
+            .iter()
+            .position(|&c| c == "install_snapshot")
+            .expect("install_snapshot must be called");
+        let append_pos = storage
+            .calls
+            .iter()
+            .position(|&c| c == "append")
+            .expect("append must be called");
+        assert!(
+            install_pos < append_pos,
+            "snapshot must be installed before the new suffix is appended: {:?}",
+            storage.calls
+        );
+    }
+
+    #[test]
+    fn election_safety_after_full_compaction_uses_snapshot_boundary_for_vote_comparison() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(3),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.volatile.commit_index = LogIndex::from(1);
+        n.volatile.last_applied = LogIndex::from(1);
+        n.compact_to_snapshot(SnapshotData::new(vec![9])).unwrap();
+
+        assert!(n.persistent.log.is_empty());
+        assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(1));
+        assert_eq!(n.persistent.log.snapshot_last_term(), Term::from(3));
+
+        // A candidate whose log ends at a lower term than our snapshot boundary
+        // must be denied, even though our in-memory `entries` vec is now empty.
+        let stale_log_request = RequestVote {
+            term: Term::from(4),
+            candidate_id: NodeId::from(2),
+            last_log_index: LogIndex::from(1),
+            last_log_term: Term::from(2),
+        };
+        let cmds = n.handle_request_vote(NodeId::from(2), stale_log_request);
+        assert!(!extract_vote_granted(&cmds));
+
+        // A candidate at least as up to date as the snapshot boundary must be granted.
+        let caught_up_request = RequestVote {
+            term: Term::from(5),
+            candidate_id: NodeId::from(3),
+            last_log_index: LogIndex::from(1),
+            last_log_term: Term::from(3),
+        };
+        let cmds = n.handle_request_vote(NodeId::from(3), caught_up_request);
+        assert!(extract_vote_granted(&cmds));
     }
 }
