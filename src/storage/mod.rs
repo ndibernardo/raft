@@ -8,10 +8,18 @@ pub use memory::MemoryStorage;
 use crate::core::types::LogEntry;
 use crate::core::types::LogIndex;
 use crate::core::types::NodeId;
+use crate::core::types::Snapshot;
 use crate::core::types::Term;
 
-/// Term, vote, and log as read back from durable storage on startup.
-pub type LoadedState<Cmd> = (Term, Option<NodeId>, Vec<LogEntry<Cmd>>);
+/// Everything read back at startup. Four unrelated fields is past the point
+/// where positional tuple access is honest — name them.
+pub struct LoadedState<Cmd> {
+    pub current_term: Term,
+    pub voted_for: Option<NodeId>,
+    pub snapshot: Option<Snapshot>,
+    /// Entries after the snapshot boundary (or from index 1 if no snapshot).
+    pub entries: Vec<LogEntry<Cmd>>,
+}
 
 /// §5.1: currentTerm, votedFor, and log on stable storage. A dumb durable sink —
 /// `Node` owns the log and tells storage exactly what changed; storage never
@@ -32,4 +40,9 @@ pub trait Storage<Cmd> {
     /// Appends to the tail. Caller guarantees `entries` is exactly the suffix that
     /// follows what's already durable — no conflict detection happens here.
     fn append(&mut self, entries: &[LogEntry<Cmd>]) -> Result<(), Self::Error>;
+
+    /// Persists the snapshot durably, then drops all log entries at or below
+    /// `snapshot.meta.last_index`. Must write the snapshot before touching the
+    /// log — the reverse order loses committed state on a crash between the two.
+    fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error>;
 }
