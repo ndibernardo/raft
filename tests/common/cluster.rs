@@ -7,6 +7,7 @@ use raft::MemoryStorage;
 use raft::Node;
 use raft::Role;
 use raft::Runtime;
+use raft::SnapshotPolicy;
 use raft::StateMachine;
 use raft::TimerConfig;
 use raft::types::ClusterConfig;
@@ -60,6 +61,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
                     S::default(),
                     MemoryStorage::new(),
                     TimerConfig::default(),
+                    SnapshotPolicy::default(),
                 )
             })
             .collect();
@@ -81,18 +83,22 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     }
 
     /// Trigger election timeout on a specific node.
+    // Cluster::new never sets a compact_threshold, so no snapshot is ever taken or
+    // installed here — RuntimeError is unreachable in this harness, just not provably so.
+    #[allow(clippy::unwrap_used)]
     pub fn election_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
             .handle(raft::Event::ElectionTimeout)
-            .unwrap_or_else(|e| match e {});
+            .unwrap();
         self.queue_commands(index, commands);
     }
 
     /// Trigger heartbeat timeout on a specific node.
+    #[allow(clippy::unwrap_used)]
     pub fn heartbeat_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
             .handle(raft::Event::HeartbeatTimeout)
-            .unwrap_or_else(|e| match e {});
+            .unwrap();
         self.queue_commands(index, commands);
     }
 
@@ -114,6 +120,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     }
 
     /// Deliver a single message and queue any responses.
+    #[allow(clippy::unwrap_used)]
     fn deliver(&mut self, inflight: InFlight<Cmd>) {
         let to_index = self.node_index(inflight.to);
         if let Some(index) = to_index {
@@ -122,7 +129,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
                     from: inflight.from,
                     message: inflight.message,
                 })
-                .unwrap_or_else(|e| match e {});
+                .unwrap();
             self.queue_commands(index, commands);
         }
     }
