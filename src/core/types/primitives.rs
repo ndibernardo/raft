@@ -68,13 +68,16 @@ impl LogIndex {
         }
     }
 
-    /// Convert to array index (0-based). Returns None for index 0.
-    pub fn to_array_index(self) -> Option<usize> {
-        if self.value == 0 {
-            None
-        } else {
-            Some((self.value - 1) as usize)
+    /// Returns `self` advanced by `n`.
+    pub fn advance_by(self, n: u64) -> LogIndex {
+        LogIndex {
+            value: self.value.saturating_add(n),
         }
+    }
+
+    /// Number of steps from `base` to `self`. `None` if `self <= base`.
+    pub fn value_since(self, base: LogIndex) -> Option<u64> {
+        self.value.checked_sub(base.value).filter(|&d| d > 0)
     }
 }
 
@@ -150,14 +153,19 @@ mod tests {
     }
 
     #[test]
-    fn log_index_to_array_index_returns_none_for_zero() {
-        assert_eq!(LogIndex::default().to_array_index(), None);
+    fn log_index_advance_by_adds_steps() {
+        assert_eq!(LogIndex::from(2).advance_by(3), LogIndex::from(5));
     }
 
     #[test]
-    fn log_index_to_array_index_returns_zero_based_offset() {
-        assert_eq!(LogIndex::from(1).to_array_index(), Some(0));
-        assert_eq!(LogIndex::from(3).to_array_index(), Some(2));
+    fn log_index_value_since_returns_none_when_not_strictly_greater() {
+        assert_eq!(LogIndex::from(2).value_since(LogIndex::from(2)), None);
+        assert_eq!(LogIndex::from(1).value_since(LogIndex::from(2)), None);
+    }
+
+    #[test]
+    fn log_index_value_since_returns_step_count() {
+        assert_eq!(LogIndex::from(5).value_since(LogIndex::from(2)), Some(3));
     }
 
     #[test]

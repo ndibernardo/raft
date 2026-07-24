@@ -21,6 +21,7 @@ use crate::core::types::NodeId;
 use crate::core::types::RequestVote;
 use crate::core::types::RequestVoteResponse;
 use crate::core::types::Term;
+use crate::core::types::TermLookup;
 use crate::core::types::Vote;
 use crate::storage::Storage;
 
@@ -543,7 +544,12 @@ impl<Cmd: Clone> Node<Cmd> {
     }
 
     fn term_at(&self, index: LogIndex) -> Term {
-        self.persistent.log.term_at(index).unwrap_or_default()
+        match self.persistent.log.term_at(index) {
+            TermLookup::Known(term) => term,
+            // Pre-compaction the snapshot boundary is 0/0, so `Compacted` cannot occur
+            // yet; both fall back to the sentinel term, matching pre-Phase-1 behavior.
+            TermLookup::Compacted | TermLookup::BeyondEnd => Term::default(),
+        }
     }
 
     fn entries_from(&self, start: LogIndex) -> Vec<LogEntry<Cmd>> {
@@ -1095,11 +1101,12 @@ mod tests {
         n.handle_append_entries(NodeId::from(2), req);
 
         assert_eq!(n.persistent.log.len(), 2);
+        let entry = n.persistent.log.entry(LogIndex::from(2)).unwrap();
         assert_eq!(
-            n.persistent.log[1].payload,
+            entry.payload,
             LogPayload::Command("SET status=active".to_string())
         );
-        assert_eq!(n.persistent.log[1].term, Term::from(2));
+        assert_eq!(entry.term, Term::from(2));
     }
 
     #[test]
@@ -1321,8 +1328,9 @@ mod tests {
 
         assert!(is_leader(&n));
         assert_eq!(n.persistent.log.len(), 1);
-        assert!(matches!(n.persistent.log[0].payload, LogPayload::NoOp));
-        assert_eq!(n.persistent.log[0].term, Term::from(1));
+        let entry = n.persistent.log.entry(LogIndex::from(1)).unwrap();
+        assert!(matches!(entry.payload, LogPayload::NoOp));
+        assert_eq!(entry.term, Term::from(1));
     }
 
     #[test]
