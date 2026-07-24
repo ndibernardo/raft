@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::app::runtime::StateMachine;
+use crate::core::types::SnapshotData;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCommand {
@@ -46,11 +47,38 @@ impl KvStore {
     }
 }
 
+/// Wire format for `KvStore` snapshots. Kept separate from `KvStore` itself so the
+/// domain type never derives `Serialize`/`Deserialize` directly.
+#[derive(Serialize, Deserialize)]
+struct KvSnapshotDto {
+    entries: HashMap<String, String>,
+}
+
+/// Failure to serialize or deserialize a `KvStore` snapshot.
+#[derive(Debug, thiserror::Error)]
+#[error("kv store snapshot error: {0}")]
+pub struct KvSnapshotError(#[from] serde_json::Error);
+
 impl StateMachine<KvCommand> for KvStore {
     type Output = KvResult;
+    type SnapshotError = KvSnapshotError;
 
     fn apply(&mut self, command: KvCommand) -> Self::Output {
         KvStore::apply(self, command)
+    }
+
+    fn snapshot(&self) -> Result<SnapshotData, Self::SnapshotError> {
+        let dto = KvSnapshotDto {
+            entries: self.data.clone(),
+        };
+        let bytes = serde_json::to_vec(&dto)?;
+        Ok(SnapshotData::new(bytes))
+    }
+
+    fn restore(&mut self, data: &SnapshotData) -> Result<(), Self::SnapshotError> {
+        let dto: KvSnapshotDto = serde_json::from_slice(data.as_bytes())?;
+        self.data = dto.entries;
+        Ok(())
     }
 }
 
@@ -113,5 +141,74 @@ mod tests {
         });
 
         assert_eq!(result, KvResult::Ok);
+    }
+
+    #[test]
+    fn snapshot_then_restore_round_trips_store_contents() {
+        let mut store = KvStore::new();
+        store.apply(KvCommand::Set {
+            key: "username".to_string(),
+            value: "miles".to_string(),
+        });
+        store.apply(KvCommand::Set {
+            key: "status".to_string(),
+            value: "active".to_string(),
+        });
+
+        let data = store.snapshot().unwrap();
+        let mut restored = KvStore::new();
+        restored.restore(&data).unwrap();
+
+        assert_eq!(
+            restored.apply(KvCommand::Get {
+                key: "username".to_string()
+            }),
+            KvResult::Value(Some("miles".to_string()))
+        );
+        assert_eq!(
+            restored.apply(KvCommand::Get {
+                key: "status".to_string()
+            }),
+            KvResult::Value(Some("active".to_string()))
+        );
+    }
+
+    #[test]
+    fn restore_replaces_existing_state_not_merges() {
+        let mut source = KvStore::new();
+        source.apply(KvCommand::Set {
+            key: "region".to_string(),
+            value: "eu-west-1".to_string(),
+        });
+        let data = source.snapshot().unwrap();
+
+        let mut target = KvStore::new();
+        target.apply(KvCommand::Set {
+            key: "username".to_string(),
+            value: "miles".to_string(),
+        });
+        target.restore(&data).unwrap();
+
+        assert_eq!(
+            target.apply(KvCommand::Get {
+                key: "username".to_string()
+            }),
+            KvResult::Value(None),
+            "restore must replace state wholesale, not merge into it"
+        );
+        assert_eq!(
+            target.apply(KvCommand::Get {
+                key: "region".to_string()
+            }),
+            KvResult::Value(Some("eu-west-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_bytes() {
+        let mut store = KvStore::new();
+        let corrupt = SnapshotData::new(b"not valid json".to_vec());
+
+        assert!(store.restore(&corrupt).is_err());
     }
 }

@@ -12,13 +12,22 @@ use crate::core::types::ClusterConfig;
 use crate::core::types::LogIndex;
 use crate::core::types::Message;
 use crate::core::types::NodeId;
+use crate::core::types::SnapshotData;
 use crate::core::types::Term;
 use crate::storage::Storage;
 
 /// Trait for state machines that can apply commands.
 pub trait StateMachine<Cmd> {
     type Output;
+    type SnapshotError: std::error::Error;
+
     fn apply(&mut self, command: Cmd) -> Self::Output;
+
+    /// Serialize current state. Must capture exactly the applied prefix.
+    fn snapshot(&self) -> Result<SnapshotData, Self::SnapshotError>;
+
+    /// Replace state wholesale with the snapshot's contents.
+    fn restore(&mut self, data: &SnapshotData) -> Result<(), Self::SnapshotError>;
 }
 
 /// Events that drive the runtime.
