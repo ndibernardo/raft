@@ -10,6 +10,7 @@ pub use log::Log;
 pub use log::LogEntry;
 pub use log::LogPayload;
 pub use log::MergeOutcome;
+pub use log::TermLookup;
 pub use message::AppendEntries;
 pub use message::AppendEntriesResponse;
 pub use message::Message;
