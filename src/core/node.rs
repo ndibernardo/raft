@@ -273,14 +273,18 @@ impl<Cmd: Clone> Node<Cmd> {
         storage: &S,
     ) -> Result<Self, S::Error> {
         let persistent = PersistentState::load(storage)?;
+        // A restored snapshot already covers everything up to its boundary — starting
+        // at zero would make take_entry_to_apply replay committed entries the snapshot
+        // (and the state machine restored from it) already reflect, double-applying them.
+        let boundary = persistent.log().snapshot_last_index();
         let mut node = Self {
             id,
             config: initial_config.clone(),
             initial_config,
             persistent,
             volatile: VolatileState {
-                commit_index: LogIndex::default(),
-                last_applied: LogIndex::default(),
+                commit_index: boundary,
+                last_applied: boundary,
             },
             role: Role::Follower(Follower::new()),
             pending_config_changes: Vec::new(),

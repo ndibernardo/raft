@@ -15,6 +15,8 @@ pub use app::client_api;
 pub use app::kv;
 pub use app::runtime::Event;
 pub use app::runtime::Runtime;
+pub use app::runtime::RuntimeError;
+pub use app::runtime::SnapshotPolicy;
 pub use app::runtime::StateMachine;
 pub use app::runtime::TimerConfig;
 pub use app::server::Config;

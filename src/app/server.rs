@@ -11,6 +11,8 @@ use tokio::sync::oneshot;
 
 use crate::app::runtime::Event;
 use crate::app::runtime::Runtime;
+use crate::app::runtime::RuntimeError;
+use crate::app::runtime::SnapshotPolicy;
 use crate::app::runtime::StateMachine;
 use crate::app::runtime::TimerConfig;
 use crate::app::transport::Transport;
@@ -27,13 +29,24 @@ use crate::storage::file::FileStorage;
 use crate::storage::file::FileStorageError;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ServerError {
+pub enum ServerError<SmErr: std::error::Error> {
     #[error("storage: {0}")]
     Storage(#[from] FileStorageError),
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
     #[error("config: {0}")]
     Config(#[from] ConfigError),
+    #[error("state machine: {0}")]
+    StateMachine(SmErr),
+}
+
+impl<SmErr: std::error::Error> From<RuntimeError<FileStorageError, SmErr>> for ServerError<SmErr> {
+    fn from(err: RuntimeError<FileStorageError, SmErr>) -> Self {
+        match err {
+            RuntimeError::Storage(e) => Self::Storage(e),
+            RuntimeError::StateMachine(e) => Self::StateMachine(e),
+        }
+    }
 }
 
 /// Outcome of a submitted client command, delivered back over its response channel.
@@ -109,7 +122,7 @@ where
         state_machine: SM,
         client_rx: mpsc::Receiver<Pending<Cmd, SM::Output>>,
         membership_rx: mpsc::Receiver<MembershipPending>,
-    ) -> Result<Self, ServerError> {
+    ) -> Result<Self, ServerError<SM::SnapshotError>> {
         let local_id = config.id;
         let addr = config.addr;
 
@@ -126,6 +139,7 @@ where
             state_machine,
             storage,
             TimerConfig::default(),
+            SnapshotPolicy::default(),
         )?;
 
         // Transport only tracks peers (not self).
@@ -144,7 +158,7 @@ where
     }
 
     /// Run the Raft event loop. Returns only on I/O error.
-    pub fn run(&mut self) -> Result<(), ServerError> {
+    pub fn run(&mut self) -> Result<(), ServerError<SM::SnapshotError>> {
         loop {
             self.poll_client_requests();
             self.poll_membership_requests();
@@ -331,6 +345,7 @@ mod tests {
             KvStore::new(),
             storage,
             TimerConfig::default(),
+            SnapshotPolicy::default(),
         )
         .unwrap();
         let transport = Transport::bind(local_id, listen_addr, HashMap::new()).unwrap();
