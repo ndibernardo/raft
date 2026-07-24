@@ -95,6 +95,7 @@ pub struct Config {
     pub addr: SocketAddr,
     pub peers: HashMap<NodeId, SocketAddr>,
     pub data_dir: PathBuf,
+    pub snapshot_policy: SnapshotPolicy,
 }
 
 /// A running Raft node: persistent log on disk, RPCs over TCP. Generic over the
@@ -125,6 +126,7 @@ where
     ) -> Result<Self, ServerError<SM::SnapshotError>> {
         let local_id = config.id;
         let addr = config.addr;
+        let snapshot_policy = config.snapshot_policy;
 
         // Initial config includes self so crash-recovery can rescan the log correctly.
         // Always non-empty: local_id is inserted unconditionally below.
@@ -139,7 +141,7 @@ where
             state_machine,
             storage,
             TimerConfig::default(),
-            SnapshotPolicy::default(),
+            snapshot_policy,
         )?;
 
         // Transport only tracks peers (not self).
@@ -313,6 +315,7 @@ where
 }
 
 #[cfg(all(test, feature = "kv"))]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::path::Path;
 
@@ -345,7 +348,11 @@ mod tests {
             KvStore::new(),
             storage,
             TimerConfig::default(),
-            SnapshotPolicy::default(),
+            // Small threshold so compaction paths are reachable within a handful of
+            // submitted commands, unlike the production default of 1024.
+            SnapshotPolicy {
+                compact_threshold: std::num::NonZeroUsize::new(8),
+            },
         )
         .unwrap();
         let transport = Transport::bind(local_id, listen_addr, HashMap::new()).unwrap();

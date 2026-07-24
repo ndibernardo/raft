@@ -1,14 +1,19 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::mpsc;
 
 use clap::Parser;
 use raft::Config;
 use raft::Server;
+use raft::SnapshotPolicy;
 use raft::client_api;
 use raft::kv::KvStore;
 use raft::types::NodeId;
+
+/// Compact once 1024 applied entries have accumulated past the last snapshot.
+const PRODUCTION_SNAPSHOT_THRESHOLD: Option<NonZeroUsize> = NonZeroUsize::new(1024);
 
 /// One `--peer` entry in `ID=ADDR` form.
 #[derive(Clone)]
@@ -91,6 +96,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr: args.addr,
         peers,
         data_dir: args.data_dir,
+        snapshot_policy: SnapshotPolicy {
+            compact_threshold: PRODUCTION_SNAPSHOT_THRESHOLD,
+        },
     };
 
     if let Some(addr) = args.client_addr {
