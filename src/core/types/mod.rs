@@ -14,6 +14,8 @@ pub use log::MergeOutcome;
 pub use log::TermLookup;
 pub use message::AppendEntries;
 pub use message::AppendEntriesResponse;
+pub use message::InstallSnapshot;
+pub use message::InstallSnapshotResponse;
 pub use message::Message;
 pub use message::RequestVote;
 pub use message::RequestVoteResponse;

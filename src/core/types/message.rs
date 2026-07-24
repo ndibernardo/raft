@@ -5,6 +5,7 @@ use super::log::LogEntry;
 use super::primitives::LogIndex;
 use super::primitives::NodeId;
 use super::primitives::Term;
+use super::snapshot::Snapshot;
 
 /// RequestVote RPC arguments.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +62,33 @@ impl AppendEntriesResponse {
     }
 }
 
+/// InstallSnapshot RPC arguments (paper §7, single-message variant — no
+/// offset/done chunking).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstallSnapshot {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub snapshot: Snapshot,
+}
+
+/// InstallSnapshot RPC response.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum InstallSnapshotResponse {
+    /// Snapshot installed, or already covered by this node's commit index;
+    /// the leader may advance next_index/match_index to `last_index`.
+    Installed { term: Term, last_index: LogIndex },
+    /// Stale leader term.
+    Rejected { term: Term },
+}
+
+impl InstallSnapshotResponse {
+    pub fn term(&self) -> Term {
+        match self {
+            Self::Installed { term, .. } | Self::Rejected { term } => *term,
+        }
+    }
+}
+
 /// All possible Raft messages.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message<Cmd> {
@@ -68,4 +96,6 @@ pub enum Message<Cmd> {
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntries<Cmd>),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
