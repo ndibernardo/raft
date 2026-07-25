@@ -1,18 +1,39 @@
 mod common;
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+
 use common::Cluster;
+use raft::Event;
+use raft::FileStorage;
+use raft::Node;
 use raft::Role;
+use raft::Runtime;
+use raft::SnapshotPolicy;
+use raft::TimerConfig;
 use raft::kv::KvCommand;
 use raft::kv::KvResult;
 use raft::kv::KvStore;
+use raft::types::AppendEntriesResponse;
+use raft::types::ClusterConfig;
 use raft::types::LogIndex;
+use raft::types::Message;
+use raft::types::NodeId;
+use raft::types::RequestVoteResponse;
 use raft::types::Term;
+use raft::types::Vote;
 
 fn set(key: &str, value: &str) -> KvCommand {
     KvCommand::Set {
         key: key.to_string(),
         value: value.to_string(),
     }
+}
+
+/// Dummy dial-in address — none of these tests exchange real bytes over a socket.
+fn addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
 }
 
 /// Drive node `i` to win an election and deliver all resulting messages.
@@ -291,5 +312,262 @@ fn new_leader_accepts_commands_after_re_election() {
         cluster.runtime(1).node().volatile().commit_index,
         index.unwrap(),
         "new leader must commit its own command"
+    );
+}
+
+/// A follower partitioned before the leader ever compacts falls behind the
+/// compacted prefix entirely. Once healed, its `next_index` can no longer be
+/// satisfied by `AppendEntries` — the entries it needs are gone — so the leader
+/// must fall back to `InstallSnapshot`, and the follower must end up with the
+/// same KV state as the leader despite never having replayed the compacted log.
+#[test]
+fn lagging_follower_catches_up_via_install_snapshot() {
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(
+        3,
+        SnapshotPolicy {
+            compact_threshold: NonZeroUsize::new(2),
+        },
+    );
+    elect(&mut cluster, 0);
+
+    // Node 2 falls behind before it receives even the leader's no-op.
+    cluster.partition(2);
+
+    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+        cluster.runtime_mut(0).submit(set(key, value)).unwrap();
+        cluster.heartbeat_timeout(0);
+        cluster.deliver_all();
+    }
+    // Propagate the trailing commit index to node 1.
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    assert!(
+        cluster
+            .runtime(0)
+            .node()
+            .persistent()
+            .log()
+            .snapshot_last_index()
+            > LogIndex::from(0),
+        "leader must have compacted past the threshold while node 2 was partitioned"
+    );
+
+    cluster.heal_partition(2);
+    // Leader's next_index for node 2 is still 1 — below the compacted boundary — so
+    // this heartbeat must send InstallSnapshot instead of AppendEntries.
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+    // A second round in case any entries trailing the last compaction still need
+    // ordinary replication after the snapshot lands.
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    for key in ["a", "b", "c", "d"] {
+        let expected = cluster
+            .runtime_mut(0)
+            .state_machine_mut()
+            .apply(KvCommand::Get {
+                key: key.to_string(),
+            });
+        let actual = cluster
+            .runtime_mut(2)
+            .state_machine_mut()
+            .apply(KvCommand::Get {
+                key: key.to_string(),
+            });
+        assert_eq!(
+            actual, expected,
+            "node 2 must converge to the leader's value for {key:?} via InstallSnapshot"
+        );
+    }
+    assert!(
+        cluster.runtime(2).node().persistent().log().first_index() > LogIndex::from(1),
+        "node 2's log must start after the installed snapshot boundary, not at index 1"
+    );
+}
+
+/// A single node's committed-and-compacted state, plus an uncommitted suffix
+/// appended just before "crash," must both survive a restart from `FileStorage`.
+#[test]
+fn restarted_node_recovers_from_snapshot_plus_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ClusterConfig::new(HashMap::from([
+        (NodeId::from(1), addr(19101)),
+        (NodeId::from(2), addr(19102)),
+    ]))
+    .unwrap();
+
+    let mut rt: Runtime<KvCommand, KvStore, FileStorage<KvCommand>> = Runtime::new(
+        Node::new(NodeId::from(1), config.clone()),
+        KvStore::new(),
+        FileStorage::open(dir.path()).unwrap(),
+        TimerConfig::default(),
+        SnapshotPolicy {
+            compact_threshold: NonZeroUsize::new(1),
+        },
+    );
+
+    rt.handle(Event::ElectionTimeout).unwrap();
+    rt.handle(Event::Message {
+        from: NodeId::from(2),
+        message: Message::RequestVoteResponse(RequestVoteResponse {
+            term: Term::from(1),
+            vote: Vote::Granted,
+        }),
+    })
+    .unwrap();
+    assert!(matches!(rt.node().role(), Role::Leader(_)));
+
+    // Committed and compacted (threshold 1) via a simulated ack from peer 2.
+    let index = rt.submit(set("region", "eu-west-1")).unwrap();
+    rt.handle(Event::Message {
+        from: NodeId::from(2),
+        message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
+            term: Term::from(1),
+            match_index: index,
+        }),
+    })
+    .unwrap();
+    assert!(
+        rt.node().persistent().log().snapshot_last_index() > LogIndex::from(0),
+        "threshold of 1 must have compacted after the first commit"
+    );
+
+    // Appended and persisted, but never acked — still uncommitted at "crash" time.
+    rt.submit(set("region", "us-east-1")).unwrap();
+    rt.handle(Event::HeartbeatTimeout).unwrap();
+
+    // "Crash": drop the handle, then reopen the same data directory as a fresh restart.
+    drop(rt);
+    let mut restored = Runtime::from_storage(
+        NodeId::from(1),
+        config,
+        KvStore::new(),
+        FileStorage::open(dir.path()).unwrap(),
+        TimerConfig::default(),
+        SnapshotPolicy::default(),
+    )
+    .unwrap();
+
+    assert!(
+        restored
+            .node()
+            .persistent()
+            .log()
+            .entry(LogIndex::from(1))
+            .is_none(),
+        "compacted entries must not be replayable from the log after restart"
+    );
+    assert_eq!(
+        restored.state_machine_mut().apply(KvCommand::Get {
+            key: "region".to_string()
+        }),
+        KvResult::Value(Some("eu-west-1".to_string())),
+        "restored state machine must reflect the committed snapshot, \
+         not the uncommitted suffix written just before the crash"
+    );
+}
+
+/// A membership change compacted away by the time a lagging node catches up must
+/// still be learned — from the installed snapshot's config, since the log entry
+/// that carried it no longer exists.
+#[test]
+fn snapshot_preserves_membership_config() {
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(
+        3,
+        SnapshotPolicy {
+            compact_threshold: NonZeroUsize::new(1),
+        },
+    );
+    elect(&mut cluster, 0);
+
+    let new_member = NodeId::from(4);
+    cluster.add_node(4);
+
+    let new_config = cluster
+        .runtime(0)
+        .node()
+        .config()
+        .with_member(new_member, addr(19104));
+    let config_change_index = cluster
+        .runtime_mut(0)
+        .submit_config_change(new_config)
+        .unwrap();
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    // Node 2 falls behind starting now, before the config change is compacted away.
+    cluster.partition(2);
+
+    for (key, value) in [("x", "1"), ("y", "2"), ("z", "3")] {
+        cluster.runtime_mut(0).submit(set(key, value)).unwrap();
+        cluster.heartbeat_timeout(0);
+        cluster.deliver_all();
+    }
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    assert!(
+        cluster
+            .runtime(0)
+            .node()
+            .persistent()
+            .log()
+            .snapshot_last_index()
+            > config_change_index,
+        "the config-change entry at index {config_change_index:?} must have been compacted away"
+    );
+
+    cluster.heal_partition(2);
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    assert!(
+        cluster.runtime(2).node().config().contains(new_member),
+        "node 2 must learn the new member from the installed snapshot's config, \
+         since the config-change log entry itself was compacted away before it caught up"
+    );
+}
+
+/// Election safety must still hold once every node's log has been fully
+/// compacted — the vote comparison in this case relies entirely on the
+/// snapshot boundary's index/term, since `entries` is empty on every node.
+#[test]
+fn leader_election_works_when_all_logs_fully_compacted() {
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(
+        3,
+        SnapshotPolicy {
+            compact_threshold: NonZeroUsize::new(1),
+        },
+    );
+    elect(&mut cluster, 0);
+
+    cluster.runtime_mut(0).submit(set("x", "1")).unwrap();
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+    // Second round propagates commit_index to followers so they apply and compact too.
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    for i in 0..3 {
+        assert_eq!(
+            cluster.runtime(i).node().persistent().log().len(),
+            0,
+            "node {i}'s log must be fully compacted, with nothing left to replay"
+        );
+    }
+
+    // Simulate leader failure: node 1 times out and starts a new election.
+    elect(&mut cluster, 1);
+
+    assert_eq!(
+        cluster.leader(),
+        Some(1),
+        "election must still succeed once every log is fully compacted"
     );
 }

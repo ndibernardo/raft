@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -21,31 +22,44 @@ struct InFlight<Cmd> {
     message: Message<Cmd>,
 }
 
+/// Dummy dial-in address for a simulated node — the cluster harness routes messages
+/// in-memory by `NodeId`, never over a real socket, so only its uniqueness matters.
+fn dummy_addr(id_value: u64) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], (9000 + id_value) as u16))
+}
+
 /// Simulated cluster for testing. Uses MemoryStorage on every node.
 pub struct Cluster<Cmd, S: StateMachine<Cmd>> {
     runtimes: Vec<Runtime<Cmd, S, MemoryStorage<Cmd>>>,
     messages: VecDeque<InFlight<Cmd>>,
+    /// Nodes currently cut off from the rest of the cluster: messages to or from
+    /// them are dropped in flight (see `deliver`) until `heal_partition`.
+    partitioned: HashSet<NodeId>,
+    /// Applied to every node created by `with_snapshot_policy` and `add_node`, so a
+    /// node joining after cluster creation compacts on the same schedule as its peers.
+    snapshot_policy: SnapshotPolicy,
 }
 
 impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
-    /// Create a cluster with the given number of nodes.
+    /// Create a cluster with the given number of nodes; auto-compaction disabled.
     ///
     /// # Panics
     /// If `size` is 0 — a cluster harness with no nodes isn't a meaningful test fixture.
     pub fn new(size: usize) -> Self {
+        Self::with_snapshot_policy(size, SnapshotPolicy::default())
+    }
+
+    /// Create a cluster with the given number of nodes, each compacting per `snapshot_policy`.
+    ///
+    /// # Panics
+    /// If `size` is 0 — a cluster harness with no nodes isn't a meaningful test fixture.
+    pub fn with_snapshot_policy(size: usize, snapshot_policy: SnapshotPolicy) -> Self {
         assert!(size > 0, "Cluster::new requires at least one node");
         let ids: Vec<NodeId> = (1..=size).map(|i| NodeId::from(i as u64)).collect();
 
         // Shared config: all nodes start with the same full membership.
-        // Addresses are dummies — cluster harness delivers messages in-memory, not over TCP.
-        let members: HashMap<NodeId, SocketAddr> = ids
-            .iter()
-            .map(|&id| {
-                // Construct directly from octets to avoid parsing and unwrap.
-                let addr = SocketAddr::from(([127, 0, 0, 1], (9000 + id.value()) as u16));
-                (id, addr)
-            })
-            .collect();
+        let members: HashMap<NodeId, SocketAddr> =
+            ids.iter().map(|&id| (id, dummy_addr(id.value()))).collect();
         let config = match ClusterConfig::new(members) {
             Ok(config) => config,
             // `size > 0` was asserted above, so `members` is never empty.
@@ -61,7 +75,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
                     S::default(),
                     MemoryStorage::new(),
                     TimerConfig::default(),
-                    SnapshotPolicy::default(),
+                    snapshot_policy,
                 )
             })
             .collect();
@@ -69,7 +83,41 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         Self {
             runtimes,
             messages: VecDeque::new(),
+            partitioned: HashSet::new(),
+            snapshot_policy,
         }
+    }
+
+    /// Adds a new node to the running cluster, e.g. to simulate a member joining
+    /// mid-test. Its own initial config only contains itself — irrelevant once it
+    /// starts receiving AppendEntries/InstallSnapshot from the leader, since those
+    /// carry (or imply) the real membership and supersede a joining node's view.
+    pub fn add_node(&mut self, id_value: u64) {
+        let id = NodeId::from(id_value);
+        let solo_config = match ClusterConfig::new(HashMap::from([(id, dummy_addr(id_value))])) {
+            Ok(config) => config,
+            Err(_) => unreachable!("a single-member config is always valid"),
+        };
+        let node = Node::new(id, solo_config);
+        let runtime = Runtime::new(
+            node,
+            S::default(),
+            MemoryStorage::new(),
+            TimerConfig::default(),
+            self.snapshot_policy,
+        );
+        self.runtimes.push(runtime);
+    }
+
+    /// Cuts node `index` off from the rest of the cluster: messages to or from it
+    /// are dropped in flight (not queued for later) until `heal_partition`.
+    pub fn partition(&mut self, index: usize) {
+        self.partitioned.insert(self.runtimes[index].node().id());
+    }
+
+    /// Reconnects a previously partitioned node.
+    pub fn heal_partition(&mut self, index: usize) {
+        self.partitioned.remove(&self.runtimes[index].node().id());
     }
 
     /// Get a reference to a node's runtime by index (0-based).
@@ -83,8 +131,10 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
     }
 
     /// Trigger election timeout on a specific node.
-    // Cluster::new never sets a compact_threshold, so no snapshot is ever taken or
-    // installed here — RuntimeError is unreachable in this harness, just not provably so.
+    // KvStore's snapshot/restore only (de)serialize an in-memory HashMap<String, String>
+    // and never fail in practice, so RuntimeError is unreachable here even when the
+    // cluster's snapshot policy compacts — not provably so, but not worth threading a
+    // fallible harness API through every test for it.
     #[allow(clippy::unwrap_used)]
     pub fn election_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
@@ -119,9 +169,14 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         }
     }
 
-    /// Deliver a single message and queue any responses.
+    /// Deliver a single message and queue any responses. Dropped in flight (never
+    /// queued for later) if either endpoint is currently partitioned — mirrors a
+    /// real network dropping in-flight packets rather than buffering them.
     #[allow(clippy::unwrap_used)]
     fn deliver(&mut self, inflight: InFlight<Cmd>) {
+        if self.partitioned.contains(&inflight.from) || self.partitioned.contains(&inflight.to) {
+            return;
+        }
         let to_index = self.node_index(inflight.to);
         if let Some(index) = to_index {
             let commands = self.runtimes[index]
@@ -181,15 +236,19 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
 #[cfg(test)]
 mod proptest_tests {
     use std::collections::HashMap;
+    use std::num::NonZeroUsize;
 
     use proptest::prelude::*;
     use raft::Role;
+    use raft::SnapshotPolicy;
     use raft::kv::KvCommand;
     use raft::kv::KvStore;
+    use raft::types::LogIndex;
 
     use super::*;
 
     const N: usize = 3;
+    const KEYS: [&str; 3] = ["a", "b", "c"];
 
     #[derive(Debug, Clone)]
     enum Op {
@@ -198,6 +257,8 @@ mod proptest_tests {
         DeliverOne,
         DeliverAll,
         Submit { node: usize, key: u8, val: u8 },
+        Partition(usize),
+        HealPartition(usize),
     }
 
     fn arb_op() -> impl Strategy<Value = Op> {
@@ -209,11 +270,12 @@ mod proptest_tests {
             3 => Just(Op::DeliverAll),
             2 => (0..N, 0u8..3u8, 0u8..3u8)
                 .prop_map(|(n, k, v)| Op::Submit { node: n, key: k, val: v }),
+            1 => (0..N).prop_map(Op::Partition),
+            1 => (0..N).prop_map(Op::HealPartition),
         ]
     }
 
     fn apply(cluster: &mut Cluster<KvCommand, KvStore>, op: Op) {
-        const KEYS: [&str; 3] = ["a", "b", "c"];
         const VALS: [&str; 3] = ["1", "2", "3"];
         match op {
             Op::ElectionTimeout(i) => cluster.election_timeout(i),
@@ -228,6 +290,8 @@ mod proptest_tests {
                     value: VALS[val as usize].to_string(),
                 });
             }
+            Op::Partition(i) => cluster.partition(i),
+            Op::HealPartition(i) => cluster.heal_partition(i),
         }
     }
 
@@ -304,16 +368,57 @@ mod proptest_tests {
         }
     }
 
+    /// State-machine equivalence: once entries fall inside a compaction boundary on
+    /// either side, `check_state_machine_safety` can no longer compare them directly
+    /// (they're gone from the log). Nodes that have applied through the same index
+    /// must still agree on the materialized result — checked here via `Get` instead.
+    fn check_applied_state_equivalence(cluster: &mut Cluster<KvCommand, KvStore>) {
+        let applied: Vec<LogIndex> = (0..N)
+            .map(|i| cluster.runtime(i).node().volatile().last_applied)
+            .collect();
+        for i in 0..N {
+            for j in (i + 1)..N {
+                if applied[i] != applied[j] || applied[i] == LogIndex::default() {
+                    continue;
+                }
+                for key in KEYS {
+                    let vi = cluster
+                        .runtime_mut(i)
+                        .state_machine_mut()
+                        .apply(KvCommand::Get {
+                            key: key.to_string(),
+                        });
+                    let vj = cluster
+                        .runtime_mut(j)
+                        .state_machine_mut()
+                        .apply(KvCommand::Get {
+                            key: key.to_string(),
+                        });
+                    assert_eq!(
+                        vi, vj,
+                        "nodes {i} and {j} both applied through index {:?} \
+                         but disagree on key {key:?}",
+                        applied[i]
+                    );
+                }
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(500))]
 
         #[test]
         fn safety_invariants_hold(ops in proptest::collection::vec(arb_op(), 1..=60)) {
-            let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(N);
+            let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(
+                N,
+                SnapshotPolicy { compact_threshold: NonZeroUsize::new(2) },
+            );
             for op in ops {
                 apply(&mut cluster, op);
                 check_election_safety(&cluster);
                 check_state_machine_safety(&cluster);
+                check_applied_state_equivalence(&mut cluster);
             }
         }
     }

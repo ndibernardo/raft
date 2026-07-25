@@ -55,7 +55,7 @@ impl Default for TimerConfig {
 }
 
 /// Auto-compaction policy, checked after every `apply_committed()`.
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct SnapshotPolicy {
     /// Compact once applied-but-uncompacted entries reach this count.
     /// `None` disables auto-compaction.
