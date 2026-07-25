@@ -85,9 +85,16 @@ impl Leader {
     }
 
     /// §5.3: advance both indices together — next_index is always match_index + 1.
+    ///
+    /// Monotonic: a late-arriving duplicate response (e.g. the leader resends a full
+    /// snapshot every heartbeat until acked) must never regress indices already
+    /// advanced by a more recent response.
     pub fn record_success(&mut self, from: NodeId, match_index: LogIndex) {
-        self.match_index.insert(from, match_index);
-        self.next_index.insert(from, match_index.next());
+        let current = self.match_index.entry(from).or_default();
+        if match_index > *current {
+            *current = match_index;
+            self.next_index.insert(from, match_index.next());
+        }
     }
 
     /// §5.3: back off one position so the next AppendEntries probes earlier in the log.
@@ -181,6 +188,29 @@ mod tests {
         assert_eq!(
             leader.next_index_for(NodeId::from(2)),
             Some(LogIndex::from(1))
+        );
+    }
+
+    #[test]
+    fn record_success_ignores_a_late_duplicate_that_would_regress_indices() {
+        let peers = vec![NodeId::from(1)];
+        let mut leader = Leader::new(&peers, LogIndex::from(0));
+
+        // Peer acks up through index 8 via ordinary AppendEntries...
+        leader.record_success(NodeId::from(1), LogIndex::from(8));
+        // ...then a delayed duplicate InstallSnapshotResponse for an earlier
+        // snapshot boundary (the leader resends it every heartbeat until acked)
+        // arrives after the higher ack.
+        leader.record_success(NodeId::from(1), LogIndex::from(3));
+
+        let match_indices: Vec<_> = leader.match_indices().collect();
+        assert!(
+            match_indices.contains(&LogIndex::from(8)),
+            "match_index must not regress from a stale duplicate response"
+        );
+        assert_eq!(
+            leader.next_index_for(NodeId::from(1)),
+            Some(LogIndex::from(9))
         );
     }
 
