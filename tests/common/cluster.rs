@@ -38,6 +38,11 @@ pub struct Cluster<Cmd, S: StateMachine<Cmd>> {
     /// Applied to every node created by `with_snapshot_policy` and `add_node`, so a
     /// node joining after cluster creation compacts on the same schedule as its peers.
     snapshot_policy: SnapshotPolicy,
+    /// Each node's config at creation, by index — needed to rebuild it via
+    /// `Runtime::from_storage` in `restart`, whose `initial_config` argument is the
+    /// floor a restarted node falls back to when neither its log nor its snapshot
+    /// carries a `ConfigChange` yet.
+    initial_configs: Vec<ClusterConfig>,
 }
 
 impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
@@ -85,6 +90,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
             messages: VecDeque::new(),
             partitioned: HashSet::new(),
             snapshot_policy,
+            initial_configs: ids.iter().map(|_| config.clone()).collect(),
         }
     }
 
@@ -98,7 +104,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
             Ok(config) => config,
             Err(_) => unreachable!("a single-member config is always valid"),
         };
-        let node = Node::new(id, solo_config);
+        let node = Node::new(id, solo_config.clone());
         let runtime = Runtime::new(
             node,
             S::default(),
@@ -107,6 +113,32 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
             self.snapshot_policy,
         );
         self.runtimes.push(runtime);
+        self.initial_configs.push(solo_config);
+    }
+
+    /// Simulates a crash-and-restart of node `index`: rebuilds its runtime from
+    /// its own `MemoryStorage` via `Runtime::from_storage`, exactly as a real
+    /// process restart would. Node identity (its position in `runtimes`) is
+    /// preserved so callers can keep addressing it by the same index.
+    ///
+    /// # Panics
+    /// If `from_storage` fails — for `KvStore`, `restore` never fails in practice
+    /// (see the justification on `election_timeout`), so this is not reachable here.
+    #[allow(clippy::unwrap_used)]
+    pub fn restart(&mut self, index: usize) {
+        let old = self.runtimes.remove(index);
+        let id = old.node().id();
+        let storage = old.into_storage();
+        let restored = Runtime::from_storage(
+            id,
+            self.initial_configs[index].clone(),
+            S::default(),
+            storage,
+            TimerConfig::default(),
+            self.snapshot_policy,
+        )
+        .unwrap();
+        self.runtimes.insert(index, restored);
     }
 
     /// Cuts node `index` off from the rest of the cluster: messages to or from it
@@ -259,6 +291,7 @@ mod proptest_tests {
         Submit { node: usize, key: u8, val: u8 },
         Partition(usize),
         HealPartition(usize),
+        Restart(usize),
     }
 
     fn arb_op() -> impl Strategy<Value = Op> {
@@ -272,6 +305,7 @@ mod proptest_tests {
                 .prop_map(|(n, k, v)| Op::Submit { node: n, key: k, val: v }),
             1 => (0..N).prop_map(Op::Partition),
             1 => (0..N).prop_map(Op::HealPartition),
+            1 => (0..N).prop_map(Op::Restart),
         ]
     }
 
@@ -292,6 +326,7 @@ mod proptest_tests {
             }
             Op::Partition(i) => cluster.partition(i),
             Op::HealPartition(i) => cluster.heal_partition(i),
+            Op::Restart(i) => cluster.restart(i),
         }
     }
 
