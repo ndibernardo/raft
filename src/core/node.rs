@@ -951,6 +951,12 @@ impl<Cmd: Clone> Node<Cmd> {
                 _ => None,
             })
             .last()
+            .or_else(|| {
+                self.persistent
+                    .latest_snapshot
+                    .as_ref()
+                    .map(|s| s.meta.config.clone())
+            })
             .unwrap_or_else(|| self.initial_config.clone())
     }
 
@@ -2026,6 +2032,48 @@ mod tests {
         let snapshot = n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
 
         assert_eq!(snapshot.meta.config, earlier_config);
+    }
+
+    #[test]
+    fn compact_to_snapshot_falls_back_to_previous_snapshot_config_when_retained_prefix_has_none() {
+        let mut n = node(1, &[2, 3]);
+        let grown_config = test_config(1, &[2, 3, 4]);
+
+        // C1 compacted into a first snapshot — the retained log no longer holds it.
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::ConfigChange(grown_config.clone()),
+        }); // index 1
+        n.set_config(grown_config.clone()); // config changes take effect on append, §4.1
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        }); // index 2, first compaction boundary
+        n.volatile.commit_index = LogIndex::from(2);
+        n.volatile.last_applied = LogIndex::from(2);
+        let first_snapshot = n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
+        assert_eq!(first_snapshot.meta.config, grown_config);
+
+        // C2 appended but not yet applied when the second compaction fires — the
+        // retained prefix (just index 3) carries no ConfigChange at all.
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        }); // index 3, second compaction boundary
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::ConfigChange(test_config(1, &[2, 3, 4, 5])),
+        }); // index 4, beyond the boundary — must not be picked
+        n.volatile.commit_index = LogIndex::from(3);
+        n.volatile.last_applied = LogIndex::from(3);
+
+        let second_snapshot = n.compact_to_snapshot(SnapshotData::new(vec![2])).unwrap();
+
+        assert_eq!(
+            second_snapshot.meta.config, grown_config,
+            "must fall back to the previous snapshot's config, not initial_config, \
+             when the only ConfigChange in the retained prefix was already compacted away"
+        );
     }
 
     #[test]
