@@ -159,6 +159,12 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         &mut self.state_machine
     }
 
+    /// Consumes the runtime and returns its storage handle — lets a caller simulate
+    /// a crash-and-restart by feeding the same storage into `from_storage`.
+    pub fn into_storage(self) -> St {
+        self.storage
+    }
+
     /// Callers must not transmit responses before this returns — §5.1 requires durable state
     /// before responding to any RPC.
     pub fn handle(
