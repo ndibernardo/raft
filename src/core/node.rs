@@ -637,8 +637,18 @@ impl<Cmd: Clone> Node<Cmd> {
             TermLookup::Known(term) => term,
             // send_heartbeats routes any next_index at or below the snapshot boundary
             // to InstallSnapshot instead, so prev_log_index here is always above the
-            // boundary — Compacted cannot occur. BeyondEnd falls back defensively.
-            TermLookup::Compacted | TermLookup::BeyondEnd => Term::default(),
+            // boundary — Compacted should be unreachable; self-check the invariant.
+            TermLookup::Compacted => {
+                debug_assert!(
+                    false,
+                    "term_at called with a compacted index — send_heartbeats must have \
+                     routed this peer to InstallSnapshot instead"
+                );
+                Term::default()
+            }
+            // Reachable defensively (e.g. a probe just past the leader's own tail); no
+            // invariant to assert here.
+            TermLookup::BeyondEnd => Term::default(),
         }
     }
 
