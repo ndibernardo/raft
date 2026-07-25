@@ -95,7 +95,6 @@ Unit tests in `src/` cover node protocol logic, storage, state machine, and tran
 
 The core protocol — leader election, log replication, the safety rules, persistence, and single-server membership changes — is complete. Still missing from the paper and dissertation:
 
-- Log compaction and snapshotting (paper section 7, dissertation chapter 5)
 - Read-only queries without log writes (dissertation section 6.4)
 - Client sessions and request de-duplication (dissertation section 6.3)
 - Pre-vote (dissertation section 9.6)
