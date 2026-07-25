@@ -1059,10 +1059,15 @@ impl<Cmd: Clone> Node<Cmd> {
         // through the normal take_entry_to_apply path afterward.
         self.volatile.commit_index = std::cmp::max(self.volatile.commit_index, last_index);
         self.volatile.last_applied = last_index;
-        self.set_config(req.snapshot.meta.config.clone());
 
+        // latest_snapshot must be updated before the rescan below: in the discard
+        // branch the log is now empty, and in the retain-suffix branch a surviving
+        // ConfigChange takes precedence (§4.1, effective on append) — either way
+        // apply_latest_config_from_log's snapshot-config fallback must resolve
+        // against this snapshot, not whatever was installed before it.
         self.persistent.pending_snapshot_install = Some(req.snapshot.clone());
         self.persistent.latest_snapshot = Some(req.snapshot.clone());
+        self.apply_latest_config_from_log();
         self.pending_snapshot_restore = Some(req.snapshot);
         info!(node = %self.id, leader = %from, last_index = %last_index, "snapshot installed");
 
@@ -2300,6 +2305,40 @@ mod tests {
         assert!(n.persistent.log.is_empty());
         assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(2));
         assert_eq!(n.persistent.log.snapshot_last_term(), Term::from(9));
+    }
+
+    #[test]
+    fn follower_retains_suffix_config_change_over_snapshots_boundary_time_config() {
+        let mut n = node(1, &[2, 3]);
+        let boundary_time_config = test_config(1, &[2, 3]);
+        let grown_config = test_config(1, &[2, 3, 4]);
+
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        }); // index 1
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        }); // index 2, the snapshot boundary
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::ConfigChange(grown_config.clone()),
+        }); // index 3, beyond the boundary — config changes take effect on append (§4.1)
+
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(2, 1, boundary_time_config), // term matches our entry at index 2
+        };
+        n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(2));
+        assert_eq!(
+            n.config(),
+            &grown_config,
+            "surviving suffix's ConfigChange must win over the snapshot's boundary-time config"
+        );
     }
 
     #[test]
