@@ -11,16 +11,25 @@ use raft::Node;
 use raft::Role;
 use raft::Runtime;
 use raft::SnapshotPolicy;
+use raft::StateMachine;
+use raft::Storage;
 use raft::TimerConfig;
 use raft::kv::KvCommand;
 use raft::kv::KvResult;
 use raft::kv::KvStore;
+use raft::types::AppendEntries;
 use raft::types::AppendEntriesResponse;
 use raft::types::ClusterConfig;
+use raft::types::InstallSnapshot;
+use raft::types::LogEntry;
 use raft::types::LogIndex;
+use raft::types::LogPayload;
 use raft::types::Message;
 use raft::types::NodeId;
 use raft::types::RequestVoteResponse;
+use raft::types::Snapshot;
+use raft::types::SnapshotData;
+use raft::types::SnapshotMeta;
 use raft::types::Term;
 use raft::types::Vote;
 
@@ -467,6 +476,102 @@ fn restarted_node_recovers_from_snapshot_plus_suffix() {
         "restored state machine must reflect the committed snapshot, \
          not the uncommitted suffix written just before the crash"
     );
+}
+
+/// Discard-case `InstallSnapshot` (boundary conflicts with the local log) must
+/// clear the whole stale suffix from durable storage, not just the compacted
+/// prefix — otherwise a later append lands after leftover entries the node
+/// itself discarded, and node and storage disagree about the log on restart.
+#[test]
+fn restarted_node_discards_stale_suffix_after_conflicting_install_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ClusterConfig::new(HashMap::from([
+        (NodeId::from(1), addr(19201)),
+        (NodeId::from(2), addr(19202)),
+        (NodeId::from(3), addr(19203)),
+    ]))
+    .unwrap();
+
+    let mut rt: Runtime<KvCommand, KvStore, FileStorage<KvCommand>> = Runtime::new(
+        Node::new(NodeId::from(1), config.clone()),
+        KvStore::new(),
+        FileStorage::open(dir.path()).unwrap(),
+        TimerConfig::default(),
+        SnapshotPolicy::default(),
+    );
+
+    // Old leader (node 3, term 1) replicates 3 entries; none commit.
+    let entries: Vec<LogEntry<KvCommand>> = ["a", "b", "c"]
+        .iter()
+        .map(|k| LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command(set(k, "1")),
+        })
+        .collect();
+    rt.handle(Event::Message {
+        from: NodeId::from(3),
+        message: Message::AppendEntries(AppendEntries {
+            term: Term::from(1),
+            leader_id: NodeId::from(3),
+            prev_log_index: LogIndex::from(0),
+            prev_log_term: Term::from(0),
+            entries,
+            leader_commit: LogIndex::from(0),
+        }),
+    })
+    .unwrap();
+
+    // New leader (node 2, term 9) installs a snapshot at index 2, term 9 —
+    // conflicts with our term-1 entry at 2, so the whole log must be discarded.
+    let mut source = KvStore::new();
+    source.apply(set("a", "leader"));
+    let data: SnapshotData = StateMachine::snapshot(&source).unwrap();
+    rt.handle(Event::Message {
+        from: NodeId::from(2),
+        message: Message::InstallSnapshot(InstallSnapshot {
+            term: Term::from(9),
+            leader_id: NodeId::from(2),
+            snapshot: Snapshot {
+                meta: SnapshotMeta {
+                    last_index: LogIndex::from(2),
+                    last_term: Term::from(9),
+                    config: config.clone(),
+                },
+                data,
+            },
+        }),
+    })
+    .unwrap();
+    assert_eq!(rt.node().persistent().log().len(), 0);
+
+    // New leader replicates a fresh entry at index 3 (term 9); node acks it.
+    rt.handle(Event::Message {
+        from: NodeId::from(2),
+        message: Message::AppendEntries(AppendEntries {
+            term: Term::from(9),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::from(2),
+            prev_log_term: Term::from(9),
+            entries: vec![LogEntry {
+                term: Term::from(9),
+                payload: LogPayload::Command(set("d", "fresh")),
+            }],
+            leader_commit: LogIndex::from(2),
+        }),
+    })
+    .unwrap();
+
+    // "Crash": reopen the same data directory and inspect the durable log.
+    drop(rt);
+    let reopened: FileStorage<KvCommand> = FileStorage::open(dir.path()).unwrap();
+    let loaded = reopened.load().unwrap();
+    assert_eq!(
+        loaded.entries.len(),
+        1,
+        "storage must hold exactly the one fresh entry after the boundary; \
+         a stale discarded entry surviving here diverges node and storage"
+    );
+    assert_eq!(loaded.entries[0].term, Term::from(9));
 }
 
 /// A membership change compacted away by the time a lagging node catches up must

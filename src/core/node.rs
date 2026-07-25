@@ -198,6 +198,16 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         }
         Ok(())
     }
+
+    /// Discard-case `InstallSnapshot`: wipes the local log and records the
+    /// truncation so `save` clears any stale suffix in storage. Storage-side
+    /// `install_snapshot` only runs `compact_through`, which keeps entries
+    /// above the boundary — without this, a suffix discarded here would
+    /// survive on disk and diverge from the in-memory log after restart.
+    fn discard_to_snapshot(&mut self, last_index: LogIndex, last_term: Term) {
+        self.log.reset_to_snapshot(last_index, last_term);
+        self.truncated_from = Some(last_index.next());
+    }
 }
 
 /// §Figure 2: commit_index and last_applied. Reset to zero on every restart — not persisted.
@@ -1035,7 +1045,7 @@ impl<Cmd: Clone> Node<Cmd> {
         if retains_suffix {
             self.persistent.log.compact_through(last_index, last_term);
         } else {
-            self.persistent.log.reset_to_snapshot(last_index, last_term);
+            self.persistent.discard_to_snapshot(last_index, last_term);
         }
 
         // last_applied jumps straight to the boundary — cases above must never
