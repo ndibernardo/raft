@@ -5,7 +5,9 @@ use serde::Serialize;
 
 /// Monotonically increasing term number.
 ///
-/// Terms act as logical clocks in Raft and are used to detect stale information.
+/// Terms are the logical clock of the cluster. Every message carries one, and a
+/// node that sees a term higher than its own steps down and adopts it, which is
+/// how stale leaders and stale votes are detected (section 5.1).
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -15,6 +17,8 @@ pub struct Term {
 }
 
 impl Term {
+    /// Returns the following term. Saturates at `u64::MAX` rather than wrapping,
+    /// since a wrapped term would make an ancient leader look current.
     pub fn next(self) -> Term {
         Term {
             value: self.value.saturating_add(1),
@@ -34,10 +38,11 @@ impl From<u64> for Term {
     }
 }
 
-/// 1-based log index.
+/// One-based position of an entry in the replicated log.
 ///
-/// LogIndex 0 represents "no entries" or "before the first entry".
-/// Valid log entries start at index 1.
+/// Index 0 is the sentinel for "no entries" or "before the first entry", so it
+/// is a valid value for `commit_index` and `prev_log_index` but never addresses
+/// a real entry. The first entry a leader appends has index 1.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -47,17 +52,20 @@ pub struct LogIndex {
 }
 
 impl LogIndex {
-    /// Create from array length (0-based length becomes 1-based index).
+    /// Converts a slice length into the index of its last element, since a log
+    /// of `len` entries starting at 1 ends at index `len`.
     pub fn from_length(len: usize) -> LogIndex {
         LogIndex { value: len as u64 }
     }
 
+    /// Returns the following index. Saturates at `u64::MAX`.
     pub fn next(self) -> LogIndex {
         LogIndex {
             value: self.value.saturating_add(1),
         }
     }
 
+    /// Returns the preceding index, or `None` at the index 0 sentinel.
     pub fn prev(self) -> Option<LogIndex> {
         if self.value == 0 {
             None
@@ -68,14 +76,15 @@ impl LogIndex {
         }
     }
 
-    /// Returns `self` advanced by `n`.
+    /// Returns `self` advanced by `n` positions. Saturates at `u64::MAX`.
     pub fn advance_by(self, n: u64) -> LogIndex {
         LogIndex {
             value: self.value.saturating_add(n),
         }
     }
 
-    /// Number of steps from `base` to `self`. `None` if `self <= base`.
+    /// Number of positions from `base` up to `self`, or `None` when `self` does
+    /// not lie strictly after `base`.
     pub fn value_since(self, base: LogIndex) -> Option<u64> {
         self.value.checked_sub(base.value).filter(|&d| d > 0)
     }
@@ -93,7 +102,8 @@ impl From<u64> for LogIndex {
     }
 }
 
-/// Unique server identifier.
+/// Cluster-wide unique server identifier. Stable across restarts, because a
+/// node's persisted vote and a leader's replication state are both keyed by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct NodeId {
@@ -107,6 +117,7 @@ impl fmt::Display for NodeId {
 }
 
 impl NodeId {
+    /// The underlying numeric identifier.
     pub fn value(self) -> u64 {
         self.value
     }

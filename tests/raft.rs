@@ -40,19 +40,20 @@ fn set(key: &str, value: &str) -> KvCommand {
     }
 }
 
-/// Dummy dial-in address — none of these tests exchange real bytes over a socket.
+/// A placeholder address. No test here opens a socket, so only uniqueness
+/// within a configuration matters.
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// Drive node `i` to win an election and deliver all resulting messages.
+/// Drives node `i` through an election and delivers everything it produces.
 fn elect(cluster: &mut Cluster<KvCommand, KvStore>, i: usize) {
     cluster.election_timeout(i);
     cluster.deliver_all();
 }
 
-/// A single-node cluster needs no peers — it transitions to leader immediately
-/// on election timeout without any message exchange.
+/// A single-node cluster reaches leadership on the election timeout alone. Its
+/// own vote is already a majority, so no message is exchanged.
 #[test]
 fn single_node_becomes_leader_without_messages() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(1);
@@ -67,7 +68,8 @@ fn single_node_becomes_leader_without_messages() {
     assert_eq!(cluster.role_counts(), (0, 0, 1));
 }
 
-/// Standard 3-node election: one candidate, two voters, majority achieved.
+/// A three-node election: one candidate and two voters, of whom one suffices
+/// for a majority.
 #[test]
 fn three_node_cluster_elects_single_leader() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
@@ -81,7 +83,7 @@ fn three_node_cluster_elects_single_leader() {
     assert_eq!(followers, 2);
 }
 
-/// 5-node cluster: candidate needs 3/5 votes (self + 2 peers).
+/// In a five-node cluster a candidate needs three votes: its own plus two peers.
 #[test]
 fn five_node_cluster_elects_with_majority() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(5);
@@ -92,19 +94,18 @@ fn five_node_cluster_elects_with_majority() {
     assert_eq!(cluster.role_counts(), (4, 0, 1));
 }
 
-/// When a follower times out while a leader is active, it starts a new election
-/// in a higher term. The current leader steps down (hears term N+1 in the vote
-/// request) and the new candidate wins.
+/// A follower that times out while a leader is active starts an election in a
+/// higher term. The leader sees that term in the vote request, steps down, and
+/// the candidate wins.
 #[test]
 fn re_election_after_leader_steps_down() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
 
-    // Node 0 wins term 1.
     elect(&mut cluster, 0);
     assert_eq!(cluster.leader(), Some(0));
 
-    // Node 1 times out → starts election in term 2.
-    // Node 0 receives the higher-term RequestVote, steps down, grants vote.
+    // Node 1 stands for election in term 2. Node 0 sees the higher term in the
+    // vote request, steps down, and grants the vote.
     elect(&mut cluster, 1);
 
     assert_eq!(
@@ -179,23 +180,25 @@ fn outputs_empty_before_commit() {
     );
 }
 
-/// Leadership can transfer across three consecutive terms without losing safety.
-/// Each leader must replicate its no-op before the next election: §5.4.1 prevents
-/// a node with a stale log from winning a vote, so skipping replication would
-/// cause the next candidate's RequestVote to be denied.
+/// Leadership transfers across three consecutive terms without losing safety.
+///
+/// Each leader replicates its no-op before the next election because the
+/// up-to-date check of section 5.4.1 denies a vote to a candidate with a stale
+/// log. Skipping a replication round would leave the next candidate behind and
+/// its RequestVote refused.
 #[test]
 fn three_consecutive_re_elections() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
 
     elect(&mut cluster, 0);
-    cluster.heartbeat_timeout(0); // replicate term-1 no-op to all nodes
+    cluster.heartbeat_timeout(0); // replicates the term 1 no-op
     cluster.deliver_all();
 
     elect(&mut cluster, 1);
-    cluster.heartbeat_timeout(1); // replicate term-2 no-op to all nodes
+    cluster.heartbeat_timeout(1); // replicates the term 2 no-op
     cluster.deliver_all();
 
-    elect(&mut cluster, 2); // node 2 now has an up-to-date log → wins term 3
+    elect(&mut cluster, 2); // node 2's log is current, so it wins term 3
 
     assert_eq!(cluster.leader(), Some(2));
     assert_eq!(cluster.role_counts(), (2, 0, 1));
@@ -209,8 +212,8 @@ fn three_consecutive_re_elections() {
     ));
 }
 
-/// Leader appends a no-op on election (§8) plus the submitted command.
-/// After one heartbeat round-trip all nodes must have both entries.
+/// A new leader appends a no-op (section 8) and then the submitted command. One
+/// heartbeat round trip carries both to every node.
 #[test]
 fn command_replicated_to_all_followers_after_one_heartbeat() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
@@ -227,7 +230,7 @@ fn command_replicated_to_all_followers_after_one_heartbeat() {
     for i in 0..3 {
         assert_eq!(
             cluster.runtime(i).node().persistent().log().len(),
-            2, // no-op at index 1, command at index 2
+            2, // the no-op at index 1 and the command at index 2
             "node {i} must have both log entries"
         );
     }
@@ -245,7 +248,8 @@ fn command_committed_and_applied_on_all_nodes() {
         .submit(set("region", "eu-west-1"))
         .unwrap();
 
-    // First heartbeat: replicate entries; leader commits (majority = self + one ack).
+    // The first round replicates the entries. One acknowledgement plus the
+    // leader's own copy is a majority of three, so the leader commits.
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
@@ -255,7 +259,7 @@ fn command_committed_and_applied_on_all_nodes() {
         "leader must have committed both entries"
     );
 
-    // Second heartbeat: propagate commit_index to followers.
+    // The second round carries that commit index to the followers.
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
@@ -282,20 +286,21 @@ fn multiple_commands_applied_in_order() {
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
-    // Drain applied outputs from the leader (indices 2 and 3; index 1 is no-op).
+    // Indices 2 and 3 carry the commands; index 1 is the no-op, which produces
+    // no output.
     let outputs = cluster.runtime_mut(0).take_outputs();
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0], (Term::from(1), LogIndex::from(2), KvResult::Ok));
     assert_eq!(outputs[1], (Term::from(1), LogIndex::from(3), KvResult::Ok));
 }
 
-/// Submitting to a non-leader returns Err — the client must redirect.
+/// A follower refuses a client command, so the client can be redirected to the
+/// leader instead of silently writing to a node that cannot replicate.
 #[test]
 fn submit_to_follower_returns_none() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
 
-    // Node 1 is a follower.
     let index = cluster.runtime_mut(1).submit(set("key", "value"));
     assert!(index.is_err(), "follower must reject client commands");
 }
@@ -305,7 +310,7 @@ fn submit_to_follower_returns_none() {
 fn new_leader_accepts_commands_after_re_election() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
     elect(&mut cluster, 0);
-    elect(&mut cluster, 1); // node 1 wins term 2
+    elect(&mut cluster, 1); // node 1 takes over in term 2
 
     assert_eq!(cluster.leader(), Some(1));
 
@@ -325,10 +330,12 @@ fn new_leader_accepts_commands_after_re_election() {
 }
 
 /// A follower partitioned before the leader ever compacts falls behind the
-/// compacted prefix entirely. Once healed, its `next_index` can no longer be
-/// satisfied by `AppendEntries` — the entries it needs are gone — so the leader
-/// must fall back to `InstallSnapshot`, and the follower must end up with the
-/// same KV state as the leader despite never having replayed the compacted log.
+/// entire compacted prefix.
+///
+/// Once healed, its `next_index` points at entries the leader no longer holds,
+/// so AppendEntries cannot serve it and the leader must send a snapshot instead.
+/// The follower has to reach the leader's state without ever replaying the
+/// compacted log.
 #[test]
 fn lagging_follower_catches_up_via_install_snapshot() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(
@@ -347,7 +354,7 @@ fn lagging_follower_catches_up_via_install_snapshot() {
         cluster.heartbeat_timeout(0);
         cluster.deliver_all();
     }
-    // Propagate the trailing commit index to node 1.
+    // Carries the last commit index to node 1, which lets it compact too.
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
@@ -363,12 +370,13 @@ fn lagging_follower_catches_up_via_install_snapshot() {
     );
 
     cluster.heal_partition(2);
-    // Leader's next_index for node 2 is still 1 — below the compacted boundary — so
-    // this heartbeat must send InstallSnapshot instead of AppendEntries.
+    // The leader's next_index for node 2 is still 1, below the compacted
+    // boundary, so this round must send InstallSnapshot rather than
+    // AppendEntries.
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
-    // A second round in case any entries trailing the last compaction still need
-    // ordinary replication after the snapshot lands.
+    // A second round replicates any entries appended after the last compaction,
+    // which the snapshot does not cover.
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
@@ -396,8 +404,9 @@ fn lagging_follower_catches_up_via_install_snapshot() {
     );
 }
 
-/// A single node's committed-and-compacted state, plus an uncommitted suffix
-/// appended just before "crash," must both survive a restart from `FileStorage`.
+/// Both halves of a node's durable state survive a restart from `FileStorage`:
+/// the committed prefix folded into a snapshot, and the uncommitted suffix
+/// appended just before the crash.
 #[test]
 fn restarted_node_recovers_from_snapshot_plus_suffix() {
     let dir = tempfile::tempdir().unwrap();
@@ -428,7 +437,8 @@ fn restarted_node_recovers_from_snapshot_plus_suffix() {
     .unwrap();
     assert!(matches!(rt.node().role(), Role::Leader(_)));
 
-    // Committed and compacted (threshold 1) via a simulated ack from peer 2.
+    // A simulated acknowledgement from peer 2 commits the entry, and the
+    // threshold of 1 compacts it immediately.
     let index = rt.submit(set("region", "eu-west-1")).unwrap();
     rt.handle(Event::Message {
         from: NodeId::from(2),
@@ -443,11 +453,12 @@ fn restarted_node_recovers_from_snapshot_plus_suffix() {
         "threshold of 1 must have compacted after the first commit"
     );
 
-    // Appended and persisted, but never acked — still uncommitted at "crash" time.
+    // Appended and persisted but never acknowledged, so it is still uncommitted
+    // when the crash happens.
     rt.submit(set("region", "us-east-1")).unwrap();
     rt.handle(Event::HeartbeatTimeout).unwrap();
 
-    // "Crash": drop the handle, then reopen the same data directory as a fresh restart.
+    // Dropping the runtime and reopening the same directory is the crash.
     drop(rt);
     let mut restored = Runtime::from_storage(
         NodeId::from(1),
@@ -478,10 +489,11 @@ fn restarted_node_recovers_from_snapshot_plus_suffix() {
     );
 }
 
-/// Discard-case `InstallSnapshot` (boundary conflicts with the local log) must
-/// clear the whole stale suffix from durable storage, not just the compacted
-/// prefix — otherwise a later append lands after leftover entries the node
-/// itself discarded, and node and storage disagree about the log on restart.
+/// An `InstallSnapshot` whose boundary conflicts with the local log must clear
+/// the whole stale suffix from durable storage, not only the compacted prefix.
+///
+/// Otherwise a later append lands after entries the node itself discarded, and
+/// the log on disk no longer matches the one in memory once the node restarts.
 #[test]
 fn restarted_node_discards_stale_suffix_after_conflicting_install_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -500,7 +512,7 @@ fn restarted_node_discards_stale_suffix_after_conflicting_install_snapshot() {
         SnapshotPolicy::default(),
     );
 
-    // Old leader (node 3, term 1) replicates 3 entries; none commit.
+    // A term 1 leader replicates three entries, none of which commit.
     let entries: Vec<LogEntry<KvCommand>> = ["a", "b", "c"]
         .iter()
         .map(|k| LogEntry {
@@ -521,8 +533,8 @@ fn restarted_node_discards_stale_suffix_after_conflicting_install_snapshot() {
     })
     .unwrap();
 
-    // New leader (node 2, term 9) installs a snapshot at index 2, term 9 —
-    // conflicts with our term-1 entry at 2, so the whole log must be discarded.
+    // A term 9 leader installs a snapshot whose boundary at index 2 claims term
+    // 9, conflicting with the local term 1 entry there. The whole log goes.
     let mut source = KvStore::new();
     source.apply(set("a", "leader"));
     let data: SnapshotData = StateMachine::snapshot(&source).unwrap();
@@ -544,7 +556,7 @@ fn restarted_node_discards_stale_suffix_after_conflicting_install_snapshot() {
     .unwrap();
     assert_eq!(rt.node().persistent().log().len(), 0);
 
-    // New leader replicates a fresh entry at index 3 (term 9); node acks it.
+    // The new leader then replicates a fresh term 9 entry at index 3.
     rt.handle(Event::Message {
         from: NodeId::from(2),
         message: Message::AppendEntries(AppendEntries {
@@ -561,7 +573,7 @@ fn restarted_node_discards_stale_suffix_after_conflicting_install_snapshot() {
     })
     .unwrap();
 
-    // "Crash": reopen the same data directory and inspect the durable log.
+    // Reopening the same directory shows what the crash would have left behind.
     drop(rt);
     let reopened: FileStorage<KvCommand> = FileStorage::open(dir.path()).unwrap();
     let loaded = reopened.load().unwrap();
@@ -574,9 +586,9 @@ fn restarted_node_discards_stale_suffix_after_conflicting_install_snapshot() {
     assert_eq!(loaded.entries[0].term, Term::from(9));
 }
 
-/// A membership change compacted away by the time a lagging node catches up must
-/// still be learned — from the installed snapshot's config, since the log entry
-/// that carried it no longer exists.
+/// A lagging node still learns a membership change whose log entry was compacted
+/// away before it caught up, because the snapshot carries the configuration that
+/// entry established.
 #[test]
 fn snapshot_preserves_membership_config() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(
@@ -604,7 +616,8 @@ fn snapshot_preserves_membership_config() {
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
-    // Node 2 falls behind starting now, before the config change is compacted away.
+    // Node 2 stops receiving anything from here on, while the config change is
+    // still in the log but before compaction removes it.
     cluster.partition(2);
 
     for (key, value) in [("x", "1"), ("y", "2"), ("z", "3")] {
@@ -639,9 +652,11 @@ fn snapshot_preserves_membership_config() {
     );
 }
 
-/// Election safety must still hold once every node's log has been fully
-/// compacted — the vote comparison in this case relies entirely on the
-/// snapshot boundary's index/term, since `entries` is empty on every node.
+/// An election still succeeds once every node's log is fully compacted.
+///
+/// With no entries retained anywhere, the up-to-date comparison has nothing to
+/// read from the log and rests entirely on the index and term preserved at the
+/// snapshot boundary.
 #[test]
 fn leader_election_works_when_all_logs_fully_compacted() {
     let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(
@@ -655,7 +670,8 @@ fn leader_election_works_when_all_logs_fully_compacted() {
     cluster.runtime_mut(0).submit(set("x", "1")).unwrap();
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
-    // Second round propagates commit_index to followers so they apply and compact too.
+    // The second round carries the commit index to the followers, so they apply
+    // and compact as well.
     cluster.heartbeat_timeout(0);
     cluster.deliver_all();
 
@@ -667,7 +683,7 @@ fn leader_election_works_when_all_logs_fully_compacted() {
         );
     }
 
-    // Simulate leader failure: node 1 times out and starts a new election.
+    // The leader is presumed lost, so node 1 times out and stands for election.
     elect(&mut cluster, 1);
 
     assert_eq!(

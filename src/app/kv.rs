@@ -6,6 +6,10 @@ use serde::Serialize;
 use crate::app::runtime::StateMachine;
 use crate::core::types::SnapshotData;
 
+/// An operation against the store, as replicated through the log.
+///
+/// `Get` is included so a read is ordered against writes by going through
+/// consensus like any other command, at the cost of a full round trip.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCommand {
     Get { key: String },
@@ -13,25 +17,31 @@ pub enum KvCommand {
     Delete { key: String },
 }
 
+/// What applying a `KvCommand` produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KvResult {
+    /// A write completed. `Delete` reports this whether or not the key existed.
     Ok,
+    /// A read completed, with `None` when the key is absent.
     Value(Option<String>),
 }
 
-/// In-memory key-value store.
+/// In-memory key-value store, the example state machine driven by the log.
 #[derive(Default)]
 pub struct KvStore {
     data: HashMap<String, String>,
 }
 
 impl KvStore {
+    /// An empty store.
     pub fn new() -> Self {
         Self {
             data: HashMap::new(),
         }
     }
 
+    /// Applies one command and returns its result. Deterministic, as every
+    /// replica must reach the same state from the same sequence of commands.
     pub fn apply(&mut self, command: KvCommand) -> KvResult {
         match command {
             KvCommand::Get { key } => KvResult::Value(self.data.get(&key).cloned()),
@@ -47,8 +57,10 @@ impl KvStore {
     }
 }
 
-/// Wire format for `KvStore` snapshots. Kept separate from `KvStore` itself so the
-/// domain type never derives `Serialize`/`Deserialize` directly.
+/// Serialization format for a `KvStore` snapshot.
+///
+/// Separate from `KvStore` so the domain type carries no derive of its own, and
+/// the on-disk format can change without changing the store.
 #[derive(Serialize, Deserialize)]
 struct KvSnapshotDto {
     entries: HashMap<String, String>,

@@ -20,7 +20,7 @@ use crate::core::types::Term;
 use crate::storage::LoadedState;
 use crate::storage::Storage;
 
-/// Error type for FileStorage operations.
+/// Why a `FileStorage` operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum FileStorageError {
     #[error("i/o error: {0}")]
@@ -29,31 +29,35 @@ pub enum FileStorageError {
     Corrupt(#[from] serde_json::Error),
 }
 
+/// On-disk form of `meta.json`.
 #[derive(Serialize, Deserialize)]
 struct Meta {
     current_term: Term,
     voted_for: Option<NodeId>,
 }
 
-/// Line 1 of `log.jsonl` once it has been rewritten at least once (by
-/// `truncate_from` or `install_snapshot`): the index of the entry on line 2.
-/// Distinguishable from a `LogEntry` line by its distinct field name, so a
-/// pure-append-only file (never rewritten) parses with no header at all.
+/// First line of `log.jsonl` once the file has been rewritten at least once, by
+/// `truncate_from` or `install_snapshot`. It names the index of the entry on the
+/// following line.
+///
+/// Its field name does not occur in a serialized `LogEntry`, so a file that has
+/// only ever been appended to parses correctly with no header present.
 #[derive(Serialize, Deserialize)]
 struct LogFileHeader {
     first_index: LogIndex,
 }
 
-/// Disk-backed storage. Persistent state lives in up to three files inside `dir`:
-///   meta.json      — current term and voted_for, written atomically via rename
-///   snapshot.json  — most recent snapshot (meta + opaque state machine bytes), if any
-///   log.jsonl      — one JSON object per log entry, one entry per line, optionally
-///                    preceded by a `{"first_index": N}` header line
+/// Disk-backed storage. State lives in up to three files inside `dir`.
 ///
-/// The in-memory log acts as a write-through cache: reads are served from
-/// memory, writes update memory then flush to disk with fsync before returning.
-/// This satisfies the durability requirement of §5.1 (respond only after
-/// persisting state).
+/// `meta.json` holds the current term and vote, replaced atomically by rename.
+/// `snapshot.json` holds the most recent snapshot, if any. `log.jsonl` holds one
+/// JSON-encoded entry per line, optionally preceded by a `LogFileHeader` line.
+///
+/// The in-memory log is a write-through cache: reads come from memory, and a
+/// write updates memory and then reaches disk with an fsync before the call
+/// returns. That ordering is what satisfies the durability requirement of
+/// section 5.1, which forbids responding to an RPC before the state it
+/// acknowledges is persisted.
 pub struct FileStorage<Cmd> {
     dir: PathBuf,
     current_term: Term,
@@ -66,13 +70,19 @@ impl<Cmd> FileStorage<Cmd>
 where
     Cmd: Serialize + for<'de> Deserialize<'de>,
 {
-    /// Open (or create) storage rooted at `dir`. On first use the directory
-    /// is created and all files start empty (term=0, no vote, no snapshot, empty log).
+    /// Opens storage rooted at `dir`, creating the directory if it is absent. A
+    /// missing file is read as its empty value: term 0, no vote, no snapshot,
+    /// no entries.
     ///
-    /// Reconciles a crash that landed between `install_snapshot`'s two durable
-    /// writes: if `log.jsonl`'s header claims entries starting at or before the
-    /// snapshot boundary, the overlapping prefix is dropped in memory (the
-    /// on-disk log is only rewritten again on the next mutation).
+    /// Also reconciles a crash between the two durable writes of
+    /// `install_snapshot`. If the header of `log.jsonl` claims entries starting
+    /// at or below the snapshot boundary, the file predates the snapshot, and
+    /// the overlapping prefix is dropped while loading. Only the in-memory log
+    /// is corrected here; the file itself is rewritten at the next mutation.
+    ///
+    /// # Errors
+    /// `FileStorageError::Io` if the directory or a file cannot be read.
+    /// `FileStorageError::Corrupt` if a file does not parse.
     pub fn open(dir: &Path) -> Result<Self, FileStorageError> {
         fs::create_dir_all(dir)?;
         let meta = Self::read_meta(dir)?;
@@ -136,8 +146,12 @@ where
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
-    /// Returns the first index claimed by line 1's header, or `LogIndex::from(1)`
-    /// if the file has never been rewritten (no header, or the file is absent).
+    /// Reads `log.jsonl` and returns the index its first entry occupies along
+    /// with the entries themselves.
+    ///
+    /// The index comes from the header line when one is present, and is 1
+    /// otherwise, which covers both an absent file and one that has only ever
+    /// been appended to.
     fn read_log(dir: &Path) -> Result<(LogIndex, Vec<LogEntry<Cmd>>), FileStorageError> {
         let path = dir.join("log.jsonl");
         if !path.exists() {
@@ -171,7 +185,8 @@ where
         Ok((first_index, entries))
     }
 
-    /// Atomically overwrite meta.json: write temp file → fsync → rename → fsync dir.
+    /// Replaces `meta.json` atomically: write a temporary file, fsync it, rename
+    /// it into place, then fsync the directory.
     fn flush_meta(&self) -> Result<(), FileStorageError> {
         let tmp = self.dir.join("meta.json.tmp");
         let meta = Meta {
@@ -184,12 +199,13 @@ where
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, self.meta_path())?;
-        // Fsync the directory so the rename is visible after a crash.
+        // The rename itself is a directory modification, and without this fsync
+        // it may not survive a crash even though the file contents did.
         File::open(&self.dir)?.sync_all()?;
         Ok(())
     }
 
-    /// Atomically overwrite snapshot.json: write temp file → fsync → rename → fsync dir.
+    /// Replaces `snapshot.json` atomically, by the same sequence as `flush_meta`.
     fn flush_snapshot(&self, snapshot: &Snapshot) -> Result<(), FileStorageError> {
         let tmp = self.dir.join("snapshot.json.tmp");
         let bytes = serde_json::to_vec(snapshot)?;
@@ -202,7 +218,7 @@ where
         Ok(())
     }
 
-    /// Append one serialised entry to log.jsonl and fsync.
+    /// Appends one serialized entry to `log.jsonl` and fsyncs it.
     fn append_to_log_file(&self, entry: &LogEntry<Cmd>) -> Result<(), FileStorageError> {
         let mut line = serde_json::to_string(entry)?;
         line.push('\n');
@@ -215,9 +231,12 @@ where
         Ok(())
     }
 
-    /// Rewrite log.jsonl from the in-memory cache atomically and fsync. Always
-    /// leads with a `{"first_index": N}` header so a reload can tell how far a
-    /// stale (pre-rewrite) file's entries reach relative to the snapshot boundary.
+    /// Rewrites `log.jsonl` from the in-memory log, atomically and with an fsync.
+    ///
+    /// The output always leads with a header line. Without the first index it
+    /// records, a reload could not tell where a surviving file's entries sit
+    /// relative to the snapshot boundary, and so could not detect a file left
+    /// behind by a crash mid-install.
     fn rewrite_log_file(&self) -> Result<(), FileStorageError> {
         let tmp = self.dir.join("log.jsonl.tmp");
         let mut file = File::create(&tmp)?;
@@ -255,9 +274,9 @@ where
         })
     }
 
-    /// Single `flush_meta` call — one fsync for both fields, not two. `Node` only
-    /// calls this when term or vote actually changed, so a steady-state heartbeat
-    /// with nothing to persist costs zero fsyncs.
+    /// Persists term and vote in a single `flush_meta`, so the pair costs one
+    /// fsync rather than two. `Node` calls this only when one of them actually
+    /// changed, which leaves a steady-state heartbeat free of fsyncs entirely.
     fn set_meta(&mut self, term: Term, voted_for: Option<NodeId>) -> Result<(), Self::Error> {
         self.current_term = term;
         self.voted_for = voted_for;
@@ -269,9 +288,11 @@ where
         self.rewrite_log_file()
     }
 
-    /// `Node` already resolved any conflict in memory and hands us exactly the
-    /// suffix to persist — append each entry individually so a crash mid-batch
-    /// leaves the file with a valid (if partial) prefix rather than none of it.
+    /// Appends the suffix `Node` has already reconciled in memory.
+    ///
+    /// Each entry is written and fsynced on its own. A crash partway through a
+    /// batch then leaves a shorter but well-formed log, rather than a truncated
+    /// final line that would fail to parse on reload.
     fn append(&mut self, entries: &[LogEntry<Cmd>]) -> Result<(), Self::Error> {
         for entry in entries {
             self.append_to_log_file(entry)?;
@@ -280,8 +301,9 @@ where
         Ok(())
     }
 
-    /// Snapshot durable first, then the log prefix is dropped and rewritten —
-    /// a crash between the two is reconciled by `open()` on the next start.
+    /// Makes the snapshot durable first, then drops the compacted prefix and
+    /// rewrites the log. A crash between the two leaves a log file whose header
+    /// overlaps the snapshot boundary, which `open` detects and reconciles.
     fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
         self.flush_snapshot(snapshot)?;
         self.snapshot = Some(snapshot.clone());
@@ -386,9 +408,10 @@ mod tests {
                 },
             ])
             .expect("append");
-            // Entry at index 2 conflicts (term 2 vs 1): Node resolves the conflict
-            // in memory and tells storage to truncate from there, then append the
-            // replacement suffix — storage never has to detect the conflict itself.
+            // The incoming entry at index 2 carries term 2 against the stored
+            // term 1. Node resolves that in memory and issues a truncation
+            // followed by the replacement suffix, so storage never detects the
+            // conflict itself.
             s.truncate_from(LogIndex::from(2)).expect("truncate");
             s.append(&[LogEntry {
                 term: Term::from(2),
@@ -509,9 +532,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         {
             let mut s = open_fresh(tmp.path());
-            // No truncate/install_snapshot yet, so log.jsonl has no header —
-            // exactly the state a crash between install_snapshot's two durable
-            // writes would leave behind.
+            // Neither truncate_from nor install_snapshot has run, so log.jsonl
+            // still has no header. That is the state a crash between the two
+            // durable writes of install_snapshot leaves behind.
             s.append(&three_entry_log()).expect("append");
 
             let snapshot = test_snapshot(2, 1, vec![7, 7]);

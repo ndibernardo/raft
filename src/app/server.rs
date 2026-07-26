@@ -28,6 +28,7 @@ use crate::core::types::Term;
 use crate::storage::file::FileStorage;
 use crate::storage::file::FileStorageError;
 
+/// Why the server could not start or could not continue running.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError<SmErr: std::error::Error> {
     #[error("storage: {0}")]
@@ -49,36 +50,45 @@ impl<SmErr: std::error::Error> From<RuntimeError<FileStorageError, SmErr>> for S
     }
 }
 
-/// Outcome of a submitted client command, delivered back over its response channel.
+/// Outcome of a submitted client command, returned over its response channel.
 #[derive(Debug)]
 pub enum ApiResponse<Output> {
+    /// The command committed and was applied, yielding this output.
     Result(Output),
+    /// This node cannot accept writes. The hint names where to retry.
     NotLeader { leader_hint: Option<NodeId> },
 }
 
-/// A submitted command paired with the channel to deliver its result.
+/// A submitted command paired with the channel its result is returned on.
 pub type Pending<Cmd, Output> = (Cmd, oneshot::Sender<ApiResponse<Output>>);
 
+/// A requested change to cluster membership. One server at a time, as
+/// dissertation section 4.1 requires.
 pub enum MembershipRequest {
     Add { id: NodeId, addr: SocketAddr },
     Remove { id: NodeId },
 }
 
+/// Outcome of a membership change.
 pub enum MembershipResult {
+    /// The change committed.
     Ok,
+    /// This node is not the leader.
     NotLeader,
-    /// Another config change is already uncommitted.
+    /// The change was refused: another one is still uncommitted, or it would
+    /// have emptied the cluster.
     Rejected,
 }
 
-/// Membership request paired with the channel to deliver its result.
+/// A membership request paired with the channel its result is returned on.
 pub type MembershipPending = (MembershipRequest, oneshot::Sender<MembershipResult>);
 
 /// Why `Server::apply_membership_request` could not apply a membership change.
 #[derive(Debug)]
 enum MembershipApplyError {
     Submit(SubmitError),
-    /// Removing this member would leave the config with zero members.
+    /// The removal would have left the configuration with no members, which
+    /// makes quorum unreachable forever.
     WouldLeaveNoMembers,
 }
 
@@ -88,27 +98,39 @@ impl From<SubmitError> for MembershipApplyError {
     }
 }
 
-/// Boundary-validated startup config: every field is already a valid domain type,
-/// parsed once at the CLI (see `main.rs`), so `Server::start` never re-parses strings.
+/// Startup configuration, validated at the boundary.
+///
+/// Every field is already a domain type, parsed once by the CLI in `main.rs`,
+/// so `Server::start` never parses a string and never fails on a malformed one.
 pub struct Config {
     pub id: NodeId,
+    /// Address the Raft listener binds to.
     pub addr: SocketAddr,
+    /// Other members at startup. Excludes this node.
     pub peers: HashMap<NodeId, SocketAddr>,
+    /// Directory holding the log, snapshot, and metadata files.
     pub data_dir: PathBuf,
     pub snapshot_policy: SnapshotPolicy,
 }
 
-/// A running Raft node: persistent log on disk, RPCs over TCP. Generic over the
-/// submitted command type and the state machine that applies it.
+/// A running Raft node: log persisted to disk, RPCs over TCP, and an HTTP API in
+/// front of it. Generic over the command type and the state machine applying it.
 pub struct Server<Cmd, SM: StateMachine<Cmd>> {
     runtime: Runtime<Cmd, SM, FileStorage<Cmd>>,
     transport: Transport<Cmd>,
     client_rx: mpsc::Receiver<Pending<Cmd, SM::Output>>,
-    /// Keyed by (term, index) of the submitted entry, not index alone — if leadership
-    /// changes before commit, a different entry can later land at the same index, and
-    /// a bare-index key would deliver that unrelated result to this client.
+    /// Clients awaiting a result, keyed by the term and index of the entry they
+    /// submitted.
+    ///
+    /// The term is part of the key because an index alone does not identify a
+    /// submission. If leadership changes before the entry commits, a different
+    /// leader can write an unrelated entry at the same index, and an
+    /// index-keyed map would hand that entry's result to this client.
     pending: HashMap<(Term, LogIndex), oneshot::Sender<ApiResponse<SM::Output>>>,
     membership_rx: mpsc::Receiver<MembershipPending>,
+    /// Membership requests awaiting commit, keyed by log index. No term is
+    /// needed: a `ConfigChange` that loses its index is superseded by whatever
+    /// configuration the new leader has, and the request simply times out.
     pending_membership: HashMap<LogIndex, oneshot::Sender<MembershipResult>>,
 }
 
@@ -118,6 +140,12 @@ where
     SM: StateMachine<Cmd>,
 {
     /// Restores persistent state from disk and binds the Raft listener.
+    ///
+    /// # Errors
+    /// `ServerError::Config` if the membership is empty.
+    /// `ServerError::Storage` if the data directory cannot be read.
+    /// `ServerError::StateMachine` if a persisted snapshot cannot be restored.
+    /// `ServerError::Transport` if the listener address cannot be bound.
     pub fn start(
         config: Config,
         state_machine: SM,
@@ -128,8 +156,9 @@ where
         let addr = config.addr;
         let snapshot_policy = config.snapshot_policy;
 
-        // Initial config includes self so crash-recovery can rescan the log correctly.
-        // Always non-empty: local_id is inserted unconditionally below.
+        // The configuration must include this node, because quorum is computed
+        // over the whole membership and crash recovery rescans the log against
+        // it. Inserting local_id also guarantees the map is non-empty.
         let mut members = config.peers.clone();
         members.insert(local_id, addr);
         let initial_config = ClusterConfig::new(members)?;
@@ -144,7 +173,7 @@ where
             snapshot_policy,
         )?;
 
-        // Transport only tracks peers (not self).
+        // The transport routes to peers only; this node is never dialed.
         let transport = Transport::bind(local_id, addr, config.peers)?;
 
         tracing::info!(node = %local_id, addr = %addr, "raft listener bound");
@@ -159,7 +188,13 @@ where
         })
     }
 
-    /// Run the Raft event loop. Returns only on I/O error.
+    /// Runs the event loop: client requests, then timers, then inbound messages.
+    /// Does not return under normal operation.
+    ///
+    /// # Errors
+    /// `ServerError::Storage` or `ServerError::StateMachine` if persisting or
+    /// snapshotting fails. Both are fatal, since the node can no longer honour
+    /// the durability guarantee its responses imply.
     pub fn run(&mut self) -> Result<(), ServerError<SM::SnapshotError>> {
         loop {
             self.poll_client_requests();
@@ -196,12 +231,15 @@ where
         }
     }
 
+    /// Drains queued client commands, submitting each and registering the
+    /// caller to be answered once the entry commits.
     fn poll_client_requests(&mut self) {
         while let Ok((command, resp_tx)) = self.client_rx.try_recv() {
             match self.runtime.submit(command) {
                 Ok(index) => {
-                    // submit() just appended this entry as the current term, so reading
-                    // the term back here is exactly the term it was submitted under.
+                    // submit stamped the entry with the current term a moment
+                    // ago, and nothing between then and here can change it, so
+                    // this read yields the term the entry was submitted under.
                     let term = self.runtime.node().persistent().current_term();
                     tracing::debug!(node = %self.runtime.node().id(), %term, %index, "client command queued");
                     self.pending.insert((term, index), resp_tx);
@@ -213,6 +251,8 @@ where
         }
     }
 
+    /// Drains queued membership requests, answering a refusal immediately and
+    /// registering an accepted change to be answered once it commits.
     fn poll_membership_requests(&mut self) {
         while let Ok((req, resp_tx)) = self.membership_rx.try_recv() {
             match self.apply_membership_request(req) {
@@ -231,12 +271,12 @@ where
         }
     }
 
-    /// Build the next config from the current one and submit it.
+    /// Derives the next configuration from the current one and submits it.
     ///
-    /// Syncs the transport peer map before returning — the new config takes effect on
-    /// `Node` immediately on append (§4.1), so transport must not lag behind it even by
-    /// one event-loop iteration, or the next heartbeat sends to a peer transport doesn't
-    /// know about yet.
+    /// The transport peer map is synchronized before returning. The
+    /// configuration takes effect on `Node` the moment it is appended (section
+    /// 4.1), so a transport lagging even one loop iteration behind would make
+    /// the next heartbeat target a peer it cannot resolve.
     fn apply_membership_request(
         &mut self,
         req: MembershipRequest,
@@ -253,11 +293,11 @@ where
         Ok(index)
     }
 
-    /// Sync the transport peer map whenever a new config takes effect on append.
+    /// Brings the transport peer map in line with every configuration that has
+    /// taken effect since the last call.
     fn apply_config_changes(&mut self) {
         for config in self.runtime.take_config_changes() {
             let self_id = self.runtime.node().id();
-            // Remove peers that are no longer in the new config.
             let to_remove: Vec<NodeId> = self
                 .transport
                 .peer_ids()
@@ -267,7 +307,6 @@ where
             for id in to_remove {
                 self.transport.remove_peer(id);
             }
-            // Add or update peers from the new config.
             for (peer_id, addr) in config.members() {
                 if peer_id != self_id {
                     self.transport.add_peer(peer_id, addr);
@@ -276,6 +315,9 @@ where
         }
     }
 
+    /// Answers the clients whose entries have just been applied. An output with
+    /// no waiting client is discarded, which is the normal case on a follower
+    /// and after a restart.
     fn resolve_outputs(&mut self) {
         for (term, index, result) in self.runtime.take_outputs() {
             if let Some(tx) = self.pending.remove(&(term, index)) {
@@ -284,8 +326,11 @@ where
         }
     }
 
-    /// Fail every outstanding client fast with `NotLeader` instead of leaving it to time
-    /// out — their entries may never commit now that this node is no longer leader.
+    /// Fails every waiting client with `NotLeader` after this node steps down.
+    ///
+    /// Their entries were never committed and the next leader may overwrite
+    /// them, so waiting would end in a timeout that says less than the immediate
+    /// answer does.
     fn purge_pending(&mut self) {
         let leader_hint = self.runtime.node().leader_hint();
         for (_, tx) in self.pending.drain() {
@@ -293,6 +338,8 @@ where
         }
     }
 
+    /// Answers the membership requests whose `ConfigChange` entries have just
+    /// committed.
     fn resolve_membership_outputs(&mut self) {
         for (index, _config) in self.runtime.take_committed_config_changes() {
             if let Some(tx) = self.pending_membership.remove(&index) {
@@ -301,8 +348,12 @@ where
         }
     }
 
-    /// Sends are fire-and-forget (`transport.rs` doc comment) — a single unreachable or
-    /// unknown peer must never take down the event loop.
+    /// Hands every `Send` command to the transport, logging failures rather than
+    /// propagating them.
+    ///
+    /// Sends are fire and forget by design, so an unreachable or unregistered
+    /// peer is an ordinary condition that retries recover from. Treating it as
+    /// fatal would let one bad address stop the whole node.
     fn dispatch(&self, commands: Vec<Command<Cmd>>) {
         for command in commands {
             if let Command::Send { to, message } = command
@@ -335,7 +386,8 @@ mod tests {
         format!("127.0.0.1:{port}").parse().unwrap()
     }
 
-    /// Single-node server: config contains only itself, listener on an ephemeral port.
+    /// A single-node server whose configuration holds only itself, listening on
+    /// an ephemeral port.
     fn test_server(id: u64, dir: &Path) -> Server<KvCommand, KvStore> {
         let local_id = NodeId::from(id);
         let listen_addr = test_addr(0);
@@ -348,8 +400,8 @@ mod tests {
             KvStore::new(),
             storage,
             TimerConfig::default(),
-            // Small threshold so compaction paths are reachable within a handful of
-            // submitted commands, unlike the production default of 1024.
+            // Low enough that compaction is reachable within a handful of
+            // commands, unlike the production default of 1024.
             SnapshotPolicy {
                 compact_threshold: std::num::NonZeroUsize::new(8),
             },
@@ -369,10 +421,10 @@ mod tests {
         }
     }
 
-    /// adding a member must sync the transport peer map immediately —
-    /// otherwise the next heartbeat tries to send to a peer transport doesn't know about,
-    /// `Transport::send` returns `UnknownPeer`, and (pre-fix) `run()` propagates that error
-    /// and the whole server dies.
+    /// Adding a member must update the transport peer map at once. Otherwise the
+    /// next heartbeat targets a peer the transport cannot resolve, and
+    /// `Transport::send` reports `UnknownPeer` for a member the node considers
+    /// active.
     #[test]
     fn membership_add_updates_transport_before_next_heartbeat() {
         let dir = tempfile::tempdir().unwrap();
@@ -394,9 +446,10 @@ mod tests {
         );
     }
 
-    /// Before the SubmitError fix both "not leader" and "another change pending"
-    /// collapsed to the same `None`, so `MembershipResult::Rejected` was dead code —
-    /// clients always saw a misleading `NotLeader` instead of the true 409 conflict.
+    /// A second membership change while the first is uncommitted must be
+    /// rejected as pending, distinguishably from a not-leader refusal. Collapsing
+    /// the two would tell the client to retry elsewhere when the correct answer
+    /// is to retry here, later.
     #[test]
     fn second_membership_request_is_rejected_while_first_uncommitted() {
         let dir = tempfile::tempdir().unwrap();
@@ -426,9 +479,9 @@ mod tests {
         );
     }
 
-    /// Before ClusterConfig::new validated non-emptiness, removing a single-node
-    /// cluster's only member was fully representable and would have poisoned quorum
-    /// math (majority of zero voters) rather than being rejected up front.
+    /// Removing the only member of a single-node cluster must be refused. An
+    /// empty configuration computes a majority over zero voters, after which no
+    /// entry can ever commit and no leader can ever be elected.
     #[test]
     fn removing_the_last_member_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -447,8 +500,9 @@ mod tests {
         );
     }
 
-    /// a send to a peer that isn't (or is no longer) registered must not be treated
-    /// as fatal — sends are fire-and-forget by design (see `transport.rs`).
+    /// A send to a peer that is not, or is no longer, registered must not be
+    /// fatal. Sends are fire and forget by design, and a removed member is
+    /// exactly the case that produces one.
     #[test]
     fn dispatch_does_not_propagate_unknown_peer_as_fatal() {
         let dir = tempfile::tempdir().unwrap();
@@ -473,8 +527,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut server = test_server(1, dir.path());
 
-        // Node 1 becomes leader alone, in term 1, and a client submits a command that
-        // lands at index 2 (index 1 is the leader's own no-op).
+        // Node 1 becomes leader alone in term 1. A client command then lands at
+        // index 2, index 1 being the leader's own no-op.
         server.runtime.handle(Event::ElectionTimeout).unwrap();
         assert!(matches!(server.runtime.node().role(), Role::Leader(_)));
         let leader_term = server.runtime.node().persistent().current_term();
@@ -490,8 +544,8 @@ mod tests {
         let (resp_tx, mut resp_rx) = oneshot::channel();
         server.pending.insert((leader_term, index), resp_tx);
 
-        // A higher-term RequestVote from another node forces node 1 to step down —
-        // its own command at index 2 is now stranded, uncommitted.
+        // A RequestVote from a higher term forces node 1 to step down, leaving
+        // the command at index 2 stranded and uncommitted.
         let commands = server
             .runtime
             .handle(Event::Message {
@@ -512,8 +566,8 @@ mod tests {
         server.resolve_outputs();
         assert!(matches!(server.runtime.node().role(), Role::Follower(_)));
 
-        // A new leader (term 6) overwrites index 2 with an unrelated command and directs
-        // node 1 to commit it immediately.
+        // A term 6 leader overwrites index 2 with an unrelated command and
+        // directs node 1 to commit it.
         let commands = server
             .runtime
             .handle(Event::Message {
@@ -541,9 +595,10 @@ mod tests {
         }
         server.resolve_outputs();
 
-        // The original client must never see the unrelated command's result — either it
-        // failed fast with NotLeader (purge-on-stepdown) or it's still pending; either is
-        // fine. Only an ApiResponse::Result here would mean the wrong answer was delivered.
+        // The original client must never see the unrelated command's result.
+        // Either it failed with NotLeader when the node stepped down, or it is
+        // still waiting; both are correct. Only a Result here would mean the
+        // wrong answer was delivered.
         match resp_rx.try_recv() {
             Ok(ApiResponse::Result(result)) => {
                 panic!(

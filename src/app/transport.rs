@@ -16,7 +16,7 @@ use serde::Serialize;
 use crate::core::types::Message;
 use crate::core::types::NodeId;
 
-/// Error type for transport operations.
+/// Why a transport operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("i/o error: {0}")]
@@ -27,7 +27,8 @@ pub enum TransportError {
     UnknownPeer(NodeId),
 }
 
-/// Wire envelope: wraps a Raft message with the sender's identity.
+/// A Raft message paired with the sender's identity, as it travels on the wire.
+/// The identity is not authenticated.
 #[derive(Serialize, Deserialize)]
 struct Envelope<Cmd> {
     from: NodeId,
@@ -36,18 +37,22 @@ struct Envelope<Cmd> {
 
 /// TCP transport for Raft RPCs.
 ///
-/// Messages are framed with a 4-byte big-endian length prefix followed by a
-/// JSON-serialized `Envelope`. A background thread accepts incoming connections;
-/// each is dispatched to its own short-lived thread which reads one message and
-/// forwards it into the receive channel. Outbound messages are sent fire-and-forget
-/// on ephemeral threads — failed sends are silently dropped, consistent with
-/// Raft's assumption of unreliable networks (timeout/retry handles losses).
+/// A message is framed as a four-byte big-endian length followed by a
+/// JSON-encoded `Envelope`. One background thread accepts connections and hands
+/// each to a short-lived thread that reads a single message and forwards it into
+/// the receive channel.
+///
+/// Sends are fire and forget, on ephemeral threads, and a failure is dropped
+/// without notice. That is sound because Raft already assumes an unreliable
+/// network: a lost message is indistinguishable from a slow one, and both are
+/// recovered by the sender's own timeout and retry.
 pub struct Transport<Cmd> {
     local_id: NodeId,
     peers: HashMap<NodeId, SocketAddr>,
     rx: mpsc::Receiver<(NodeId, Message<Cmd>)>,
-    /// Keeping this Arc alive closes the listener when Transport is dropped,
-    /// which causes the accept loop to receive an error and exit.
+    /// Holding this handle keeps the listener open. Dropping the transport drops
+    /// the last reference, which closes the socket and makes the accept loop
+    /// fail and exit.
     _listener: Arc<TcpListener>,
 }
 
@@ -55,7 +60,10 @@ impl<Cmd> Transport<Cmd>
 where
     Cmd: Send + 'static + Serialize + for<'de> Deserialize<'de>,
 {
-    /// Bind a listener on `addr` and start accepting inbound Raft RPCs.
+    /// Binds a listener on `addr` and starts accepting inbound RPCs.
+    ///
+    /// # Errors
+    /// `TransportError::Io` if the address cannot be bound.
     pub fn bind(
         local_id: NodeId,
         addr: SocketAddr,
@@ -78,12 +86,12 @@ where
         }
     }
 
-    /// Register a new peer. Overwrites the address if the peer already exists.
+    /// Registers a peer, replacing the address if it is already known.
     pub fn add_peer(&mut self, peer: NodeId, addr: SocketAddr) {
         self.peers.insert(peer, addr);
     }
 
-    /// Deregister a peer. Subsequent sends to this ID return UnknownPeer.
+    /// Deregisters a peer. Later sends to it fail with `UnknownPeer`.
     pub fn remove_peer(&mut self, peer: NodeId) {
         self.peers.remove(&peer);
     }
@@ -93,7 +101,12 @@ where
         self.peers.keys().copied().collect()
     }
 
-    /// Fire-and-forget: returns immediately; UnknownPeer is the only synchronous error.
+    /// Queues `message` for `to` and returns immediately, without waiting for
+    /// the connection or the write.
+    ///
+    /// # Errors
+    /// `TransportError::UnknownPeer` if `to` is not registered. This is the only
+    /// error reported synchronously; a dial or write failure is dropped.
     pub fn send(&self, to: NodeId, message: Message<Cmd>) -> Result<(), TransportError> {
         let addr = self
             .peers
@@ -107,16 +120,24 @@ where
         Ok(())
     }
 
-    /// Returns None on timeout.
+    /// Waits up to `timeout` for an inbound message. `None` means the wait
+    /// elapsed with nothing to deliver.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<(NodeId, Message<Cmd>)> {
         self.rx.recv_timeout(timeout).ok()
     }
 
+    /// The address the listener is bound to, which resolves the port when the
+    /// caller bound to port 0.
+    ///
+    /// # Errors
+    /// `TransportError::Io` if the socket cannot be queried.
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
         Ok(self._listener.local_addr()?)
     }
 }
 
+/// Accepts connections until the listener closes, handing each to its own
+/// thread so one slow sender cannot stall the others.
 fn accept_loop<Cmd>(listener: Arc<TcpListener>, tx: mpsc::Sender<(NodeId, Message<Cmd>)>)
 where
     Cmd: Send + 'static + for<'de> Deserialize<'de>,
@@ -124,7 +145,8 @@ where
     while let Ok((stream, _)) = listener.accept() {
         let tx = tx.clone();
         thread::spawn(move || {
-            // Bound how long we wait for a slow/misbehaving sender.
+            // Without a read timeout, a sender that connects and then stalls
+            // holds its thread forever.
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             if let Ok(env) = read_envelope::<Cmd>(&stream) {
                 let _ = tx.send((env.from, env.message));
@@ -133,6 +155,7 @@ where
     }
 }
 
+/// Reads one length-prefixed envelope from `stream`.
 fn read_envelope<Cmd: for<'de> Deserialize<'de>>(
     mut stream: &TcpStream,
 ) -> Result<Envelope<Cmd>, TransportError> {
@@ -144,6 +167,9 @@ fn read_envelope<Cmd: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(&buf)?)
 }
 
+/// Connects to `addr` and writes one length-prefixed envelope. Both the connect
+/// and the write are bounded, so a peer that is down or wedged cannot hold the
+/// calling thread open.
 fn dial_and_send<Cmd: Serialize>(
     addr: SocketAddr,
     from: NodeId,
@@ -225,7 +251,7 @@ mod tests {
 
         let (a, b) = make_pair();
 
-        // A → B: AppendEntries
+        // Node A sends an AppendEntries to node B.
         a.send(
             NodeId::from(2),
             Message::AppendEntries(AppendEntries {
@@ -243,7 +269,7 @@ mod tests {
         assert_eq!(from, NodeId::from(1));
         assert!(matches!(msg, Message::AppendEntries(_)));
 
-        // B → A: AppendEntriesResponse
+        // Node B answers over its own connection back to node A.
         b.send(
             NodeId::from(1),
             Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {

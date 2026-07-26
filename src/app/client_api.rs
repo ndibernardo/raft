@@ -24,16 +24,22 @@ use crate::app::server::MembershipRequest;
 use crate::app::server::MembershipResult;
 use crate::core::types::NodeId;
 
-/// KV command paired with the channel to deliver its result.
+/// A key-value command paired with the channel its result is returned on.
 pub type Pending = crate::app::server::Pending<KvCommand, KvResult>;
 
+/// Channels back to the server loop. Cloned into every request handler.
 #[derive(Clone)]
 struct AppState {
     kv_tx: mpsc::Sender<Pending>,
     membership_tx: mpsc::Sender<MembershipPending>,
 }
 
-/// Spawns a background thread hosting the axum HTTP server; requests forwarded via the channels.
+/// Starts the HTTP API on `addr` in a background thread with its own tokio
+/// runtime.
+///
+/// Requests are forwarded over the supplied channels to the server loop, which
+/// owns the node and answers on the one-shot channel carried with each request.
+/// A bind failure is reported to stderr and leaves the rest of the node running.
 pub fn start(
     addr: SocketAddr,
     kv_tx: mpsc::Sender<Pending>,
@@ -108,7 +114,7 @@ async fn handle_delete(
     submit_kv(state.kv_tx, KvCommand::Delete { key }).await
 }
 
-/// DTO for `POST /cluster/members`.
+/// Request body of `POST /cluster/members`.
 #[derive(Deserialize)]
 struct AddMemberBody {
     id: u64,
@@ -145,7 +151,12 @@ async fn handle_remove_member(
     submit_membership(state.membership_tx, req).await
 }
 
-/// 5-second timeout; SERVICE_UNAVAILABLE on timeout or channel error.
+/// Forwards a key-value command to the server loop and waits up to five seconds
+/// for the result.
+///
+/// A timeout or a closed channel becomes 503, since neither says whether the
+/// command committed. The client must treat the outcome as unknown and retry an
+/// idempotent request rather than assume failure.
 async fn submit_kv(tx: mpsc::Sender<Pending>, command: KvCommand) -> (StatusCode, String) {
     let (resp_tx, resp_rx) = oneshot::channel::<ApiResponse<KvResult>>();
 
@@ -177,6 +188,9 @@ async fn submit_kv(tx: mpsc::Sender<Pending>, command: KvCommand) -> (StatusCode
     }
 }
 
+/// Forwards a membership change to the server loop and waits up to ten seconds
+/// for the result. The longer budget covers catching a newly added member up
+/// before the change can commit.
 async fn submit_membership(
     tx: mpsc::Sender<MembershipPending>,
     req: MembershipRequest,

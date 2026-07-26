@@ -7,8 +7,11 @@ use crate::core::types::Term;
 use crate::storage::LoadedState;
 use crate::storage::Storage;
 
-/// In-memory storage. Legitimate as a standalone backend (single-process clusters,
-/// tests) — not durable across restarts by construction, which is the point.
+/// Storage that keeps everything in memory and nothing on disk.
+///
+/// Suitable for single-process clusters and for tests, where losing state on
+/// restart is the intended behaviour rather than a limitation. A cluster that
+/// must survive a restart needs `FileStorage`.
 pub struct MemoryStorage<Cmd> {
     current_term: Term,
     voted_for: Option<NodeId>,
@@ -17,6 +20,7 @@ pub struct MemoryStorage<Cmd> {
 }
 
 impl<Cmd> MemoryStorage<Cmd> {
+    /// Empty storage: term 0, no vote, no snapshot, no entries.
     pub fn new() -> Self {
         Self {
             current_term: Term::default(),

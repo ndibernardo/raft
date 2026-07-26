@@ -9,30 +9,37 @@ use super::primitives::NodeId;
 /// Why a `ClusterConfig` could not be constructed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    /// An empty config is representable but poisons quorum math (size 0 → majority 1
-    /// with zero voters), so it's rejected at construction instead.
+    /// A membership of size zero breaks quorum arithmetic: the majority
+    /// threshold computes to 1 while no node can ever vote, so no entry commits.
     #[error("cluster config must have at least one member")]
     Empty,
 }
 
-/// Complete cluster membership: every voting member's ID mapped to its Raft RPC address.
-/// Always non-empty — enforced at construction, so quorum math never divides by a
-/// membership of size zero.
+/// Complete cluster membership: every voting member's ID mapped to its Raft RPC
+/// address.
 ///
-/// Stored verbatim in the log as `LogPayload::ConfigChange` so any node can reconstruct
-/// the full membership history purely from its log after a crash.
+/// Construction rejects an empty membership, so quorum arithmetic never runs
+/// against zero voters.
 ///
-/// A `ConfigChange` entry takes effect immediately when appended — not when committed.
-/// This is the single-server-changes safety rule (dissertation §4.1): changing one
-/// member at a time guarantees any majority of the old config and any majority of the
-/// new config overlap, so two independent leaders cannot form.
+/// A configuration is stored verbatim in the log as `LogPayload::ConfigChange`,
+/// which lets any node reconstruct the entire membership history from its log
+/// alone after a crash.
+///
+/// A `ConfigChange` entry takes effect as soon as it is appended, not when it
+/// commits. That is the single-server-change rule of dissertation section 4.1:
+/// because only one member is added or removed at a time, any majority of the
+/// old configuration intersects any majority of the new one, so the two
+/// configurations cannot elect separate leaders.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterConfig {
     members: HashMap<NodeId, SocketAddr>,
 }
 
 impl ClusterConfig {
-    /// Returns `Err(ConfigError::Empty)` if `members` is empty.
+    /// Builds a configuration from a membership map.
+    ///
+    /// # Errors
+    /// `ConfigError::Empty` when `members` is empty.
     pub fn new(members: HashMap<NodeId, SocketAddr>) -> Result<Self, ConfigError> {
         if members.is_empty() {
             return Err(ConfigError::Empty);
@@ -40,15 +47,20 @@ impl ClusterConfig {
         Ok(Self { members })
     }
 
-    /// Derives the next config with `id` added (or its address updated). Adding a
-    /// member to an already-valid config can never produce an empty one.
+    /// Derives the next configuration with `id` added, or its address updated if
+    /// it is already a member. Infallible, because growing a non-empty
+    /// membership cannot empty it.
     pub fn with_member(&self, id: NodeId, addr: SocketAddr) -> Self {
         let mut members = self.members.clone();
         members.insert(id, addr);
         Self { members }
     }
 
-    /// Derives the next config with `id` removed. Fails if `id` was the last member.
+    /// Derives the next configuration with `id` removed. Removing an absent `id`
+    /// yields an equivalent configuration.
+    ///
+    /// # Errors
+    /// `ConfigError::Empty` when `id` was the only remaining member.
     pub fn without_member(&self, id: NodeId) -> Result<Self, ConfigError> {
         let mut members = self.members.clone();
         members.remove(&id);
@@ -64,22 +76,26 @@ impl ClusterConfig {
             .collect()
     }
 
-    /// Every (id, address) pair in the config.
+    /// Every identifier and address pair in the configuration, in unspecified order.
     pub fn members(&self) -> impl Iterator<Item = (NodeId, SocketAddr)> + '_ {
         self.members.iter().map(|(&id, &addr)| (id, addr))
     }
 
+    /// Number of voting members. Always at least 1.
     pub fn size(&self) -> usize {
         self.members.len()
     }
 
+    /// Whether `id` is a voting member.
     pub fn contains(&self, id: NodeId) -> bool {
         self.members.contains_key(&id)
     }
 
-    /// Whether `id` currently holds a voting seat — a removed or spoofed
-    /// `NodeId` must not be silently treated as `false` where the caller needs
-    /// to branch on cluster membership as a domain outcome.
+    /// Whether `id` holds a voting seat, as a named outcome.
+    ///
+    /// Callers that branch on membership use this rather than `contains`, so
+    /// that a removed or unknown `NodeId` reads as an explicit `NonMember`
+    /// decision instead of an anonymous `false`.
     pub fn membership_of(&self, id: NodeId) -> Membership {
         if self.contains(id) {
             Membership::Member
@@ -137,8 +153,8 @@ mod tests {
         assert!(!shrunk.contains(NodeId::from(2)));
     }
 
-    /// The invariant this whole type exists to enforce: an empty config would
-    /// poison quorum math (majority of zero voters), so it must be unrepresentable.
+    /// The invariant the type exists to enforce: an empty configuration would
+    /// make a majority of zero voters representable, so it must be rejected.
     #[test]
     fn without_member_rejects_removing_the_last_member() {
         let config = single_member_config();

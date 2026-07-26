@@ -22,52 +22,58 @@ struct InFlight<Cmd> {
     message: Message<Cmd>,
 }
 
-/// Dummy dial-in address for a simulated node — the cluster harness routes messages
-/// in-memory by `NodeId`, never over a real socket, so only its uniqueness matters.
+/// A placeholder address for a simulated node. The harness routes messages in
+/// memory by `NodeId` and never opens a socket, so only uniqueness matters.
 fn dummy_addr(id_value: u64) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], (9000 + id_value) as u16))
 }
 
-/// Simulated cluster for testing. Uses MemoryStorage on every node.
+/// A cluster simulated in one process, with `MemoryStorage` on every node.
+///
+/// Message delivery is explicit rather than concurrent: the harness queues what
+/// each node emits and delivers it on demand, so a test can drive an exact
+/// interleaving and reproduce it on every run.
 pub struct Cluster<Cmd, S: StateMachine<Cmd>> {
     runtimes: Vec<Runtime<Cmd, S, MemoryStorage<Cmd>>>,
     messages: VecDeque<InFlight<Cmd>>,
-    /// Nodes currently cut off from the rest of the cluster: messages to or from
-    /// them are dropped in flight (see `deliver`) until `heal_partition`.
+    /// Nodes cut off from the rest of the cluster. Messages to or from them are
+    /// dropped in flight until `heal_partition`.
     partitioned: HashSet<NodeId>,
-    /// Applied to every node created by `with_snapshot_policy` and `add_node`, so a
-    /// node joining after cluster creation compacts on the same schedule as its peers.
+    /// Applied to every node created by `with_snapshot_policy` and `add_node`,
+    /// so a node joining later compacts on the same schedule as its peers.
     snapshot_policy: SnapshotPolicy,
-    /// Each node's config at creation, by index — needed to rebuild it via
-    /// `Runtime::from_storage` in `restart`, whose `initial_config` argument is the
-    /// floor a restarted node falls back to when neither its log nor its snapshot
-    /// carries a `ConfigChange` yet.
+    /// The configuration each node was created with, by index.
+    ///
+    /// `restart` passes this back to `Runtime::from_storage` as
+    /// `initial_config`, the fallback a restarted node uses when neither its log
+    /// nor its snapshot carries a `ConfigChange`.
     initial_configs: Vec<ClusterConfig>,
 }
 
 impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
-    /// Create a cluster with the given number of nodes; auto-compaction disabled.
+    /// A cluster of `size` nodes with automatic compaction disabled.
     ///
     /// # Panics
-    /// If `size` is 0 — a cluster harness with no nodes isn't a meaningful test fixture.
+    /// If `size` is 0, which is not a meaningful fixture.
     pub fn new(size: usize) -> Self {
         Self::with_snapshot_policy(size, SnapshotPolicy::default())
     }
 
-    /// Create a cluster with the given number of nodes, each compacting per `snapshot_policy`.
+    /// A cluster of `size` nodes, each compacting according to `snapshot_policy`.
     ///
     /// # Panics
-    /// If `size` is 0 — a cluster harness with no nodes isn't a meaningful test fixture.
+    /// If `size` is 0, which is not a meaningful fixture.
     pub fn with_snapshot_policy(size: usize, snapshot_policy: SnapshotPolicy) -> Self {
         assert!(size > 0, "Cluster::new requires at least one node");
         let ids: Vec<NodeId> = (1..=size).map(|i| NodeId::from(i as u64)).collect();
 
-        // Shared config: all nodes start with the same full membership.
+        // Every node starts from the same full membership, as a cluster brought
+        // up from a shared configuration file would.
         let members: HashMap<NodeId, SocketAddr> =
             ids.iter().map(|&id| (id, dummy_addr(id.value()))).collect();
         let config = match ClusterConfig::new(members) {
             Ok(config) => config,
-            // `size > 0` was asserted above, so `members` is never empty.
+            // The assertion above guarantees members is non-empty.
             Err(_) => unreachable!("Cluster::new asserts size > 0, so members is non-empty"),
         };
 
@@ -94,10 +100,12 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         }
     }
 
-    /// Adds a new node to the running cluster, e.g. to simulate a member joining
-    /// mid-test. Its own initial config only contains itself — irrelevant once it
-    /// starts receiving AppendEntries/InstallSnapshot from the leader, since those
-    /// carry (or imply) the real membership and supersede a joining node's view.
+    /// Adds a node to a running cluster, simulating a member that joins partway
+    /// through a test.
+    ///
+    /// The new node's configuration contains only itself. That view is replaced
+    /// as soon as the leader reaches it, since both AppendEntries and
+    /// InstallSnapshot carry the real membership.
     pub fn add_node(&mut self, id_value: u64) {
         let id = NodeId::from(id_value);
         let solo_config = match ClusterConfig::new(HashMap::from([(id, dummy_addr(id_value))])) {
@@ -116,14 +124,16 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         self.initial_configs.push(solo_config);
     }
 
-    /// Simulates a crash-and-restart of node `index`: rebuilds its runtime from
-    /// its own `MemoryStorage` via `Runtime::from_storage`, exactly as a real
-    /// process restart would. Node identity (its position in `runtimes`) is
-    /// preserved so callers can keep addressing it by the same index.
+    /// Crashes and restarts node `index`, rebuilding its runtime from its own
+    /// storage through `Runtime::from_storage`, exactly as a process restart
+    /// would. All volatile state is lost and the node comes back as a follower.
+    ///
+    /// The node keeps its position in `runtimes`, so callers can go on
+    /// addressing it by the same index.
     ///
     /// # Panics
-    /// If `from_storage` fails — for `KvStore`, `restore` never fails in practice
-    /// (see the justification on `election_timeout`), so this is not reachable here.
+    /// If `from_storage` fails. For `KvStore` that requires a restore failure,
+    /// which cannot happen for the reason given on `election_timeout`.
     #[allow(clippy::unwrap_used)]
     pub fn restart(&mut self, index: usize) {
         let old = self.runtimes.remove(index);
@@ -141,8 +151,8 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         self.runtimes.insert(index, restored);
     }
 
-    /// Cuts node `index` off from the rest of the cluster: messages to or from it
-    /// are dropped in flight (not queued for later) until `heal_partition`.
+    /// Cuts node `index` off from the cluster. Messages to or from it are
+    /// dropped in flight, not queued, until `heal_partition`.
     pub fn partition(&mut self, index: usize) {
         self.partitioned.insert(self.runtimes[index].node().id());
     }
@@ -152,21 +162,21 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         self.partitioned.remove(&self.runtimes[index].node().id());
     }
 
-    /// Get a reference to a node's runtime by index (0-based).
+    /// A node's runtime, by zero-based index.
     pub fn runtime(&self, index: usize) -> &Runtime<Cmd, S, MemoryStorage<Cmd>> {
         &self.runtimes[index]
     }
 
-    /// Get a mutable reference to a node's runtime by index (0-based).
+    /// Mutable access to a node's runtime, by zero-based index.
     pub fn runtime_mut(&mut self, index: usize) -> &mut Runtime<Cmd, S, MemoryStorage<Cmd>> {
         &mut self.runtimes[index]
     }
 
-    /// Trigger election timeout on a specific node.
-    // KvStore's snapshot/restore only (de)serialize an in-memory HashMap<String, String>
-    // and never fail in practice, so RuntimeError is unreachable here even when the
-    // cluster's snapshot policy compacts — not provably so, but not worth threading a
-    // fallible harness API through every test for it.
+    /// Fires the election timeout on node `index` and queues what it emits.
+    // KvStore's snapshot and restore only serialize an in-memory
+    // HashMap<String, String>, which never fails in practice, so RuntimeError is
+    // unreachable here even when the snapshot policy compacts. Not provable, but
+    // not worth a fallible harness API threaded through every test.
     #[allow(clippy::unwrap_used)]
     pub fn election_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
@@ -175,7 +185,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         self.queue_commands(index, commands);
     }
 
-    /// Trigger heartbeat timeout on a specific node.
+    /// Fires the heartbeat interval on node `index` and queues what it emits.
     #[allow(clippy::unwrap_used)]
     pub fn heartbeat_timeout(&mut self, index: usize) {
         let commands = self.runtimes[index]
@@ -184,7 +194,7 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         self.queue_commands(index, commands);
     }
 
-    /// Deliver one pending message. Returns true if a message was available.
+    /// Delivers the oldest queued message. Returns whether there was one.
     pub fn deliver_one(&mut self) -> bool {
         if let Some(msg) = self.messages.pop_front() {
             self.deliver(msg);
@@ -194,16 +204,19 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         }
     }
 
-    /// Deliver all pending messages.
+    /// Delivers queued messages until none remain, including those generated by
+    /// the deliveries themselves.
     pub fn deliver_all(&mut self) {
         while let Some(msg) = self.messages.pop_front() {
             self.deliver(msg);
         }
     }
 
-    /// Deliver a single message and queue any responses. Dropped in flight (never
-    /// queued for later) if either endpoint is currently partitioned — mirrors a
-    /// real network dropping in-flight packets rather than buffering them.
+    /// Delivers one message and queues whatever the recipient emits in response.
+    ///
+    /// A message is discarded, not deferred, when either endpoint is
+    /// partitioned. A real network drops packets it cannot route rather than
+    /// buffering them until the link returns.
     #[allow(clippy::unwrap_used)]
     fn deliver(&mut self, inflight: InFlight<Cmd>) {
         if self.partitioned.contains(&inflight.from) || self.partitioned.contains(&inflight.to) {
@@ -221,7 +234,8 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         }
     }
 
-    /// Queue outgoing commands from a node.
+    /// Queues the `Send` commands a node emitted. Timer commands are irrelevant
+    /// here, since the harness drives timeouts explicitly.
     fn queue_commands(&mut self, from_index: usize, commands: Vec<Command<Cmd>>) {
         let from_id = self.runtimes[from_index].node().id();
         for command in commands {
@@ -235,19 +249,21 @@ impl<Cmd: Clone, S: StateMachine<Cmd> + Default> Cluster<Cmd, S> {
         }
     }
 
-    /// Find runtime index by node ID.
+    /// Index of the node with `id`, or `None` if no such node exists.
     fn node_index(&self, id: NodeId) -> Option<usize> {
         self.runtimes.iter().position(|rt| rt.node().id() == id)
     }
 
-    /// Find the current leader, if any.
+    /// Index of a node currently believing itself leader, if any. Two nodes can
+    /// hold that belief at once across different terms, in which case this
+    /// returns the first.
     pub fn leader(&self) -> Option<usize> {
         self.runtimes
             .iter()
             .position(|rt| matches!(rt.node().role(), Role::Leader(_)))
     }
 
-    /// Count nodes in each role.
+    /// Counts of followers, candidates, and leaders, in that order.
     pub fn role_counts(&self) -> (usize, usize, usize) {
         let mut followers = 0;
         let mut candidates = 0;
@@ -282,6 +298,7 @@ mod proptest_tests {
     const N: usize = 3;
     const KEYS: [&str; 3] = ["a", "b", "c"];
 
+    /// One step a generated schedule can take against the cluster.
     #[derive(Debug, Clone)]
     enum Op {
         ElectionTimeout(usize),
@@ -294,9 +311,10 @@ mod proptest_tests {
         Restart(usize),
     }
 
+    /// Generates operations with delivery weighted heavily, so that schedules
+    /// actually reach a committed state instead of thrashing between elections.
     fn arb_op() -> impl Strategy<Value = Op> {
         prop_oneof![
-            // delivery weighted higher so the cluster has a chance to make progress
             3 => (0..N).prop_map(Op::ElectionTimeout),
             2 => (0..N).prop_map(Op::HeartbeatTimeout),
             5 => Just(Op::DeliverOne),
@@ -330,7 +348,8 @@ mod proptest_tests {
         }
     }
 
-    /// §5.2 Election Safety: at most one leader per term at any point in time.
+    /// Election Safety (section 5.2): no term ever has two leaders. Nodes in
+    /// different terms may both believe they lead, which is allowed.
     fn check_election_safety(cluster: &Cluster<KvCommand, KvStore>) {
         let mut leaders: HashMap<raft::types::Term, usize> = HashMap::new();
         for i in 0..N {
@@ -345,13 +364,13 @@ mod proptest_tests {
         }
     }
 
-    /// §5.4.3 State Machine Safety: if two nodes have both committed up to some
-    /// index, the committed entries at every position must be identical.
+    /// State Machine Safety (section 5.4.3): where two nodes have both committed
+    /// through some index, their entries at every position up to it are equal.
     ///
-    /// Once either node has compacted, entries below its `first_index()` are gone;
-    /// that prefix is proven equal by the snapshot invariant itself; the comparison
-    /// only needs to cover the overlap of both nodes' retained ranges, plus a term
-    /// check at the boundary where the overlap begins.
+    /// Compaction removes entries below a node's `first_index`, so a direct
+    /// comparison is only possible across the overlap of the two retained
+    /// ranges. The discarded prefix is covered by the snapshot itself, and the
+    /// term check at the start of the overlap is what ties the two together.
     fn check_state_machine_safety(cluster: &Cluster<KvCommand, KvStore>) {
         for i in 0..N {
             for j in (i + 1)..N {
@@ -403,10 +422,12 @@ mod proptest_tests {
         }
     }
 
-    /// State-machine equivalence: once entries fall inside a compaction boundary on
-    /// either side, `check_state_machine_safety` can no longer compare them directly
-    /// (they're gone from the log). Nodes that have applied through the same index
-    /// must still agree on the materialized result — checked here via `Get` instead.
+    /// Two nodes that have applied through the same index hold the same values.
+    ///
+    /// This covers what compaction puts out of reach of
+    /// `check_state_machine_safety`: once entries fall below a compaction
+    /// boundary they cannot be compared in the log, but the state they produced
+    /// is still observable through a read.
     fn check_applied_state_equivalence(cluster: &mut Cluster<KvCommand, KvStore>) {
         let applied: Vec<LogIndex> = (0..N)
             .map(|i| cluster.runtime(i).node().volatile().last_applied)
@@ -481,14 +502,12 @@ mod tests {
     fn three_node_leader_election() {
         let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
 
-        // Node 0 starts election.
         cluster.election_timeout(0);
         assert_eq!(cluster.role_counts(), (2, 1, 0));
 
-        // Deliver vote requests and responses.
+        // Carries the vote requests out and the responses back.
         cluster.deliver_all();
 
-        // Node 0 should be leader.
         assert_eq!(cluster.leader(), Some(0));
         assert_eq!(cluster.role_counts(), (2, 0, 1));
     }
@@ -497,34 +516,30 @@ mod tests {
     fn leader_replicates_to_followers() {
         let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
 
-        // Elect leader.
         cluster.election_timeout(0);
         cluster.deliver_all();
         assert_eq!(cluster.leader(), Some(0));
 
-        // Submit command to leader (no-op is at index 1, command at index 2).
+        // Index 1 holds the leader's no-op, so the command lands at index 2.
         let index = cluster.runtime_mut(0).submit(KvCommand::Set {
             key: "x".to_string(),
             value: "1".to_string(),
         });
         assert_eq!(index, Ok(LogIndex::from(2)));
 
-        // Send heartbeats with new entries (no-op + command).
         cluster.heartbeat_timeout(0);
         cluster.deliver_all();
 
-        // Verify all nodes have both entries (no-op + command).
+        // Both the no-op and the command reach every node.
         for i in 0..3 {
             assert_eq!(cluster.runtime(i).node().persistent().log().len(), 2);
         }
 
-        // Verify leader committed and applied both entries.
         assert_eq!(
             cluster.runtime(0).node().volatile().commit_index,
             LogIndex::from(2)
         );
 
-        // Verify state machine applied on leader.
         let result = cluster
             .runtime_mut(0)
             .state_machine_mut()
@@ -538,7 +553,6 @@ mod tests {
     fn followers_commit_on_leader_heartbeat() {
         let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
 
-        // Elect leader and submit command.
         cluster.election_timeout(0);
         cluster.deliver_all();
 
@@ -550,15 +564,15 @@ mod tests {
             })
             .unwrap();
 
-        // First heartbeat: replicate entry.
+        // The first round replicates the entry, which is what lets the leader
+        // commit it. Only the second round carries that commit index to the
+        // followers.
+        cluster.heartbeat_timeout(0);
+        cluster.deliver_all();
         cluster.heartbeat_timeout(0);
         cluster.deliver_all();
 
-        // Second heartbeat: propagate commit index.
-        cluster.heartbeat_timeout(0);
-        cluster.deliver_all();
-
-        // Verify followers committed (no-op at 1 + command at 2).
+        // The no-op at index 1 and the command at index 2 are both committed.
         for i in 1..3 {
             assert_eq!(
                 cluster.runtime(i).node().volatile().commit_index,

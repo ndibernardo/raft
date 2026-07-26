@@ -18,30 +18,45 @@ use crate::core::types::SnapshotData;
 use crate::core::types::Term;
 use crate::storage::Storage;
 
-/// Trait for state machines that can apply commands.
+/// The application state that committed commands are applied to.
+///
+/// Implementations must be deterministic: every replica applies the same
+/// commands in the same order and has to arrive at the same state, or a snapshot
+/// taken on one node will not reconstruct the same state on another.
 pub trait StateMachine<Cmd> {
     type Output;
     type SnapshotError: std::error::Error;
 
+    /// Applies one committed command and returns whatever the client should see.
     fn apply(&mut self, command: Cmd) -> Self::Output;
 
-    /// Serialize current state. Must capture exactly the applied prefix.
+    /// Serializes the current state.
+    ///
+    /// The result must reflect exactly the commands applied so far, no more and
+    /// no fewer, because it is paired with a log index that claims precisely
+    /// that.
     fn snapshot(&self) -> Result<SnapshotData, Self::SnapshotError>;
 
-    /// Replace state wholesale with the snapshot's contents.
+    /// Replaces the state wholesale with the contents of `data`. Not a merge:
+    /// anything the snapshot does not contain is gone afterward.
     fn restore(&mut self, data: &SnapshotData) -> Result<(), Self::SnapshotError>;
 }
 
-/// Events that drive the runtime.
+/// Something that has happened and requires the node to act.
 pub enum Event<Cmd> {
     ElectionTimeout,
     HeartbeatTimeout,
     Message { from: NodeId, message: Message<Cmd> },
 }
 
-/// Timer configuration.
+/// Timer durations governing elections and replication.
 pub struct TimerConfig {
+    /// Base time a follower waits without hearing from a leader before standing
+    /// for election. The actual wait is randomized within this value and twice
+    /// it.
     pub election_timeout: Duration,
+    /// How often a leader replicates. Must be comfortably below
+    /// `election_timeout`, or followers will time out under a healthy leader.
     pub heartbeat_interval: Duration,
 }
 
@@ -54,16 +69,17 @@ impl Default for TimerConfig {
     }
 }
 
-/// Auto-compaction policy, checked after every `apply_committed()`.
+/// When the runtime compacts the log on its own. Evaluated after every batch of
+/// applies.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SnapshotPolicy {
-    /// Compact once applied-but-uncompacted entries reach this count.
-    /// `None` disables auto-compaction.
+    /// Compact once this many entries have been applied since the last snapshot.
+    /// `None` leaves compaction entirely to the caller.
     pub compact_threshold: Option<NonZeroUsize>,
 }
 
-/// Failures from `Runtime::handle`/`Runtime::from_storage`: either the durable
-/// storage layer or the state machine's own (de)serialization step.
+/// Why a `Runtime` operation failed. The two sources are the durable storage
+/// backend and the state machine's own serialization.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError<StErr, SmErr> {
     #[error("storage error: {0}")]
@@ -72,11 +88,16 @@ pub enum RuntimeError<StErr, SmErr> {
     StateMachine(SmErr),
 }
 
-/// Shorthand for a `Runtime` result — every fallible `Runtime` method fails with
-/// either a storage error or a state-machine error, never anything else.
+/// Shorthand for a `Runtime` result. Every fallible method fails with a storage
+/// error or a state machine error and nothing else.
 type RuntimeResult<T, StErr, SmErr> = Result<T, RuntimeError<StErr, SmErr>>;
 
-/// Runtime that wraps a Raft node with timer management and durable storage.
+/// Drives a `Node`, supplying the three things it deliberately lacks: a clock,
+/// durable storage, and a state machine.
+///
+/// The node decides what should happen; the runtime makes it happen, in the
+/// order Raft requires. Sending the resulting messages is still the caller's
+/// job, which keeps the transport out of this layer.
 pub struct Runtime<Cmd, S: StateMachine<Cmd>, St> {
     node: Node<Cmd>,
     state_machine: S,
@@ -85,15 +106,16 @@ pub struct Runtime<Cmd, S: StateMachine<Cmd>, St> {
     snapshot_policy: SnapshotPolicy,
     election_deadline: Instant,
     heartbeat_deadline: Instant,
-    /// Outputs produced by applying committed entries, in log order.
-    /// Drained by the caller via take_outputs after each handle() call.
+    /// Outputs from applying committed entries, in log order. Drained by
+    /// `take_outputs`.
     pending_outputs: Vec<(Term, LogIndex, S::Output)>,
-    /// Set when the most recent `handle()` call demoted this node from leader.
-    /// Drained by `take_stepped_down` so the caller can fail pending clients fast.
+    /// Set when the most recent `handle` demoted this node from leader. Drained
+    /// by `take_stepped_down`.
     stepped_down: bool,
 }
 
 impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
+    /// Wraps `node` with the clock, storage, and state machine it needs.
     pub fn new(
         node: Node<Cmd>,
         state_machine: S,
@@ -102,9 +124,10 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         snapshot_policy: SnapshotPolicy,
     ) -> Self {
         let now = Instant::now();
-        // Randomize in [T, 2T) like Command::ResetElectionTimer does — an un-jittered
-        // initial deadline makes every node in a fresh cluster time out at once,
-        // reliably splitting the first election.
+        // Randomized between one and two election timeouts, exactly as
+        // Command::ResetElectionTimer does. A fixed initial deadline would make
+        // every node in a fresh cluster stand for election at the same instant,
+        // splitting the first vote every time.
         let jitter_ms = rand::rng().random_range(0..config.election_timeout.as_millis() as u64);
         let election_deadline = now + config.election_timeout + Duration::from_millis(jitter_ms);
         Self {
@@ -120,9 +143,17 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         }
     }
 
-    /// Restarts as follower (§5.1). If durable storage holds a snapshot, the state
-    /// machine is restored from it before any log replay — committed entries after
-    /// the snapshot boundary are then replayed lazily as the leader drives AppendEntries.
+    /// Rebuilds a runtime from durable storage, restarting as a follower
+    /// (section 5.1).
+    ///
+    /// A persisted snapshot is restored into the state machine before anything
+    /// else, since the log no longer contains the entries it covers. Committed
+    /// entries above the snapshot boundary are replayed later, as the leader
+    /// drives this node forward with AppendEntries.
+    ///
+    /// # Errors
+    /// `RuntimeError::Storage` if the persisted state cannot be read.
+    /// `RuntimeError::StateMachine` if the snapshot cannot be restored.
     pub fn from_storage(
         id: NodeId,
         initial_config: ClusterConfig,
@@ -147,26 +178,37 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         ))
     }
 
+    /// The wrapped node.
     pub fn node(&self) -> &Node<Cmd> {
         &self.node
     }
 
+    /// The state machine, for serving reads.
     pub fn state_machine(&self) -> &S {
         &self.state_machine
     }
 
+    /// Mutable access to the state machine. Bypassing `apply` with this leaves
+    /// the replicas divergent, since the change is in no log.
     pub fn state_machine_mut(&mut self) -> &mut S {
         &mut self.state_machine
     }
 
-    /// Consumes the runtime and returns its storage handle — lets a caller simulate
-    /// a crash-and-restart by feeding the same storage into `from_storage`.
+    /// Consumes the runtime and hands back its storage, so the same storage can
+    /// be fed to `from_storage` to simulate a crash and restart.
     pub fn into_storage(self) -> St {
         self.storage
     }
 
-    /// Callers must not transmit responses before this returns — §5.1 requires durable state
-    /// before responding to any RPC.
+    /// Processes one event and returns the messages the caller must send.
+    ///
+    /// State is durable by the time this returns, and not before. The caller
+    /// must therefore not transmit anything until it does, since section 5.1
+    /// forbids responding to an RPC ahead of the state that response promises.
+    ///
+    /// # Errors
+    /// `RuntimeError::Storage` if persisting fails.
+    /// `RuntimeError::StateMachine` if restoring a snapshot or taking one fails.
     pub fn handle(
         &mut self,
         event: Event<Cmd>,
@@ -194,9 +236,12 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         Ok(commands)
     }
 
-    /// Feeds an `InstallSnapshot`-installed snapshot to the state machine. A failed
-    /// restore is fatal to consistency (the state machine may be half-replaced) and
-    /// must propagate rather than being retried silently.
+    /// Feeds a snapshot accepted by `handle_install_snapshot` to the state
+    /// machine.
+    ///
+    /// A failed restore propagates rather than being retried quietly. The state
+    /// machine may be half replaced at that point, and continuing to apply
+    /// entries on top of it would diverge from the rest of the cluster.
     fn restore_snapshot_if_pending(&mut self) -> RuntimeResult<(), St::Error, S::SnapshotError> {
         if let Some(snapshot) = self.node.take_snapshot_to_restore() {
             self.state_machine
@@ -206,9 +251,12 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         Ok(())
     }
 
-    /// Snapshots and compacts the log once applied-but-uncompacted entries reach the
-    /// configured threshold. A failed snapshot is surfaced rather than swallowed — per
-    /// "errors are part of the domain" the caller decides whether to retry.
+    /// Snapshots the state machine and compacts the log once the number of
+    /// applied but uncompacted entries reaches the configured threshold.
+    ///
+    /// A failed snapshot surfaces to the caller, which decides whether to retry.
+    /// Swallowing it would let the log grow without bound behind a policy that
+    /// silently never fires.
     fn maybe_compact(&mut self) -> RuntimeResult<(), St::Error, S::SnapshotError> {
         let Some(threshold) = self.snapshot_policy.compact_threshold else {
             return Ok(());
@@ -233,14 +281,19 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         Ok(())
     }
 
-    /// True if the most recent `handle()` call demoted this node from leader.
-    /// Callers must purge any pending client responses on a true result — an
-    /// entry a caller is waiting on may never commit under the new leader.
+    /// Whether the most recent `handle` demoted this node from leader, clearing
+    /// the flag.
+    ///
+    /// On a true result the caller must fail every client it has waiting. An
+    /// uncommitted entry submitted to this node can still be overwritten by the
+    /// next leader, so waiting for it to commit may never terminate.
     pub fn take_stepped_down(&mut self) -> bool {
         std::mem::replace(&mut self.stepped_down, false)
     }
 
-    /// §5.2: leaders check the heartbeat deadline; others check the election deadline.
+    /// The event whose deadline has passed, if any. A leader watches the
+    /// heartbeat interval; every other role watches the election timeout
+    /// (section 5.2).
     pub fn poll_timers(&self) -> Option<Event<Cmd>> {
         let now = Instant::now();
 
@@ -258,7 +311,8 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         None
     }
 
-    /// Use to avoid busy-waiting: sleep until this instant, then call poll_timers.
+    /// The next instant at which `poll_timers` can return an event. Sleep until
+    /// then instead of polling in a loop.
     pub fn next_deadline(&self) -> Instant {
         if matches!(self.node.role(), Role::Leader(_)) {
             self.heartbeat_deadline
@@ -267,22 +321,34 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         }
     }
 
-    /// Returns the assigned log index. Errors if not leader — client must retry elsewhere.
+    /// Appends a client command and returns the index it landed at. The command
+    /// is not committed yet; the caller learns that from `take_outputs`.
+    ///
+    /// # Errors
+    /// `NotLeaderError` when this node is not the leader, carrying the leader to
+    /// retry against.
     pub fn submit(&mut self, command: Cmd) -> Result<LogIndex, NotLeaderError> {
         self.node.submit_command(command)
     }
 
-    /// Propose a membership change. Errors if not leader or another change is uncommitted.
+    /// Proposes a membership change and returns the index it landed at.
+    ///
+    /// # Errors
+    /// `SubmitError::NotLeader` when this node is not the leader.
+    /// `SubmitError::ConfigChangePending` when an earlier change is uncommitted.
     pub fn submit_config_change(&mut self, config: ClusterConfig) -> Result<LogIndex, SubmitError> {
         self.node.propose_config_change(config)
     }
 
-    /// Configs applied on append (before commit). Caller passes to Transport for immediate RPC routing.
+    /// Drains the configurations that took effect on append. The caller passes
+    /// these to the transport so a newly added peer becomes reachable at once.
     pub fn take_config_changes(&mut self) -> Vec<ClusterConfig> {
         self.node.take_config_changes()
     }
 
-    /// Committed config changes with their log index. Caller uses to resolve pending membership requests.
+    /// Drains the configurations that have committed, with the index of the
+    /// entry that carried each. The caller resolves the membership requests
+    /// waiting on them.
     pub fn take_committed_config_changes(&mut self) -> Vec<(LogIndex, ClusterConfig)> {
         self.node.take_committed_config_changes()
     }
@@ -308,8 +374,10 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         for command in commands {
             match command {
                 Command::ResetElectionTimer => {
-                    // §5.2: randomize in [T, 2T] so nodes time out at different moments,
-                    // preventing repeated split votes when multiple candidates start at once.
+                    // Randomized between one and two election timeouts, so that
+                    // nodes stand for election at different moments (section
+                    // 5.2). Identical deadlines produce split votes that repeat
+                    // indefinitely, since every retry collides again.
                     let base = self.config.election_timeout;
                     let jitter_ms = rand::rng().random_range(0..base.as_millis() as u64);
                     self.election_deadline =
@@ -319,15 +387,18 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
                     self.heartbeat_deadline = Instant::now() + self.config.heartbeat_interval;
                 }
                 Command::Send { .. } => {
-                    // Sending is handled by caller.
+                    // Returned to the caller, which owns the transport.
                 }
             }
         }
     }
 
-    /// Returns (term, log_index, output) triples in commit order since the last call;
-    /// drains the buffer. The term identifies which submission actually committed at
-    /// that index — see `Applied::term`.
+    /// Drains the outputs applied since the last call, in commit order, as
+    /// triples of term, index, and output.
+    ///
+    /// The term is part of the key because an index alone does not identify a
+    /// submission: a later leader can write an unrelated entry at the same
+    /// index. See `Applied::term`.
     pub fn take_outputs(&mut self) -> Vec<(Term, LogIndex, S::Output)> {
         std::mem::take(&mut self.pending_outputs)
     }
@@ -519,7 +590,7 @@ mod tests {
     fn from_storage_restores_persistent_state() {
         let mut rt = runtime(1, &[2, 3]);
 
-        // Become leader — handle() persists the no-op to storage on each call.
+        // Winning the election appends a no-op, which handle persists.
         rt.handle(Event::ElectionTimeout).unwrap();
         rt.handle(Event::Message {
             from: NodeId::from(2),
@@ -584,10 +655,11 @@ mod tests {
     fn timer_reset_on_election_timeout() {
         let mut rt = runtime(1, &[2, 3]);
 
-        // Comparing against the pre-handle deadline would be flaky now that the initial
-        // deadline is itself jittered — a small initial jitter draw could otherwise
-        // land before a large one. The real invariant: handling ElectionTimeout always
-        // pushes the deadline at least a full election_timeout past "now".
+        // Comparing against the deadline from before the call would be flaky,
+        // because the initial deadline is jittered too and a small draw here can
+        // land before a large one there. The invariant that actually holds is
+        // that handling an ElectionTimeout pushes the deadline at least one full
+        // election timeout past the current instant.
         let before = Instant::now();
         rt.handle(Event::ElectionTimeout).unwrap();
 
@@ -732,8 +804,8 @@ mod tests {
         )
         .unwrap();
 
-        // The compacted entries are gone from the log — the value can only have
-        // come from the restored state machine, not from replaying the log.
+        // The compacted entries are gone from the log, so the value can only
+        // have come from the restored state machine.
         assert!(
             restored
                 .node()
@@ -768,7 +840,8 @@ mod tests {
             },
         );
 
-        // Appended and persisted, but never acked — still uncommitted at "crash" time.
+        // Appended and persisted but never acknowledged, so it is still
+        // uncommitted when the simulated crash happens.
         rt.submit(KvCommand::Set {
             key: "counter".to_string(),
             value: "2".to_string(),
@@ -787,9 +860,9 @@ mod tests {
         )
         .unwrap();
 
-        // last_applied/commit_index start exactly at the snapshot boundary — not at
-        // zero (which would strand the state machine) and not past it (which would
-        // treat the uncommitted suffix entry as already applied).
+        // Both positions must restart exactly at the snapshot boundary. At zero
+        // the restored state machine would be replayed over; past the boundary
+        // the uncommitted suffix entry would be treated as already applied.
         assert_eq!(restored.node().volatile().commit_index, LogIndex::from(2));
         assert_eq!(restored.node().volatile().last_applied, LogIndex::from(2));
         assert_eq!(

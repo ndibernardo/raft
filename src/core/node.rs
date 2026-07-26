@@ -30,11 +30,12 @@ use crate::core::types::TermLookup;
 use crate::core::types::Vote;
 use crate::storage::Storage;
 
-/// Why `Node::submit_command` refused a client command: this node isn't the leader.
+/// Why `Node::submit_command` refused a client command: this node is not the leader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("not the leader")]
 pub struct NotLeaderError {
-    /// Best-known current leader, if this node has heard from one — the client can retry there.
+    /// The leader this node last heard from, so the client can retry there
+    /// instead of polling the cluster at random.
     pub leader_hint: Option<NodeId>,
 }
 
@@ -43,7 +44,9 @@ pub struct NotLeaderError {
 pub enum SubmitError {
     #[error("not the leader")]
     NotLeader { leader_hint: Option<NodeId> },
-    /// Single-server changes (§4.1) allow at most one uncommitted config change at a time.
+    /// An earlier `ConfigChange` is still uncommitted. The single-server-change
+    /// rule of dissertation section 4.1 permits only one in flight, because
+    /// overlapping changes can produce two disjoint majorities.
     #[error("a config change is already pending")]
     ConfigChangePending,
 }
@@ -51,36 +54,42 @@ pub enum SubmitError {
 /// Why `Node::compact_to_snapshot` refused to compact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CompactError {
-    /// `last_applied` is already at or below the current snapshot boundary —
-    /// nothing has been applied since the last compaction.
+    /// `last_applied` is at or below the current snapshot boundary, so nothing
+    /// has been applied since the last compaction.
     #[error("nothing to compact: last_applied is at or below the snapshot boundary")]
     NothingToCompact,
 }
 
-/// §Figure 2: current_term, voted_for, log. Must be written to durable storage before
-/// responding to any RPC — persisting after responding violates Raft's safety guarantees.
+/// The state Figure 2 requires on stable storage: `current_term`, `voted_for`,
+/// and the log. All of it must reach durable storage before this node responds
+/// to any RPC, since a response is a promise the node must still honour after a
+/// crash.
 ///
-/// `Node` is the single owner of the log; `save` never re-derives what changed by
-/// diffing against storage, which would silently drop a same-length conflict
-/// overwrite. Every mutation records precisely what happened — `set_term`/
-/// `set_voted_for` flag the meta dirty, `append_entry`/`merge_entries` record the
-/// exact truncation point and appended suffix — and `save` just replays that
-/// record to storage, then clears it.
+/// `Node` is the single owner of the log, and `save` never reconstructs a diff
+/// by comparing against storage. A length comparison in particular would miss a
+/// conflict overwrite that replaces entries without changing the log length.
+/// Instead every mutation records exactly what it did (`set_term` and
+/// `set_voted_for` mark the metadata dirty; `append_entry` and `merge_entries`
+/// record the truncation point and the appended suffix), and `save` replays that
+/// record to storage and clears it.
 #[derive(Debug)]
 pub struct PersistentState<Cmd> {
     current_term: Term,
     voted_for: Option<NodeId>,
     log: Log<Cmd>,
+    /// Set when the term or vote changed and storage has not seen it yet.
     meta_dirty: bool,
+    /// Index a conflict truncated the log at, pending replay to storage.
     truncated_from: Option<LogIndex>,
+    /// Entries appended since the last `save`, in index order.
     pending_append: Vec<LogEntry<Cmd>>,
-    /// Recorded by `compact_to_snapshot`/`handle_install_snapshot`, replayed by
-    /// `save` as `storage.install_snapshot(...)`, then cleared — same
-    /// record-then-replay pattern as `truncated_from`/`pending_append`.
+    /// Snapshot recorded by `compact_to_snapshot` or `handle_install_snapshot`,
+    /// replayed by `save` as `storage.install_snapshot` and then cleared. Same
+    /// record-then-replay pattern as `truncated_from` and `pending_append`.
     pending_snapshot_install: Option<Snapshot>,
-    /// The most recently installed snapshot, kept for the leader send path
-    /// (building `InstallSnapshot` RPCs) — unlike `pending_snapshot_install`,
-    /// this persists for the node's lifetime, not just until the next `save`.
+    /// The most recent snapshot, retained for the leader send path that builds
+    /// `InstallSnapshot` RPCs. Unlike `pending_snapshot_install` it lives for the
+    /// node's lifetime rather than until the next `save`.
     latest_snapshot: Option<Snapshot>,
 }
 
@@ -98,22 +107,29 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         }
     }
 
+    /// Highest term this node has seen.
     pub fn current_term(&self) -> Term {
         self.current_term
     }
 
+    /// Candidate this node voted for in `current_term`, if any.
     pub fn voted_for(&self) -> Option<NodeId> {
         self.voted_for
     }
 
+    /// The replicated log.
     pub fn log(&self) -> &Log<Cmd> {
         &self.log
     }
 
+    /// The most recent snapshot, or `None` if the log was never compacted and no
+    /// leader ever installed one.
     pub fn latest_snapshot(&self) -> Option<&Snapshot> {
         self.latest_snapshot.as_ref()
     }
 
+    /// Records a new term, marking the metadata dirty only on an actual change
+    /// so an unchanged term does not force a needless durable write.
     fn set_term(&mut self, term: Term) {
         if term != self.current_term {
             self.current_term = term;
@@ -121,6 +137,7 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         }
     }
 
+    /// Records a vote, marking the metadata dirty only on an actual change.
     fn set_voted_for(&mut self, candidate: Option<NodeId>) {
         if candidate != self.voted_for {
             self.voted_for = candidate;
@@ -128,15 +145,16 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         }
     }
 
-    /// Leader-side: append one entry to the tail. Returns its assigned index.
+    /// Leader-side append of one entry to the tail. Returns its assigned index.
     fn append_entry(&mut self, entry: LogEntry<Cmd>) -> LogIndex {
         let index = self.log.append(entry.clone());
         self.pending_append.push(entry);
         index
     }
 
-    /// Follower-side §5.3 conflict resolution — delegates to `Log::merge` and
-    /// records exactly what it did so `save` can tell storage the same thing.
+    /// Follower-side conflict resolution (section 5.3). Delegates to
+    /// `Log::merge` and records the resulting truncation point and suffix, so
+    /// `save` can hand storage the identical change.
     fn merge_entries(&mut self, prev_index: LogIndex, entries: Vec<LogEntry<Cmd>>) -> MergeOutcome {
         let before_len = self.log.len();
         let outcome = self.log.merge(prev_index, entries);
@@ -156,11 +174,15 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         outcome
     }
 
+    /// Reads term, vote, snapshot, and log back from durable storage.
+    ///
+    /// # Errors
+    /// Whatever the storage backend reports.
     pub fn load<S: Storage<Cmd>>(storage: &S) -> Result<Self, S::Error> {
         let loaded = storage.load()?;
-        // A persisted snapshot fixes the log's index offset — `from_entries`
-        // would otherwise treat the already-reconciled suffix as starting at
-        // index 1, corrupting every index arithmetic downstream.
+        // A persisted snapshot fixes the log's index offset. `from_entries`
+        // would place the surviving suffix at index 1 instead, shifting every
+        // index in the log by the size of the compacted prefix.
         let log = match &loaded.snapshot {
             Some(snapshot) => Log::from_snapshot_and_suffix(
                 snapshot.meta.last_index,
@@ -181,6 +203,16 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         })
     }
 
+    /// Replays every recorded change to storage and clears the record.
+    ///
+    /// The order is fixed: metadata, then snapshot install, then truncation,
+    /// then append. A truncation applied before its snapshot, or an append
+    /// before the truncation that makes room for it, would leave storage
+    /// holding entries the in-memory log has already discarded.
+    ///
+    /// # Errors
+    /// Whatever the storage backend reports. The uncompleted part of the record
+    /// is retained, so a later `save` can retry it.
     pub fn save<S: Storage<Cmd>>(&mut self, storage: &mut S) -> Result<(), S::Error> {
         if self.meta_dirty {
             storage.set_meta(self.current_term, self.voted_for)?;
@@ -199,24 +231,31 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         Ok(())
     }
 
-    /// Discard-case `InstallSnapshot`: wipes the local log and records the
-    /// truncation so `save` clears any stale suffix in storage. Storage-side
-    /// `install_snapshot` only runs `compact_through`, which keeps entries
-    /// above the boundary — without this, a suffix discarded here would
-    /// survive on disk and diverge from the in-memory log after restart.
+    /// Wipes the local log for the discard case of `InstallSnapshot` and records
+    /// the truncation so `save` also clears the stale suffix in storage.
+    ///
+    /// The storage-side `install_snapshot` compacts through the boundary and
+    /// keeps everything above it. Without the recorded truncation, a suffix
+    /// discarded here would survive on disk and reappear at the next restart,
+    /// diverging from the snapshot that replaced it.
     fn discard_to_snapshot(&mut self, last_index: LogIndex, last_term: Term) {
         self.log.reset_to_snapshot(last_index, last_term);
         self.truncated_from = Some(last_index.next());
     }
 }
 
-/// §Figure 2: commit_index and last_applied. Reset to zero on every restart — not persisted.
+/// The volatile state of Figure 2. Not persisted: both fields restart at the
+/// snapshot boundary, or at zero when there is no snapshot, and are rebuilt by
+/// replaying the log.
 #[derive(Debug)]
 pub struct VolatileState {
+    /// Highest index known to be committed, meaning replicated on a majority.
     pub commit_index: LogIndex,
+    /// Highest index handed to the state machine.
     pub last_applied: LogIndex,
 }
 
+/// The role a node currently occupies, holding the state specific to it.
 #[derive(Debug)]
 pub enum Role {
     Follower(Follower),
@@ -228,36 +267,50 @@ pub enum Role {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Applied<'a, Cmd> {
     pub index: LogIndex,
-    /// Term of the entry actually committed at `index` — not necessarily the term the
-    /// submitting client saw. Callers key pending responses on `(term, index)` so a
-    /// later leader's unrelated entry landing at the same index can never be mistaken
-    /// for the original submission.
+    /// Term of the entry that actually committed at `index`, which is not
+    /// necessarily the term the submitting client observed. Callers key pending
+    /// client responses on the pair of term and index, so an unrelated entry
+    /// written at the same index by a later leader cannot be mistaken for the
+    /// original submission.
     pub term: Term,
     pub command: &'a Cmd,
 }
 
+/// A single Raft server, implemented as a pure state machine.
+///
+/// Every entry point takes an event (a timeout, an incoming message, a client
+/// submission), mutates this node's state, and returns the `Command`s the driver
+/// must carry out. Nothing here performs I/O or reads a clock, which is what
+/// makes the whole protocol deterministically testable.
 #[derive(Debug)]
 pub struct Node<Cmd> {
     id: NodeId,
-    /// Current effective cluster config (from latest ConfigChange in log, or initial_config).
+    /// Cluster configuration currently in force, taken from the latest
+    /// `ConfigChange` in the log, or from `initial_config` when there is none.
     config: ClusterConfig,
-    /// Config at startup — used as the floor when rescanning the log after a truncation
-    /// removes all ConfigChange entries.
+    /// Configuration this node booted with. Serves as the fallback when a
+    /// rescan finds no `ConfigChange` in the log and no snapshot to fall back
+    /// to, which happens after a truncation removes the only one there was.
     initial_config: ClusterConfig,
     persistent: PersistentState<Cmd>,
     volatile: VolatileState,
     role: Role,
-    /// Configs applied on append (before commit). Drained by Runtime → Transport.
+    /// Configurations that took effect on append, before commit. The runtime
+    /// drains these and passes them to the transport, so RPCs can reach a newly
+    /// added peer immediately.
     pending_config_changes: Vec<ClusterConfig>,
-    /// Configs that have just been committed. Drained by Server to resolve HTTP requests.
+    /// Configurations that have just committed. The server drains these to
+    /// resolve the client requests that proposed them.
     pending_committed_config_changes: Vec<(LogIndex, ClusterConfig)>,
-    /// A snapshot installed via `handle_install_snapshot`, awaiting the
-    /// Runtime's `state_machine.restore()` call. Drained by `take_snapshot_to_restore`.
+    /// A snapshot accepted by `handle_install_snapshot` and awaiting the
+    /// runtime's call to `StateMachine::restore`. Drained by
+    /// `take_snapshot_to_restore`.
     pending_snapshot_restore: Option<Snapshot>,
 }
 
 impl<Cmd: Clone> Node<Cmd> {
-    /// Starts as follower with no known leader (§5.1 initial state).
+    /// A fresh node at term 0, starting as a follower with no known leader, as
+    /// section 5.1 requires.
     pub fn new(id: NodeId, config: ClusterConfig) -> Self {
         Self {
             id,
@@ -275,17 +328,21 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Crash recovery: restore term, vote, and log from durable storage, restart as follower.
-    /// Derives the current config from the latest ConfigChange entry in the restored log.
+    /// Restores a node after a crash: term, vote, and log come from durable
+    /// storage, and the role restarts as follower. The active configuration is
+    /// derived from the restored log rather than from `initial_config`.
+    ///
+    /// # Errors
+    /// Whatever the storage backend reports while loading.
     pub fn from_storage<S: Storage<Cmd>>(
         id: NodeId,
         initial_config: ClusterConfig,
         storage: &S,
     ) -> Result<Self, S::Error> {
         let persistent = PersistentState::load(storage)?;
-        // A restored snapshot already covers everything up to its boundary — starting
-        // at zero would make take_entry_to_apply replay committed entries the snapshot
-        // (and the state machine restored from it) already reflect, double-applying them.
+        // A restored snapshot already covers everything up to its boundary. From
+        // zero, take_entry_to_apply would replay entries the restored state
+        // machine already reflects, applying them a second time.
         let boundary = persistent.log().snapshot_last_index();
         let mut node = Self {
             id,
@@ -301,13 +358,18 @@ impl<Cmd: Clone> Node<Cmd> {
             pending_committed_config_changes: Vec::new(),
             pending_snapshot_restore: None,
         };
-        // Replay the latest config from the restored log so peers and transport
-        // are updated correctly on restart.
+        // The restored log may carry a membership this node was unaware of when
+        // it booted, so the peer set has to be rebuilt from it.
         node.apply_latest_config_from_log();
         Ok(node)
     }
 
-    /// Must be called before responding to any RPC (§5.1 durability requirement).
+    /// Flushes pending state to durable storage. The driver must call this
+    /// before it sends any of the returned commands, per the durability
+    /// requirement of section 5.1.
+    ///
+    /// # Errors
+    /// Whatever the storage backend reports.
     pub fn save<S: Storage<Cmd>>(&mut self, storage: &mut S) -> Result<(), S::Error> {
         self.persistent.save(storage)
     }
@@ -322,23 +384,24 @@ impl<Cmd: Clone> Node<Cmd> {
         &self.role
     }
 
-    /// Current effective cluster config.
+    /// Cluster configuration currently in force.
     pub fn config(&self) -> &ClusterConfig {
         &self.config
     }
 
-    /// Read-only view of term/vote/log — mutation is internal to `Node`.
+    /// Read-only view of term, vote, and log. Mutation is internal to `Node`.
     pub fn persistent(&self) -> &PersistentState<Cmd> {
         &self.persistent
     }
 
-    /// Read-only view of commit_index/last_applied — mutation is internal to `Node`.
+    /// Read-only view of the commit and apply positions. Mutation is internal
+    /// to `Node`.
     pub fn volatile(&self) -> &VolatileState {
         &self.volatile
     }
 
-    /// All member IDs except this node's own — derived from `config` on demand rather
-    /// than cached, so it can never desynchronize from it.
+    /// Every member except this node. Derived from `config` on each call rather
+    /// than cached, so it cannot drift out of step with a membership change.
     fn peer_ids(&self) -> Vec<NodeId> {
         self.config.peer_ids(self.id)
     }
@@ -347,9 +410,13 @@ impl<Cmd: Clone> Node<Cmd> {
         self.persistent.log.last_index()
     }
 
-    /// Convert to follower state. Only resets voted_for when moving to a newer term —
-    /// stepping down within the same term (e.g. candidate hearing from current leader)
-    /// must preserve the existing vote to uphold the at-most-one-vote-per-term invariant.
+    /// Steps down to follower in `term`, optionally recording the leader.
+    ///
+    /// The vote is cleared only when moving to a strictly newer term. Stepping
+    /// down within the current term, as a candidate does when it hears from the
+    /// leader of that term, has to keep the existing vote: this node already
+    /// voted for itself, and forgetting that would let it vote a second time in
+    /// the same term.
     fn become_follower(&mut self, term: Term, leader_id: Option<NodeId>) {
         if term > self.persistent.current_term {
             self.persistent.set_term(term);
@@ -369,8 +436,11 @@ impl<Cmd: Clone> Node<Cmd> {
         self.persistent.log.last_term()
     }
 
-    /// Apply a new cluster config: updates peers, leader tracking maps, and emits a
-    /// pending notification so the transport is updated before the next heartbeat.
+    /// Adopts `config` as the active membership.
+    ///
+    /// Adds and removes peers in the leader's replication maps to match, and
+    /// queues the configuration for the transport so a newly added peer is
+    /// reachable before the next heartbeat goes out.
     fn set_config(&mut self, config: ClusterConfig) {
         let old_peers: HashSet<NodeId> = self.peer_ids().into_iter().collect();
         let new_peers: HashSet<NodeId> = config.peer_ids(self.id).into_iter().collect();
@@ -393,11 +463,17 @@ impl<Cmd: Clone> Node<Cmd> {
         self.pending_config_changes.push(config);
     }
 
-    /// Scan the log backward for the latest ConfigChange entry and apply it.
-    /// Called after a truncation (which may have removed a previously active config)
-    /// and on startup (to replay the config from a recovered log). Falls back to the
-    /// snapshot's config (if any) before `initial_config` — a compacted prefix may
-    /// have discarded the only ConfigChange entry that ever existed.
+    /// Scans the log backward for the newest `ConfigChange` and adopts it.
+    ///
+    /// Called after a truncation, which may have removed the entry that
+    /// established the active configuration, and at startup to recover the
+    /// configuration from a restored log.
+    ///
+    /// The fallback order is the log, then the snapshot's configuration, then
+    /// `initial_config`. The snapshot has to come before `initial_config`
+    /// because compaction may have discarded the only `ConfigChange` entry that
+    /// ever existed, and reverting to the boot configuration would resurrect a
+    /// membership the cluster has already moved past.
     fn apply_latest_config_from_log(&mut self) {
         let latest = self.persistent.log.iter().rev().find_map(|e| {
             if let LogPayload::ConfigChange(c) = &e.payload {
@@ -419,7 +495,9 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Leaders ignore; followers and candidates start a new election.
+    /// Handles the election timeout firing. Followers and candidates start a new
+    /// election; a leader has nothing to do, since it is the reason the timeout
+    /// should not have fired elsewhere.
     pub fn election_timeout(&mut self) -> Vec<Command<Cmd>> {
         match &self.role {
             Role::Leader(_) => Vec::new(),
@@ -436,7 +514,8 @@ impl<Cmd: Clone> Node<Cmd> {
 
         let peers = self.peer_ids();
 
-        // Single node cluster: already have majority with own vote.
+        // In a single-node cluster the candidate's own vote is already a
+        // majority, and there is no peer to wait for.
         let cluster_size = peers.len() + 1;
         if cluster_size == 1 {
             return self.become_leader();
@@ -460,7 +539,7 @@ impl<Cmd: Clone> Node<Cmd> {
         commands
     }
 
-    /// §Figure 2 RequestVote RPC — receiver implementation.
+    /// Receiver implementation of the RequestVote RPC (Figure 2).
     pub fn handle_request_vote(&mut self, from: NodeId, req: RequestVote) -> Vec<Command<Cmd>> {
         let mut reset_timer = false;
         if req.term > self.persistent.current_term {
@@ -492,9 +571,11 @@ impl<Cmd: Clone> Node<Cmd> {
         commands
     }
 
-    /// Grant vote only if all three conditions hold. Figure 2, RequestVote RPC §1–2:
-    /// (1) candidate's term is current, (2) we haven't voted for someone else this term,
-    /// (3) candidate's log is at least as up-to-date as ours (§5.4.1).
+    /// Whether to grant the vote. All three conditions of the RequestVote
+    /// receiver in Figure 2 must hold: the candidate's term is not stale, this
+    /// node has not already voted for a different candidate in that term, and
+    /// the candidate's log is at least as up to date as this one (section
+    /// 5.4.1).
     fn should_grant_vote(&self, req: &RequestVote) -> bool {
         let term_ok = req.term >= self.persistent.current_term;
         let vote_ok = match self.persistent.voted_for {
@@ -506,12 +587,14 @@ impl<Cmd: Clone> Node<Cmd> {
         term_ok && vote_ok && log_ok
     }
 
-    /// §5.4.1: compare last-entry term first, then index.
+    /// The up-to-date comparison of section 5.4.1: the later last-entry term
+    /// wins, and the longer log breaks a tie on equal terms.
     fn is_log_up_to_date(&self, candidate_term: Term, candidate_index: LogIndex) -> bool {
         (candidate_term, candidate_index) >= (self.last_log_term(), self.last_log_index())
     }
 
-    /// Step down on higher term; become leader on majority.
+    /// Handles a RequestVote response: steps down on a higher term, and becomes
+    /// leader once the granted votes form a majority.
     pub fn handle_request_vote_response(
         &mut self,
         from: NodeId,
@@ -525,9 +608,9 @@ impl<Cmd: Clone> Node<Cmd> {
             return vec![Command::ResetElectionTimer];
         }
 
-        // A vote from outside the current config must not count toward the majority —
-        // transport has no authentication, and a removed member's stale response must
-        // not be able to hand out an election win.
+        // A vote from a server outside the current configuration must not count.
+        // The transport is unauthenticated, so a removed member, or anything
+        // able to spoof one, could otherwise supply the deciding vote.
         let membership = self.config.membership_of(from);
         let cluster_size = self.peer_ids().len() + 1;
         let dominated = match &mut self.role {
@@ -553,8 +636,15 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// §8: no-op entry commits prior-term entries indirectly via Log Matching, avoiding the
-    /// Figure 8 anomaly where a leader cannot directly commit entries from previous terms.
+    /// Assumes leadership: appends a no-op entry, initializes replication state,
+    /// and sends the first round of heartbeats.
+    ///
+    /// The no-op exists because of the Figure 8 anomaly (section 8). A leader
+    /// may not commit an entry from an earlier term by counting replicas, so
+    /// entries inherited from a predecessor would otherwise stay uncommitted
+    /// until new traffic arrives. Committing the no-op, which belongs to the
+    /// current term, commits everything before it through the Log Matching
+    /// Property.
     fn become_leader(&mut self) -> Vec<Command<Cmd>> {
         self.persistent.append_entry(LogEntry {
             term: self.persistent.current_term,
@@ -565,7 +655,8 @@ impl<Cmd: Clone> Node<Cmd> {
         self.send_heartbeats()
     }
 
-    /// Leaders replicate and reset the heartbeat timer; non-leaders are no-ops.
+    /// Handles the heartbeat interval firing. Leaders replicate and restart the
+    /// timer; every other role ignores it.
     pub fn heartbeat_timeout(&mut self) -> Vec<Command<Cmd>> {
         match &self.role {
             Role::Leader(_) => self.send_heartbeats(),
@@ -573,15 +664,22 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    // §5.3: prev_log_index/term lets the follower detect a gap before accepting new entries.
+    /// Builds one replication message per tracked peer.
+    ///
+    /// Each peer gets an AppendEntries carrying everything from its `next_index`
+    /// onward, prefixed with the index and term immediately before it so the
+    /// follower can detect a gap before accepting anything (section 5.3). A peer
+    /// whose `next_index` has already been compacted away gets an
+    /// InstallSnapshot instead. With nothing to replicate, the AppendEntries is
+    /// empty and serves as the heartbeat.
     fn send_heartbeats(&self) -> Vec<Command<Cmd>> {
         let Role::Leader(leader) = &self.role else {
             return Vec::new();
         };
 
-        // Collect tracked peers upfront to avoid a borrow-checker conflict: the iterator
-        // borrows `leader` (which borrows `self.role`), but the loop body also needs `&self`
-        // to call term_at / entries_from.
+        // Collected up front because the iterator borrows `leader`, and so
+        // `self.role`, while the loop body needs `&self` for term_at and
+        // entries_from.
         let peers: Vec<NodeId> = leader.tracked_peers().collect();
         let mut commands = Vec::new();
 
@@ -590,9 +688,9 @@ impl<Cmd: Clone> Node<Cmd> {
                 .next_index_for(peer)
                 .unwrap_or_else(|| self.last_log_index().next());
 
-            // The entry at next_index - 1 has already been compacted away: an
-            // AppendEntries here could never carry a valid prev_log_index, so
-            // the peer needs the whole compacted prefix via InstallSnapshot instead.
+            // The entry preceding next_index has been compacted away, so no
+            // AppendEntries could carry a prev_log_index this leader can still
+            // prove. The peer needs the compacted prefix as a snapshot.
             if next_index <= self.persistent.log.snapshot_last_index()
                 && let Some(snapshot) = &self.persistent.latest_snapshot
             {
@@ -632,22 +730,24 @@ impl<Cmd: Clone> Node<Cmd> {
         commands
     }
 
+    /// Term at `index`, collapsing the unavailable cases to term 0.
     fn term_at(&self, index: LogIndex) -> Term {
         match self.persistent.log.term_at(index) {
             TermLookup::Known(term) => term,
-            // send_heartbeats routes any next_index at or below the snapshot boundary
-            // to InstallSnapshot instead, so prev_log_index here is always above the
-            // boundary — Compacted should be unreachable; self-check the invariant.
+            // send_heartbeats routes any peer whose next_index sits at or below
+            // the snapshot boundary to InstallSnapshot, so a compacted index
+            // cannot reach this point. Assert the invariant rather than trust it.
             TermLookup::Compacted => {
                 debug_assert!(
                     false,
-                    "term_at called with a compacted index — send_heartbeats must have \
-                     routed this peer to InstallSnapshot instead"
+                    "term_at called with a compacted index; send_heartbeats must \
+                     route this peer to InstallSnapshot instead"
                 );
                 Term::default()
             }
-            // Reachable defensively (e.g. a probe just past the leader's own tail); no
-            // invariant to assert here.
+            // Reachable, for instance when probing one position past the
+            // leader's own tail. Term 0 never matches a real entry, so the
+            // follower correctly rejects the consistency check.
             TermLookup::BeyondEnd => Term::default(),
         }
     }
@@ -656,7 +756,7 @@ impl<Cmd: Clone> Node<Cmd> {
         self.persistent.log.suffix_from(start).to_vec()
     }
 
-    /// §Figure 2 AppendEntries RPC — receiver implementation.
+    /// Receiver implementation of the AppendEntries RPC (Figure 2).
     pub fn handle_append_entries(
         &mut self,
         from: NodeId,
@@ -675,13 +775,14 @@ impl<Cmd: Clone> Node<Cmd> {
             }];
         }
 
-        // §5.2: a candidate that hears from a leader in its own term must step down.
-        // voted_for is kept — we already voted for ourselves this term and that is valid.
+        // A candidate that hears from a leader of its own term concedes the
+        // election (section 5.2). The vote survives the step-down, since this
+        // node's vote for itself in this term remains valid.
         if matches!(self.role, Role::Candidate(_)) {
             self.become_follower(req.term, Some(req.leader_id));
         }
 
-        // Valid AppendEntries from current leader.
+        // The request is from the current leader, so record it for redirection.
         if let Role::Follower(follower) = &mut self.role {
             follower.set_leader(req.leader_id);
         }
@@ -720,12 +821,15 @@ impl<Cmd: Clone> Node<Cmd> {
         commands
     }
 
-    /// §5.3 Log Matching: reject if prev_log_index/term don't match our log (Figure 2 §2).
+    /// Rule 2 of the AppendEntries receiver in Figure 2: whether this log holds
+    /// `prev_log_term` at `prev_log_index` (section 5.3, Log Matching).
     fn check_log_consistency(&self, prev_log_index: LogIndex, prev_log_term: Term) -> bool {
         self.persistent.log.matches(prev_log_index, prev_log_term)
     }
 
-    /// Non-leaders and stale terms are no-ops; leaders update replication progress.
+    /// Handles an AppendEntries response. A leader advances or backs off the
+    /// peer's replication state and recomputes the commit index; a stale term or
+    /// any other role is ignored.
     pub fn handle_append_entries_response(
         &mut self,
         from: NodeId,
@@ -760,8 +864,10 @@ impl<Cmd: Clone> Node<Cmd> {
         Vec::new()
     }
 
-    /// Best-known current leader, for redirecting a client that reached the wrong node.
-    /// `None` for a leader (self is the answer) or a candidate (no leader known this term).
+    /// The leader to redirect a misdirected client to.
+    ///
+    /// `None` on a leader, where this node is the answer, and on a candidate,
+    /// which has not yet heard from a leader in its term.
     pub fn leader_hint(&self) -> Option<NodeId> {
         match &self.role {
             Role::Follower(follower) => follower.leader_id(),
@@ -769,7 +875,13 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Appends a command to the log. Errors if this node isn't the leader.
+    /// Appends a client command to the log and returns the index it landed at.
+    /// The entry is not yet committed; the caller learns that through
+    /// `take_entry_to_apply`.
+    ///
+    /// # Errors
+    /// `NotLeaderError` when this node is not the leader, carrying the leader
+    /// hint to retry against.
     pub fn submit_command(&mut self, command: Cmd) -> Result<LogIndex, NotLeaderError> {
         if !matches!(self.role, Role::Leader(_)) {
             return Err(NotLeaderError {
@@ -786,14 +898,16 @@ impl<Cmd: Clone> Node<Cmd> {
         Ok(index)
     }
 
-    /// Propose a membership change. Returns the log index of the ConfigChange entry.
+    /// Proposes a membership change and returns the index of the `ConfigChange`
+    /// entry.
     ///
-    /// The new config takes effect immediately on append (dissertation §4.1).
+    /// The new configuration governs quorum decisions from the moment it is
+    /// appended, before it commits (dissertation section 4.1).
     ///
     /// # Errors
-    /// `SubmitError::NotLeader` — this node isn't the leader.
-    /// `SubmitError::ConfigChangePending` — another change is already uncommitted;
-    /// single-server changes (§4.1) allow at most one in flight.
+    /// `SubmitError::NotLeader` when this node is not the leader.
+    /// `SubmitError::ConfigChangePending` when an earlier change is still
+    /// uncommitted, which the single-server-change rule forbids.
     pub fn propose_config_change(
         &mut self,
         config: ClusterConfig,
@@ -812,15 +926,16 @@ impl<Cmd: Clone> Node<Cmd> {
             payload: LogPayload::ConfigChange(config.clone()),
         };
         let index = self.persistent.append_entry(entry);
-        // Takes effect immediately on append — quorum calculations use the new config
-        // before the entry is committed.
+        // Quorum calculations must use the new membership from this point on. A
+        // leader that kept counting the old majority while the new one is live
+        // could commit an entry the new configuration never agreed to.
         self.set_config(config);
         info!(node = %self.id, term = %self.persistent.current_term, index = %index, members = self.config.size(), "config change proposed");
         Ok(index)
     }
 
-    /// Returns true if there is a ConfigChange entry in the uncommitted suffix.
-    /// Used to enforce the one-change-at-a-time rule of single-server changes.
+    /// Whether the uncommitted suffix holds a `ConfigChange`. Enforces the
+    /// one-change-at-a-time rule of single-server membership changes.
     fn has_pending_config_change(&self) -> bool {
         let committed = self.volatile.commit_index;
         self.persistent.log.iter().enumerate().any(|(i, e)| {
@@ -829,29 +944,34 @@ impl<Cmd: Clone> Node<Cmd> {
         })
     }
 
-    /// Figure 2, Rules for Servers (Leaders): if there exists N > commitIndex such that a
-    /// majority of matchIndex[i] >= N and log[N].term == currentTerm, set commitIndex = N.
-    /// §5.4.2, Figure 8: a leader may only commit entries from its current term directly;
-    /// earlier entries are committed indirectly by the Log Matching Property.
+    /// Recomputes the commit index from the leader's replication state.
+    ///
+    /// Figure 2, Rules for Servers (Leaders): if some index N above
+    /// `commit_index` is matched by a majority and the entry at N belongs to the
+    /// current term, commit through N. The term condition is the Figure 8
+    /// restriction of section 5.4.2: an entry from an earlier term may not be
+    /// committed by replica count, because a later leader could still overwrite
+    /// it. Such entries commit indirectly once a current-term entry above them
+    /// commits.
     fn advance_commit_index(&mut self) {
         let Role::Leader(leader) = &self.role else {
             return;
         };
 
-        // Collect match indices including leader's own implicit match.
+        // The leader stores every entry it has appended, so its own log position
+        // counts toward the quorum alongside the tracked peers.
         let mut match_indices: Vec<LogIndex> = leader.match_indices().collect();
         match_indices.push(self.last_log_index());
         match_indices.sort();
 
-        // Majority position: with N nodes, need (N/2 + 1) replicas.
-        // Sorted ascending, so match_indices[len/2] is the median.
+        // Sorted ascending, the element at len/2 is the highest index that a
+        // majority of len servers have reached.
         let majority_pos = match_indices.len() / 2;
         let majority_index = match_indices[majority_pos];
 
-        // Only commit if entry is from current term (Figure 8 safety). Uses
-        // term_at (not entry()) so a majority_index sitting exactly at the
-        // snapshot boundary — its entry gone via compaction — is still checked
-        // correctly via the boundary's preserved term.
+        // term_at rather than entry(), so that a majority index landing exactly
+        // on the snapshot boundary is still checked against the term the
+        // boundary preserved after its entry was compacted away.
         let has_higher_index = majority_index > self.volatile.commit_index;
         let is_current_term = matches!(
             self.persistent.log.term_at(majority_index),
@@ -864,13 +984,17 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// True when commit_index has advanced past last_applied.
+    /// Whether any committed entry has yet to be applied.
     pub fn has_pending_applies(&self) -> bool {
         self.volatile.commit_index > self.volatile.last_applied
     }
 
-    /// §5.3: no-op and config-change entries advance last_applied but are not returned
-    /// to the caller. Config changes are buffered in pending_committed_config_changes.
+    /// Advances `last_applied` to the next committed command and returns it, or
+    /// `None` once everything committed has been applied.
+    ///
+    /// No-op and `ConfigChange` entries advance `last_applied` without being
+    /// returned, since the state machine has no use for them. A committed
+    /// `ConfigChange` is buffered for `take_committed_config_changes` instead.
     pub fn take_entry_to_apply(&mut self) -> Option<Applied<'_, Cmd>> {
         loop {
             if self.volatile.last_applied >= self.volatile.commit_index {
@@ -885,8 +1009,9 @@ impl<Cmd: Clone> Node<Cmd> {
             match &entry.payload {
                 LogPayload::NoOp => {}
                 LogPayload::ConfigChange(cfg) => {
-                    // Already applied to self.config on append.
-                    // Buffer the commit notification for Server to resolve HTTP requests.
+                    // The membership itself took effect back when the entry was
+                    // appended. Only the commit notification is outstanding, so
+                    // the server can answer the request that proposed it.
                     let cfg = cfg.clone();
                     self.pending_committed_config_changes.push((index, cfg));
                 }
@@ -901,21 +1026,22 @@ impl<Cmd: Clone> Node<Cmd> {
         }
     }
 
-    /// Newly applied (appended, not necessarily committed) configs.
-    /// Runtime passes these to Transport so RPCs to new peers can be sent immediately.
+    /// Drains the configurations that took effect on append, whether or not they
+    /// have committed. The runtime forwards these to the transport so RPCs can
+    /// reach a newly added peer straight away.
     pub fn take_config_changes(&mut self) -> Vec<ClusterConfig> {
         std::mem::take(&mut self.pending_config_changes)
     }
 
-    /// Committed config changes with their log index.
-    /// Server uses these to resolve pending membership HTTP requests.
+    /// Drains the configurations that have committed, paired with the index of
+    /// the entry that carried them. The server uses these to resolve the
+    /// membership requests waiting on them.
     pub fn take_committed_config_changes(&mut self) -> Vec<(LogIndex, ClusterConfig)> {
         std::mem::take(&mut self.pending_committed_config_changes)
     }
 
-    /// §5.3 Figure 2 AppendEntries §3–5: truncates on conflict (same index, different term).
-    /// Calls apply_latest_config_from_log if a truncation occurred or a ConfigChange was added,
-    /// because a truncation may have removed a previously active config.
+    /// Grafts a leader's entries onto the log, truncating on conflict, per rules
+    /// 3 to 5 of the AppendEntries receiver in Figure 2 (section 5.3).
     fn append_entries(&mut self, prev_log_index: LogIndex, entries: Vec<LogEntry<Cmd>>) {
         let has_config_entry = entries
             .iter()
@@ -926,17 +1052,20 @@ impl<Cmd: Clone> Node<Cmd> {
             debug!(node = %self.id, prev_index = %prev_log_index, "log truncated on conflict");
         }
 
-        // A truncation may have removed a previously active ConfigChange; a newly
-        // appended ConfigChange must also trigger a rescan to become the active config.
+        // A truncation may have removed the entry that established the active
+        // membership, and a newly arrived ConfigChange has to become active. The
+        // rescan resolves both cases against the same fallback order.
         if matches!(outcome, MergeOutcome::Truncated { .. }) || has_config_entry {
             self.apply_latest_config_from_log();
         }
     }
 
-    /// The cluster config active as of `index`, without reading past it. `self.config`
-    /// reflects config changes as of the log tail (changes take effect on append, not
-    /// commit — dissertation §4.1), so it cannot be used directly whenever a later
-    /// ConfigChange exists beyond `index`; this rescans the prefix in that case.
+    /// The membership in force at `index`, ignoring anything appended after it.
+    ///
+    /// `self.config` tracks the log tail, because a change takes effect on
+    /// append rather than on commit (dissertation section 4.1). It is therefore
+    /// wrong for a snapshot taken at `index` whenever a later `ConfigChange`
+    /// exists, and the prefix has to be rescanned in that case.
     fn config_as_of(&self, index: LogIndex) -> ClusterConfig {
         let has_later_config_change = self
             .persistent
@@ -970,12 +1099,17 @@ impl<Cmd: Clone> Node<Cmd> {
             .unwrap_or_else(|| self.initial_config.clone())
     }
 
-    /// Compacts the log through `last_applied`, using the serialized state machine
-    /// data the caller (Runtime, which owns the state machine) supplies.
+    /// Compacts the log through `last_applied` and returns the resulting
+    /// snapshot.
+    ///
+    /// The caller supplies `data`, since the runtime owns the state machine and
+    /// this node cannot serialize it. Compacting through `last_applied` rather
+    /// than `commit_index` is what makes the snapshot self-consistent: those
+    /// entries are already reflected in the bytes handed in.
     ///
     /// # Errors
-    /// `CompactError::NothingToCompact` — nothing has been applied since the last
-    /// compaction.
+    /// `CompactError::NothingToCompact` when nothing has been applied since the
+    /// previous compaction.
     pub fn compact_to_snapshot(&mut self, data: SnapshotData) -> Result<Snapshot, CompactError> {
         let last_index = self.volatile.last_applied;
         if last_index <= self.persistent.log.snapshot_last_index() {
@@ -1001,14 +1135,15 @@ impl<Cmd: Clone> Node<Cmd> {
         Ok(snapshot)
     }
 
-    /// Snapshot buffered by `handle_install_snapshot`, awaiting the Runtime's
-    /// `state_machine.restore()` call. Drained so a re-poll doesn't restore twice.
+    /// Takes the snapshot buffered by `handle_install_snapshot` so the runtime
+    /// can hand it to `StateMachine::restore`. Draining rather than borrowing
+    /// means a second poll cannot restore the same snapshot twice.
     pub fn take_snapshot_to_restore(&mut self) -> Option<Snapshot> {
         self.pending_snapshot_restore.take()
     }
 
-    /// §7 InstallSnapshot RPC — receiver implementation (single-message variant,
-    /// no offset/done chunking).
+    /// Receiver implementation of the InstallSnapshot RPC (section 7), in the
+    /// single-message variant without offset and done chunking.
     pub fn handle_install_snapshot(
         &mut self,
         from: NodeId,
@@ -1027,7 +1162,8 @@ impl<Cmd: Clone> Node<Cmd> {
         if req.term > self.persistent.current_term {
             self.become_follower(req.term, Some(req.leader_id));
         }
-        // §5.2: a candidate that hears from a leader in its own term must step down.
+        // A candidate that hears from a leader of its own term concedes the
+        // election (section 5.2).
         if matches!(self.role, Role::Candidate(_)) {
             self.become_follower(req.term, Some(req.leader_id));
         }
@@ -1040,7 +1176,9 @@ impl<Cmd: Clone> Node<Cmd> {
         let last_index = req.snapshot.meta.last_index;
         let last_term = req.snapshot.meta.last_term;
 
-        // Already have this committed — idempotent retry handling, nothing to do.
+        // The snapshot is already covered by what this node has committed. The
+        // leader resends until acknowledged, so answering positively rather than
+        // reinstalling keeps the RPC idempotent.
         if last_index <= self.volatile.commit_index {
             commands.push(Command::Send {
                 to: from,
@@ -1052,8 +1190,9 @@ impl<Cmd: Clone> Node<Cmd> {
             return commands;
         }
 
-        // Retain-suffix case: our log already agrees with the snapshot boundary,
-        // so anything after it is still valid and must not be discarded.
+        // The local log agrees with the leader at the snapshot boundary, so by
+        // the Log Matching Property everything after it is valid too and must
+        // survive the install.
         let retains_suffix = matches!(
             self.persistent.log.term_at(last_index),
             TermLookup::Known(term) if term == last_term
@@ -1064,17 +1203,19 @@ impl<Cmd: Clone> Node<Cmd> {
             self.persistent.discard_to_snapshot(last_index, last_term);
         }
 
-        // last_applied jumps straight to the boundary — cases above must never
-        // re-apply log entries; any surviving suffix beyond commit_index applies
-        // through the normal take_entry_to_apply path afterward.
+        // The restored state machine already reflects everything through the
+        // boundary, so last_applied jumps there rather than replaying it. A
+        // surviving suffix above commit_index still applies later through
+        // take_entry_to_apply.
         self.volatile.commit_index = std::cmp::max(self.volatile.commit_index, last_index);
         self.volatile.last_applied = last_index;
 
-        // latest_snapshot must be updated before the rescan below: in the discard
-        // branch the log is now empty, and in the retain-suffix branch a surviving
-        // ConfigChange takes precedence (§4.1, effective on append) — either way
-        // apply_latest_config_from_log's snapshot-config fallback must resolve
-        // against this snapshot, not whatever was installed before it.
+        // The rescan below falls back to the snapshot's configuration, so
+        // latest_snapshot has to be the new one first. In the discard branch the
+        // log is now empty and that fallback is the only source; in the retain
+        // branch a surviving ConfigChange still wins, being effective on append.
+        // Either way, resolving against the previous snapshot would restore a
+        // membership the cluster has already left behind.
         self.persistent.pending_snapshot_install = Some(req.snapshot.clone());
         self.persistent.latest_snapshot = Some(req.snapshot.clone());
         self.apply_latest_config_from_log();
@@ -1091,9 +1232,13 @@ impl<Cmd: Clone> Node<Cmd> {
         commands
     }
 
-    /// Non-leaders and stale terms are no-ops; leaders in-term advance replication
-    /// progress and may complete a quorum. A `Rejected` response only ever means a
-    /// stale term — there is no lower boundary to decrement to below a snapshot.
+    /// Handles an InstallSnapshot response. A leader in the response's term
+    /// advances the peer's replication state, which may complete a quorum;
+    /// stale terms and other roles are ignored.
+    ///
+    /// There is no back-off branch. A rejection can only mean a stale term,
+    /// since a snapshot carries the whole compacted prefix and leaves no earlier
+    /// position to probe.
     pub fn handle_install_snapshot_response(
         &mut self,
         from: NodeId,
@@ -1442,7 +1587,8 @@ mod tests {
             },
         );
 
-        // No-op at index 1 (current term) achieves majority → commit_index advances.
+        // The no-op at index 1 belongs to the current term, so a majority match
+        // there is enough to advance the commit index.
         assert_eq!(n.volatile.commit_index, LogIndex::from(1));
     }
 
@@ -1714,7 +1860,8 @@ mod tests {
         });
         persistent.save(&mut storage).unwrap();
 
-        // New leader (term 2) overwrites entry 2 in place — log stays the same length.
+        // A term 2 leader overwrites entry 2 in place, leaving the log length
+        // unchanged. Storage cannot detect this by comparing lengths.
         persistent.set_term(Term::from(2));
         persistent.merge_entries(
             LogIndex::from(1),
@@ -1807,9 +1954,10 @@ mod tests {
         assert!(is_follower(&n));
     }
 
-    /// A vote from a node outside the current config (e.g. a removed
-    /// member, or a spoofed envelope — transport has no authentication) must not count
-    /// toward the majority `has_majority` computes over `config` size.
+    /// A vote from a server outside the current configuration, whether a removed
+    /// member or a spoofed envelope on the unauthenticated transport, must not
+    /// count toward the majority that `has_majority` computes over the
+    /// configuration size.
     #[test]
     fn vote_from_non_member_does_not_count_toward_majority() {
         let mut n = node(1, &[2, 3]); // config = {1, 2, 3}, majority = 2, self-vote = 1
@@ -2039,7 +2187,7 @@ mod tests {
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::ConfigChange(later_config),
-        }); // index 3, beyond the boundary — must not be picked
+        }); // index 3, beyond the boundary, so it must not be picked
 
         n.volatile.commit_index = LogIndex::from(2);
         n.volatile.last_applied = LogIndex::from(2);
@@ -2054,12 +2202,13 @@ mod tests {
         let mut n = node(1, &[2, 3]);
         let grown_config = test_config(1, &[2, 3, 4]);
 
-        // C1 compacted into a first snapshot — the retained log no longer holds it.
+        // The first configuration is compacted into a snapshot, so the retained
+        // log no longer holds it.
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::ConfigChange(grown_config.clone()),
         }); // index 1
-        n.set_config(grown_config.clone()); // config changes take effect on append, §4.1
+        n.set_config(grown_config.clone()); // effective on append, section 4.1
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET name=miles".to_string()),
@@ -2069,8 +2218,9 @@ mod tests {
         let first_snapshot = n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
         assert_eq!(first_snapshot.meta.config, grown_config);
 
-        // C2 appended but not yet applied when the second compaction fires — the
-        // retained prefix (just index 3) carries no ConfigChange at all.
+        // The second configuration is appended but not yet applied when the
+        // second compaction fires, so the retained prefix, index 3 alone,
+        // carries no ConfigChange.
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET status=pending".to_string()),
@@ -2078,7 +2228,7 @@ mod tests {
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::ConfigChange(test_config(1, &[2, 3, 4, 5])),
-        }); // index 4, beyond the boundary — must not be picked
+        }); // index 4, beyond the boundary, so it must not be picked
         n.volatile.commit_index = LogIndex::from(3);
         n.volatile.last_applied = LogIndex::from(3);
 
@@ -2303,7 +2453,7 @@ mod tests {
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::Command("SET status=pending".to_string()),
-        }); // index 2, term 1 — conflicts with the snapshot's claimed term 9
+        }); // index 2, term 1, conflicting with the snapshot's term 9
 
         let req = InstallSnapshot {
             term: Term::from(1),
@@ -2334,7 +2484,7 @@ mod tests {
         n.push_entry(LogEntry {
             term: Term::from(1),
             payload: LogPayload::ConfigChange(grown_config.clone()),
-        }); // index 3, beyond the boundary — config changes take effect on append (§4.1)
+        }); // index 3, beyond the boundary and effective on append (section 4.1)
 
         let req = InstallSnapshot {
             term: Term::from(1),

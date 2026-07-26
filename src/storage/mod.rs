@@ -11,38 +11,52 @@ use crate::core::types::NodeId;
 use crate::core::types::Snapshot;
 use crate::core::types::Term;
 
-/// Everything read back at startup. Four unrelated fields is past the point
-/// where positional tuple access is honest — name them.
+/// The complete persisted state, as read back at startup.
 pub struct LoadedState<Cmd> {
+    /// Highest term this node has seen. Zero on a fresh node.
     pub current_term: Term,
+    /// Candidate this node voted for in `current_term`, if any.
     pub voted_for: Option<NodeId>,
+    /// Most recent snapshot, if one was ever installed.
     pub snapshot: Option<Snapshot>,
-    /// Entries after the snapshot boundary (or from index 1 if no snapshot).
+    /// Entries after the snapshot boundary, or from index 1 if there is no snapshot.
     pub entries: Vec<LogEntry<Cmd>>,
 }
 
-/// §5.1: currentTerm, votedFor, and log on stable storage. A dumb durable sink —
-/// `Node` owns the log and tells storage exactly what changed; storage never
-/// re-derives a diff from lengths or terms, which would silently drop a
-/// same-length conflict overwrite.
+/// Durable sink for the state Raft requires to survive a restart: `currentTerm`,
+/// `votedFor`, and the log (section 5.1).
+///
+/// Implementations are deliberately passive. `Node` owns the in-memory log and
+/// states exactly what changed through `truncate_from`, `append`, and
+/// `install_snapshot`. Storage never re-derives a diff by comparing lengths or
+/// terms, because a length-only comparison misses a conflict overwrite that
+/// replaces entries without changing the log length.
 pub trait Storage<Cmd> {
     type Error;
 
-    /// Full persisted state, read once at startup.
+    /// Reads the full persisted state. Called once, before the node starts.
     fn load(&self) -> Result<LoadedState<Cmd>, Self::Error>;
 
-    /// Must be durable before returning (§5.1).
+    /// Records the term and vote. Must be durable before returning (section 5.1):
+    /// a node that acknowledges a vote and then forgets it can elect two leaders
+    /// in one term.
     fn set_meta(&mut self, term: Term, voted_for: Option<NodeId>) -> Result<(), Self::Error>;
 
-    /// Inclusive: the entry at `index` is also removed. No-op if `index` is past the end.
+    /// Removes every entry at or after `index`. Inclusive of `index` itself.
+    /// No-op when `index` is past the end of the log.
     fn truncate_from(&mut self, index: LogIndex) -> Result<(), Self::Error>;
 
-    /// Appends to the tail. Caller guarantees `entries` is exactly the suffix that
-    /// follows what's already durable — no conflict detection happens here.
+    /// Appends `entries` to the tail.
+    ///
+    /// The caller guarantees `entries` is exactly the suffix following what is
+    /// already durable. No conflict detection happens here.
     fn append(&mut self, entries: &[LogEntry<Cmd>]) -> Result<(), Self::Error>;
 
-    /// Persists the snapshot durably, then drops all log entries at or below
-    /// `snapshot.meta.last_index`. Must write the snapshot before touching the
-    /// log — the reverse order loses committed state on a crash between the two.
+    /// Persists `snapshot`, then drops every log entry at or below
+    /// `snapshot.meta.last_index`.
+    ///
+    /// The snapshot must reach durable storage before the log is truncated. In
+    /// the reverse order, a crash between the two steps leaves neither the
+    /// entries nor the snapshot that replaced them, losing committed state.
     fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error>;
 }

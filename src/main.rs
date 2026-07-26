@@ -22,6 +22,7 @@ struct PeerSpec {
     addr: SocketAddr,
 }
 
+/// Why a `--peer` argument could not be parsed.
 #[derive(Debug, thiserror::Error)]
 enum PeerSpecError {
     #[error("--peer must be ID=ADDR, got '{0}'")]
@@ -52,6 +53,8 @@ impl FromStr for PeerSpec {
     }
 }
 
+/// Command line arguments. Parsed into domain types here, at the boundary, so
+/// nothing downstream handles raw strings.
 #[derive(Parser)]
 struct Args {
     /// Unique node ID within the cluster.

@@ -5,62 +5,81 @@ use super::config::ClusterConfig;
 use super::primitives::LogIndex;
 use super::primitives::Term;
 
-/// The data carried by a log entry. §8: leaders append a NoOp on election to commit
-/// prior-term entries via Log Matching without direct commitment of old terms.
+/// The data carried by a log entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogPayload<Cmd> {
+    /// Appended by a new leader at the start of its term (section 8). Committing
+    /// this current-term entry commits every preceding entry through the Log
+    /// Matching Property, which is what lets a leader serve reads without
+    /// committing an entry from an earlier term directly.
     NoOp,
+    /// An application command, opaque to the consensus layer.
     Command(Cmd),
-    /// Single-server membership change (dissertation §4.1).
-    /// Takes effect immediately when appended, not when committed.
+    /// Single-server membership change (dissertation section 4.1). Takes effect
+    /// as soon as it is appended, not when it commits.
     ConfigChange(ClusterConfig),
 }
 
 /// A single entry in the replicated log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry<Cmd> {
+    /// Term of the leader that created the entry. Half of the identity used by
+    /// the log matching check.
     pub term: Term,
     pub payload: LogPayload<Cmd>,
 }
 
-/// Whether `Log::merge` found a conflicting entry and truncated the log.
-/// Callers use this to decide whether a config rescan is needed (a truncation
-/// may have removed the entry holding the currently active `ConfigChange`), and
-/// to tell durable storage exactly what changed instead of re-deriving it later.
+/// What `Log::merge` did to the log.
+///
+/// Callers need this for two reasons. A truncation may have removed the entry
+/// carrying the active `ClusterConfig`, which forces a rescan of the log for the
+/// latest surviving `ConfigChange`. It also tells durable storage precisely
+/// which range changed, so storage never has to re-derive a diff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeOutcome {
-    /// No conflicting entries; any new entries were appended after the existing suffix.
+    /// No conflict. New entries, if any, went after the existing suffix.
     Appended,
-    /// A conflicting entry (same index, different term) was found at `from`; the log
-    /// was truncated there and the new suffix appended in its place.
+    /// An entry at index `from` held a different term than the incoming one. The
+    /// log was truncated at `from` and the incoming suffix took its place.
     Truncated { from: LogIndex },
 }
 
-/// The term at a given index, distinguishing "gone via compaction" from "known"
-/// from "not appended yet" — callers must pick an explicit response for each.
+/// The result of asking for the term at a given index.
+///
+/// The three cases are distinguished rather than collapsed into an `Option`
+/// because callers respond differently to each: a compacted index means the
+/// follower must be caught up with a snapshot, while an index beyond the end
+/// means the leader must back up `next_index`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TermLookup {
-    /// An in-log entry, or the snapshot/sentinel boundary itself.
+    /// A retained entry, or the snapshot boundary, or the index 0 sentinel.
     Known(Term),
-    /// Below the snapshot boundary: the term was discarded by compaction.
+    /// Below the snapshot boundary. Compaction discarded the term.
     Compacted,
     /// Past the last entry in the log.
     BeyondEnd,
 }
 
-/// The 1-based replicated log. Owns all index arithmetic so callers never touch
-/// array offsets directly. After compaction, `entries[0]` holds
-/// `snapshot_last_index + 1`, not index 1.
+/// The one-based replicated log.
+///
+/// All index arithmetic lives here so no caller converts between a `LogIndex`
+/// and a `Vec` offset. The distinction matters after compaction: `entries[0]`
+/// then holds index `snapshot_last_index + 1` rather than index 1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Log<Cmd> {
-    /// Index+term of the last compacted entry; both default (zero) pre-compaction,
-    /// which degenerates to the original sentinel semantics with no special-casing.
+    /// Index of the newest entry folded into a snapshot and dropped. Zero before
+    /// any compaction, which coincides with the index 0 sentinel and so needs no
+    /// special case anywhere in the arithmetic below.
     snapshot_last_index: LogIndex,
+    /// Term of the entry at `snapshot_last_index`, retained for log matching and
+    /// for the up-to-date comparison after the log is fully compacted.
     snapshot_last_term: Term,
+    /// Entries after the boundary, in index order.
     entries: Vec<LogEntry<Cmd>>,
 }
 
 impl<Cmd> Log<Cmd> {
+    /// An empty, uncompacted log.
     pub fn new() -> Self {
         Self {
             snapshot_last_index: LogIndex::default(),
@@ -69,6 +88,7 @@ impl<Cmd> Log<Cmd> {
         }
     }
 
+    /// An uncompacted log whose first entry is index 1.
     pub fn from_entries(entries: Vec<LogEntry<Cmd>>) -> Self {
         Self {
             snapshot_last_index: LogIndex::default(),
@@ -77,10 +97,13 @@ impl<Cmd> Log<Cmd> {
         }
     }
 
-    /// Reconstructs a log from a persisted snapshot boundary and the surviving
-    /// suffix, which the caller guarantees starts at `snapshot_last_index + 1`.
-    /// For storage backends restoring state at startup; other callers reach a
-    /// compacted state via `compact_through`/`reset_to_snapshot` instead.
+    /// Reconstructs a compacted log from a persisted snapshot boundary and the
+    /// surviving suffix, which the caller guarantees begins at
+    /// `snapshot_last_index + 1`.
+    ///
+    /// Intended for storage backends restoring state at startup. A running node
+    /// reaches a compacted state through `compact_through` or
+    /// `reset_to_snapshot`, both of which maintain the invariant themselves.
     pub fn from_snapshot_and_suffix(
         snapshot_last_index: LogIndex,
         snapshot_last_term: Term,
@@ -93,23 +116,30 @@ impl<Cmd> Log<Cmd> {
         }
     }
 
+    /// Number of retained entries. Excludes anything dropped by compaction, so
+    /// this is not the same as `last_index`.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether any entry is retained. A fully compacted log is empty even though
+    /// its `last_index` is non-zero.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// The newest retained entry, or `None` when the log is fully compacted.
     pub fn last(&self) -> Option<&LogEntry<Cmd>> {
         self.entries.last()
     }
 
+    /// Iterates the retained entries in index order.
     pub fn iter(&self) -> std::slice::Iter<'_, LogEntry<Cmd>> {
         self.entries.iter()
     }
 
-    /// Array-index lookup for `index`, or `None` if compacted away or out of range.
+    /// Translates a `LogIndex` into an offset into `entries`, or `None` when the
+    /// index was compacted away or lies past the end.
     fn slot(&self, index: LogIndex) -> Option<usize> {
         if index <= self.snapshot_last_index {
             return None;
@@ -123,33 +153,40 @@ impl<Cmd> Log<Cmd> {
         }
     }
 
+    /// Index of the newest compacted entry. Zero if nothing was compacted.
     pub fn snapshot_last_index(&self) -> LogIndex {
         self.snapshot_last_index
     }
 
+    /// Term of the entry at `snapshot_last_index`.
     pub fn snapshot_last_term(&self) -> Term {
         self.snapshot_last_term
     }
 
-    /// Index of the oldest entry still in `entries` (or the next index to be
-    /// appended, if `entries` is empty).
+    /// Index of the oldest retained entry, or the next index to be appended when
+    /// nothing is retained.
     pub fn first_index(&self) -> LogIndex {
         self.snapshot_last_index.next()
     }
 
+    /// Index of the newest entry, retained or compacted.
     pub fn last_index(&self) -> LogIndex {
         self.snapshot_last_index
             .advance_by(self.entries.len() as u64)
     }
 
-    /// Falls back to the snapshot boundary term when `entries` is empty —
-    /// required for §5.4.1 vote comparison after full compaction.
+    /// Term of the entry at `last_index`.
+    ///
+    /// Falls back to the snapshot boundary term when no entry is retained. A
+    /// fully compacted log would otherwise report term 0 and lose every
+    /// election under the up-to-date comparison of section 5.4.1.
     pub fn last_term(&self) -> Term {
         self.entries
             .last()
             .map_or(self.snapshot_last_term, |entry| entry.term)
     }
 
+    /// Term recorded at `index`, or the reason it is unavailable.
     pub fn term_at(&self, index: LogIndex) -> TermLookup {
         if index == self.snapshot_last_index {
             return TermLookup::Known(self.snapshot_last_term);
@@ -163,12 +200,15 @@ impl<Cmd> Log<Cmd> {
         }
     }
 
+    /// The entry at `index`, or `None` when it was compacted away or lies past
+    /// the end.
     pub fn entry(&self, index: LogIndex) -> Option<&LogEntry<Cmd>> {
         self.slot(index).map(|idx| &self.entries[idx])
     }
 
-    /// Entries from `index` (1-based, inclusive) to the end. Any index at or
-    /// below the snapshot boundary returns the whole retained log.
+    /// Retained entries from `index` inclusive to the end. An `index` at or
+    /// below the snapshot boundary yields the whole retained log, since nothing
+    /// older than the boundary can be served from entries.
     pub fn suffix_from(&self, index: LogIndex) -> &[LogEntry<Cmd>] {
         if index <= self.snapshot_last_index {
             return &self.entries;
@@ -185,17 +225,22 @@ impl<Cmd> Log<Cmd> {
         self.last_index()
     }
 
-    /// Inclusive: the entry at `index` is also removed. No-op below the
-    /// snapshot boundary (already compacted) or past the end of the log.
+    /// Removes every entry at or after `index`, inclusive of `index` itself.
+    ///
+    /// No-op when `index` is at or below the snapshot boundary, where the
+    /// entries are already gone, or past the end of the log.
     pub fn truncate_from(&mut self, index: LogIndex) {
         if let Some(idx) = self.slot(index) {
             self.entries.truncate(idx);
         }
     }
 
-    /// §5.3 Log Matching Property: true if our entry at `prev_index` has term
-    /// `prev_term`. Any index below the snapshot boundary is trivially true —
-    /// it names a prefix already known to be committed and identical here.
+    /// The Log Matching consistency check of section 5.3: whether this log holds
+    /// term `prev_term` at `prev_index`.
+    ///
+    /// An index below the snapshot boundary always matches. Compaction only
+    /// covers committed entries, so that prefix is already known to agree with
+    /// the leader and there is no term left to compare against.
     pub fn matches(&self, prev_index: LogIndex, prev_term: Term) -> bool {
         if prev_index < self.snapshot_last_index {
             return true;
@@ -207,11 +252,14 @@ impl<Cmd> Log<Cmd> {
             .is_some_and(|idx| self.entries[idx].term == prev_term)
     }
 
-    /// §5.3, Figure 2 AppendEntries §3-5: on conflict (same index, different term),
-    /// truncate at the conflict point and replace with the new suffix. An entry whose
-    /// index already holds a matching term is treated as already present and skipped.
-    /// Entries at or below the snapshot boundary are already covered by the snapshot
-    /// and cannot conflict with it, so they are skipped silently.
+    /// Grafts `entries` onto the log starting at `prev_index + 1`, following
+    /// rules 3 to 5 of the AppendEntries receiver in Figure 2 (section 5.3).
+    ///
+    /// An incoming entry whose index already holds the same term is a
+    /// retransmission and is skipped. An incoming entry whose index holds a
+    /// different term is a conflict: the log is truncated there and the rest of
+    /// the incoming suffix replaces it. Positions at or below the snapshot
+    /// boundary are skipped, since a committed prefix cannot conflict.
     pub fn merge(&mut self, prev_index: LogIndex, entries: Vec<LogEntry<Cmd>>) -> MergeOutcome {
         let mut insert_index = prev_index.next();
         let mut outcome = MergeOutcome::Appended;
@@ -228,7 +276,8 @@ impl<Cmd> Log<Cmd> {
                         self.entries.push(entry);
                         outcome = MergeOutcome::Truncated { from: insert_index };
                     }
-                    // Same term at this index: entry already present, skip.
+                    // Same term at this index means the entry is already
+                    // present. Truncating here would discard a correct suffix.
                 }
                 None => self.entries.push(entry),
             }
@@ -238,8 +287,11 @@ impl<Cmd> Log<Cmd> {
         outcome
     }
 
-    /// Drops entries `[.., index]` and records the compacted boundary. No-op if
-    /// `index` is at or below the current boundary.
+    /// Drops every entry up to and including `index` and records the new
+    /// boundary. No-op when `index` is at or below the current boundary.
+    ///
+    /// The caller must pass the term of the entry at `index`, because that term
+    /// outlives the entry itself and is still needed for log matching.
     pub fn compact_through(&mut self, index: LogIndex, term: Term) {
         if index <= self.snapshot_last_index {
             return;
@@ -247,17 +299,19 @@ impl<Cmd> Log<Cmd> {
         if let Some(idx) = self.slot(index) {
             self.entries.drain(..=idx);
         } else {
-            // index is beyond the retained suffix (e.g. equals last_index with
-            // no gap) — nothing left to keep either way.
+            // The index lies beyond the retained suffix, so every entry is
+            // covered by the new boundary.
             self.entries.clear();
         }
         self.snapshot_last_index = index;
         self.snapshot_last_term = term;
     }
 
-    /// Discards all entries and sets the snapshot boundary directly — used when
-    /// installing a snapshot whose boundary conflicts with or extends past the
-    /// local log.
+    /// Discards every entry and sets the snapshot boundary directly.
+    ///
+    /// Used when installing a leader's snapshot whose boundary either extends
+    /// past the local log or conflicts with it. Unlike `compact_through`, this
+    /// makes no assumption that the retained entries agree with the snapshot.
     pub fn reset_to_snapshot(&mut self, last_index: LogIndex, last_term: Term) {
         self.entries.clear();
         self.snapshot_last_index = last_index;
@@ -361,7 +415,7 @@ mod tests {
     fn merge_skips_entries_already_present_with_matching_term() {
         let mut log = log_with(vec![entry(1, "SET name=miles"), entry(1, "SET counter=1")]);
 
-        // Retried AppendEntries: same entries, no conflict, nothing to do.
+        // A retried AppendEntries carrying entries the follower already has.
         let outcome = log.merge(
             LogIndex::from(0),
             vec![entry(1, "SET name=miles"), entry(1, "SET counter=1")],
@@ -551,8 +605,8 @@ mod tests {
             1,
         );
 
-        // First entry falls at index 1, at/below the boundary — must be skipped
-        // rather than looked up as an array slot (there is none).
+        // The first incoming entry lands on index 1, at the snapshot boundary.
+        // It has no array slot, so merge must skip it rather than look it up.
         let outcome = log.merge(LogIndex::default(), vec![entry(1, "SET name=miles")]);
 
         assert_eq!(outcome, MergeOutcome::Appended);

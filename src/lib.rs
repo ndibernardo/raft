@@ -1,3 +1,20 @@
+//! An implementation of the Raft consensus algorithm.
+//!
+//! The crate is layered so that the protocol itself stays free of I/O.
+//!
+//! `Node` is a pure state machine: it consumes events (a timeout, an incoming
+//! message, a client submission), returns the `Command`s that must be carried
+//! out, and never touches a socket or a clock. That makes every protocol
+//! decision reproducible from a sequence of inputs alone.
+//!
+//! `Runtime` supplies what `Node` deliberately lacks: timers, durable
+//! `Storage`, and a `StateMachine` to apply committed commands to. `Server`
+//! wraps the runtime in an event loop with a TCP `Transport` and an HTTP client
+//! API.
+//!
+//! Section references in the documentation point at the Raft paper and Diego
+//! Ongaro's dissertation.
+
 mod app;
 mod core;
 mod storage;
