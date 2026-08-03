@@ -1,4 +1,4 @@
-# raft-rs
+# raft
 
 A Raft consensus implementation in Rust, designed as the foundation for a distributed key-value store.
 
