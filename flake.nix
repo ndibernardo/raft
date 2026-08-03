@@ -51,7 +51,7 @@
             shellHook = ''
               export RUSTFMT="${nightlyRustfmt}/bin/rustfmt"
 
-              echo "Raft-rs development environment"
+              echo "Raft development environment"
               echo "Rust version: $(rustc --version)"
             '';
           };
