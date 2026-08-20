@@ -25,6 +25,7 @@ use crate::core::types::RequestVoteResponse;
 use crate::core::types::Snapshot;
 use crate::core::types::SnapshotData;
 use crate::core::types::SnapshotMeta;
+use crate::core::types::SuffixDisposition;
 use crate::core::types::Term;
 use crate::core::types::TermLookup;
 use crate::core::types::Vote;
@@ -60,6 +61,17 @@ pub enum CompactError {
     NothingToCompact,
 }
 
+/// A snapshot install recorded in memory and awaiting replay to storage.
+///
+/// The disposition travels with the snapshot because storage cannot re-derive
+/// it: by the time it runs, the local entry whose term decided the question is
+/// already inside the compacted prefix.
+#[derive(Clone, Debug)]
+struct PendingSnapshotInstall {
+    snapshot: Snapshot,
+    disposition: SuffixDisposition,
+}
+
 /// The state Figure 2 requires on stable storage: `current_term`, `voted_for`,
 /// and the log. All of it must reach durable storage before this node responds
 /// to any RPC, since a response is a promise the node must still honour after a
@@ -86,7 +98,7 @@ pub struct PersistentState<Cmd> {
     /// Snapshot recorded by `compact_to_snapshot` or `handle_install_snapshot`,
     /// replayed by `save` as `storage.install_snapshot` and then cleared. Same
     /// record-then-replay pattern as `truncated_from` and `pending_append`.
-    pending_snapshot_install: Option<Snapshot>,
+    pending_snapshot_install: Option<PendingSnapshotInstall>,
     /// The most recent snapshot, retained for the leader send path that builds
     /// `InstallSnapshot` RPCs. Unlike `pending_snapshot_install` it lives for the
     /// node's lifetime rather than until the next `save`.
@@ -212,17 +224,21 @@ impl<Cmd: Clone> PersistentState<Cmd> {
     ///
     /// # Errors
     /// Whatever the storage backend reports. The uncompleted part of the record
-    /// is retained, so a later `save` can retry it.
+    /// is retained, so a later `save` can retry it. Each record is cleared only
+    /// after the call that consumed it returned success, since a record dropped
+    /// ahead of the write it describes can never be replayed.
     pub fn save<S: Storage<Cmd>>(&mut self, storage: &mut S) -> Result<(), S::Error> {
         if self.meta_dirty {
             storage.set_meta(self.current_term, self.voted_for)?;
             self.meta_dirty = false;
         }
-        if let Some(snapshot) = self.pending_snapshot_install.take() {
-            storage.install_snapshot(&snapshot)?;
+        if let Some(pending) = &self.pending_snapshot_install {
+            storage.install_snapshot(&pending.snapshot, pending.disposition)?;
+            self.pending_snapshot_install = None;
         }
-        if let Some(from) = self.truncated_from.take() {
+        if let Some(from) = self.truncated_from {
             storage.truncate_from(from)?;
+            self.truncated_from = None;
         }
         if !self.pending_append.is_empty() {
             storage.append(&self.pending_append)?;
@@ -231,16 +247,29 @@ impl<Cmd: Clone> PersistentState<Cmd> {
         Ok(())
     }
 
-    /// Wipes the local log for the discard case of `InstallSnapshot` and records
-    /// the truncation so `save` also clears the stale suffix in storage.
+    /// Applies `snapshot` to the in-memory log and records it, with the
+    /// disposition, for `save` to replay as a single storage call.
     ///
-    /// The storage-side `install_snapshot` compacts through the boundary and
-    /// keeps everything above it. Without the recorded truncation, a suffix
-    /// discarded here would survive on disk and reappear at the next restart,
-    /// diverging from the snapshot that replaced it.
-    fn discard_to_snapshot(&mut self, last_index: LogIndex, last_term: Term) {
-        self.log.reset_to_snapshot(last_index, last_term);
-        self.truncated_from = Some(last_index.next());
+    /// A `Discard` supersedes every earlier log mutation still pending, so the
+    /// recorded truncation and suffix go with it. Replaying them after the
+    /// install would put entries back into storage that this node has just
+    /// declared invalid.
+    fn install_snapshot(&mut self, snapshot: Snapshot, disposition: SuffixDisposition) {
+        let last_index = snapshot.meta.last_index;
+        let last_term = snapshot.meta.last_term;
+        match disposition {
+            SuffixDisposition::Retain => self.log.compact_through(last_index, last_term),
+            SuffixDisposition::Discard => {
+                self.log.reset_to_snapshot(last_index, last_term);
+                self.truncated_from = None;
+                self.pending_append.clear();
+            }
+        }
+        self.latest_snapshot = Some(snapshot.clone());
+        self.pending_snapshot_install = Some(PendingSnapshotInstall {
+            snapshot,
+            disposition,
+        });
     }
 }
 
@@ -1127,9 +1156,10 @@ impl<Cmd: Clone> Node<Cmd> {
             data,
         };
 
-        self.persistent.log.compact_through(last_index, last_term);
-        self.persistent.pending_snapshot_install = Some(snapshot.clone());
-        self.persistent.latest_snapshot = Some(snapshot.clone());
+        // Local compaction never conflicts with its own log, so the suffix
+        // above the boundary is always valid.
+        self.persistent
+            .install_snapshot(snapshot.clone(), SuffixDisposition::Retain);
         info!(node = %self.id, last_index = %last_index, "log compacted to snapshot");
 
         Ok(snapshot)
@@ -1190,18 +1220,16 @@ impl<Cmd: Clone> Node<Cmd> {
             return commands;
         }
 
-        // The local log agrees with the leader at the snapshot boundary, so by
-        // the Log Matching Property everything after it is valid too and must
-        // survive the install.
-        let retains_suffix = matches!(
-            self.persistent.log.term_at(last_index),
-            TermLookup::Known(term) if term == last_term
-        );
-        if retains_suffix {
-            self.persistent.log.compact_through(last_index, last_term);
-        } else {
-            self.persistent.discard_to_snapshot(last_index, last_term);
-        }
+        // A local entry carrying the snapshot's index and term makes everything
+        // above it valid by the Log Matching Property, so the suffix survives.
+        // Any other answer, including a boundary past the end of the log, means
+        // the local log conflicts and section 7 discards all of it.
+        let disposition = match self.persistent.log.term_at(last_index) {
+            TermLookup::Known(term) if term == last_term => SuffixDisposition::Retain,
+            TermLookup::Known(_) | TermLookup::Compacted | TermLookup::BeyondEnd => {
+                SuffixDisposition::Discard
+            }
+        };
 
         // The restored state machine already reflects everything through the
         // boundary, so last_applied jumps there rather than replaying it. A
@@ -1216,8 +1244,8 @@ impl<Cmd: Clone> Node<Cmd> {
         // branch a surviving ConfigChange still wins, being effective on append.
         // Either way, resolving against the previous snapshot would restore a
         // membership the cluster has already left behind.
-        self.persistent.pending_snapshot_install = Some(req.snapshot.clone());
-        self.persistent.latest_snapshot = Some(req.snapshot.clone());
+        self.persistent
+            .install_snapshot(req.snapshot.clone(), disposition);
         self.apply_latest_config_from_log();
         self.pending_snapshot_restore = Some(req.snapshot);
         info!(node = %self.id, leader = %from, last_index = %last_index, "snapshot installed");
@@ -2467,6 +2495,133 @@ mod tests {
         assert_eq!(n.persistent.log.snapshot_last_term(), Term::from(9));
     }
 
+    /// A boundary past the end of the local log leaves nothing to compare terms
+    /// against, so section 7 treats it like a conflict and clears the log.
+    #[test]
+    fn follower_discards_log_when_snapshot_boundary_is_past_its_end() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        }); // index 1
+
+        let req = InstallSnapshot {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            snapshot: test_snapshot(5, 3, test_config(1, &[2, 3])),
+        };
+        n.handle_install_snapshot(NodeId::from(2), req);
+
+        assert!(n.persistent.log.is_empty());
+        assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(5));
+        assert_eq!(n.persistent.log.snapshot_last_term(), Term::from(3));
+    }
+
+    /// The durable log must end up where the in-memory one did. A discard that
+    /// reached only memory would come back at the next restart.
+    #[test]
+    fn save_clears_storage_log_after_a_conflicting_install() {
+        use crate::storage::MemoryStorage;
+
+        let mut storage: MemoryStorage<String> = MemoryStorage::new();
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        n.save(&mut storage).expect("save appends");
+
+        n.handle_install_snapshot(
+            NodeId::from(2),
+            InstallSnapshot {
+                term: Term::from(1),
+                leader_id: NodeId::from(2),
+                snapshot: test_snapshot(2, 9, test_config(1, &[2, 3])),
+            },
+        );
+        n.save(&mut storage).expect("save installs");
+
+        let loaded = storage.load().expect("load");
+        assert!(loaded.entries.is_empty());
+        assert_eq!(
+            loaded.snapshot.map(|snap| snap.meta.last_term),
+            Some(Term::from(9))
+        );
+    }
+
+    /// A failed install stays recorded. Dropping it would leave the in-memory
+    /// log compacted and storage still holding the prefix, with nothing left to
+    /// replay the difference.
+    #[test]
+    fn save_keeps_the_recorded_install_when_storage_rejects_it() {
+        use crate::storage::LoadedState;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct StorageOffline;
+
+        struct FailingStorage {
+            install_attempts: usize,
+        }
+
+        impl Storage<String> for FailingStorage {
+            type Error = StorageOffline;
+
+            fn load(&self) -> Result<LoadedState<String>, Self::Error> {
+                Err(StorageOffline)
+            }
+
+            fn set_meta(
+                &mut self,
+                _term: Term,
+                _voted_for: Option<NodeId>,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn truncate_from(&mut self, _index: LogIndex) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn append(&mut self, _entries: &[LogEntry<String>]) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn install_snapshot(
+                &mut self,
+                _snapshot: &Snapshot,
+                _disposition: SuffixDisposition,
+            ) -> Result<(), Self::Error> {
+                self.install_attempts += 1;
+                Err(StorageOffline)
+            }
+        }
+
+        let mut storage = FailingStorage {
+            install_attempts: 0,
+        };
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.handle_install_snapshot(
+            NodeId::from(2),
+            InstallSnapshot {
+                term: Term::from(1),
+                leader_id: NodeId::from(2),
+                snapshot: test_snapshot(2, 9, test_config(1, &[2, 3])),
+            },
+        );
+
+        assert_eq!(n.save(&mut storage), Err(StorageOffline));
+        assert_eq!(n.save(&mut storage), Err(StorageOffline));
+        assert_eq!(storage.install_attempts, 2, "the install must be retried");
+    }
+
     #[test]
     fn follower_retains_suffix_config_change_over_snapshots_boundary_time_config() {
         let mut n = node(1, &[2, 3]);
@@ -2567,9 +2722,13 @@ mod tests {
                 self.inner.append(entries)
             }
 
-            fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
+            fn install_snapshot(
+                &mut self,
+                snapshot: &Snapshot,
+                disposition: SuffixDisposition,
+            ) -> Result<(), Self::Error> {
                 self.calls.push("install_snapshot");
-                self.inner.install_snapshot(snapshot)
+                self.inner.install_snapshot(snapshot, disposition)
             }
         }
 

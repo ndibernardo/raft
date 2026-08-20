@@ -32,6 +32,22 @@ pub struct Snapshot {
     pub data: SnapshotData,
 }
 
+/// What happens to the log entries above a snapshot boundary when the snapshot
+/// is installed (section 7).
+///
+/// The receiver of an `InstallSnapshot` decides this once, by comparing its own
+/// term at the boundary. Storage is told the answer rather than re-deriving it,
+/// because after the install the entry that carried the deciding term is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuffixDisposition {
+    /// The local entry at the boundary carried the snapshot's index and term,
+    /// so the Log Matching Property makes every entry above it valid.
+    Retain,
+    /// The boundary conflicts with the local log, or lies past its end, so the
+    /// whole log is invalid and goes.
+    Discard,
+}
+
 /// Serialized state machine bytes.
 ///
 /// A newtype rather than a bare `Vec<u8>` so it cannot be swapped with any other

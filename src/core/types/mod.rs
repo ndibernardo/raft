@@ -26,3 +26,4 @@ pub use primitives::Term;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotData;
 pub use snapshot::SnapshotMeta;
+pub use snapshot::SuffixDisposition;

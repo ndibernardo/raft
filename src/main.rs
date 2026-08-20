@@ -53,8 +53,7 @@ impl FromStr for PeerSpec {
     }
 }
 
-/// Command line arguments. Parsed into domain types here, at the boundary, so
-/// nothing downstream handles raw strings.
+/// Command line arguments
 #[derive(Parser)]
 struct Args {
     /// Unique node ID within the cluster.

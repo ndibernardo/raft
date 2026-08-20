@@ -9,6 +9,7 @@ use crate::core::types::LogEntry;
 use crate::core::types::LogIndex;
 use crate::core::types::NodeId;
 use crate::core::types::Snapshot;
+use crate::core::types::SuffixDisposition;
 use crate::core::types::Term;
 
 /// The complete persisted state, as read back at startup.
@@ -52,11 +53,21 @@ pub trait Storage<Cmd> {
     /// already durable. No conflict detection happens here.
     fn append(&mut self, entries: &[LogEntry<Cmd>]) -> Result<(), Self::Error>;
 
-    /// Persists `snapshot`, then drops every log entry at or below
-    /// `snapshot.meta.last_index`.
+    /// Persists `snapshot` and brings the log into the state `disposition`
+    /// names: `Retain` drops every entry at or below `snapshot.meta.last_index`
+    /// and keeps the rest, `Discard` drops the entire log.
     ///
-    /// The snapshot must reach durable storage before the log is truncated. In
-    /// the reverse order, a crash between the two steps leaves neither the
-    /// entries nor the snapshot that replaced them, losing committed state.
-    fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error>;
+    /// The snapshot must reach durable storage before the log changes. In the
+    /// reverse order, a crash between the two steps leaves neither the entries
+    /// nor the snapshot that replaced them, losing committed state.
+    ///
+    /// The two must also recover as one unit. An implementation that persists
+    /// the snapshot and then dies before applying `Discard` would otherwise come
+    /// back with the new snapshot beside a suffix the caller had already
+    /// invalidated, which is exactly the divergence section 7 forbids.
+    fn install_snapshot(
+        &mut self,
+        snapshot: &Snapshot,
+        disposition: SuffixDisposition,
+    ) -> Result<(), Self::Error>;
 }

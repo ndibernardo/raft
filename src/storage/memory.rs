@@ -3,6 +3,7 @@ use crate::core::types::LogEntry;
 use crate::core::types::LogIndex;
 use crate::core::types::NodeId;
 use crate::core::types::Snapshot;
+use crate::core::types::SuffixDisposition;
 use crate::core::types::Term;
 use crate::storage::LoadedState;
 use crate::storage::Storage;
@@ -67,9 +68,23 @@ impl<Cmd: Clone> Storage<Cmd> for MemoryStorage<Cmd> {
         Ok(())
     }
 
-    fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
-        self.log
-            .compact_through(snapshot.meta.last_index, snapshot.meta.last_term);
+    /// Applies both halves in one call, so there is no window in which the
+    /// snapshot is recorded and the log is not. Nothing here survives a restart
+    /// anyway, but keeping the semantics identical to `FileStorage` is what lets
+    /// the two back the same tests.
+    fn install_snapshot(
+        &mut self,
+        snapshot: &Snapshot,
+        disposition: SuffixDisposition,
+    ) -> Result<(), Self::Error> {
+        match disposition {
+            SuffixDisposition::Retain => self
+                .log
+                .compact_through(snapshot.meta.last_index, snapshot.meta.last_term),
+            SuffixDisposition::Discard => self
+                .log
+                .reset_to_snapshot(snapshot.meta.last_index, snapshot.meta.last_term),
+        }
         self.snapshot = Some(snapshot.clone());
         Ok(())
     }
@@ -221,7 +236,7 @@ mod tests {
             .unwrap();
 
         storage
-            .install_snapshot(&test_snapshot(1, 1, vec![9]))
+            .install_snapshot(&test_snapshot(1, 1, vec![9]), SuffixDisposition::Retain)
             .unwrap();
 
         let entries = storage.load().unwrap().entries;
@@ -243,10 +258,42 @@ mod tests {
             .unwrap();
 
         let snapshot = test_snapshot(1, 1, vec![1, 2, 3]);
-        storage.install_snapshot(&snapshot).unwrap();
+        storage
+            .install_snapshot(&snapshot, SuffixDisposition::Retain)
+            .unwrap();
 
         let loaded = storage.load().unwrap();
         assert_eq!(loaded.snapshot, Some(snapshot));
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn install_snapshot_with_discard_drops_entries_above_the_boundary() {
+        let mut storage: MemoryStorage<String> = MemoryStorage::new();
+        storage
+            .append(&[
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+                },
+            ])
+            .unwrap();
+
+        // The boundary sits at index 2 and the entry above it is valid only if
+        // the local log agreed there. Discard says it did not.
+        storage
+            .install_snapshot(&test_snapshot(2, 9, vec![4, 2]), SuffixDisposition::Discard)
+            .unwrap();
+
+        let loaded = storage.load().unwrap();
         assert!(loaded.entries.is_empty());
     }
 }

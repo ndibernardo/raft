@@ -16,6 +16,7 @@ use crate::core::types::LogEntry;
 use crate::core::types::LogIndex;
 use crate::core::types::NodeId;
 use crate::core::types::Snapshot;
+use crate::core::types::SuffixDisposition;
 use crate::core::types::Term;
 use crate::storage::LoadedState;
 use crate::storage::Storage;
@@ -47,11 +48,69 @@ struct LogFileHeader {
     first_index: LogIndex,
 }
 
-/// Disk-backed storage. State lives in up to three files inside `dir`.
+/// On-disk form of `SuffixDisposition`.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DispositionDto {
+    Retain,
+    Discard,
+}
+
+impl From<SuffixDisposition> for DispositionDto {
+    fn from(disposition: SuffixDisposition) -> Self {
+        match disposition {
+            SuffixDisposition::Retain => Self::Retain,
+            SuffixDisposition::Discard => Self::Discard,
+        }
+    }
+}
+
+impl From<DispositionDto> for SuffixDisposition {
+    fn from(dto: DispositionDto) -> Self {
+        match dto {
+            DispositionDto::Retain => Self::Retain,
+            DispositionDto::Discard => Self::Discard,
+        }
+    }
+}
+
+/// On-disk record of a snapshot install that has started and not yet finished.
+///
+/// It names the boundary being installed and what was decided about the entries
+/// above it. `open` finds it only after a crash, and uses it to finish or roll
+/// back the install before serving any read.
+#[derive(Serialize, Deserialize)]
+struct InstallIntent {
+    last_index: LogIndex,
+    last_term: Term,
+    disposition: DispositionDto,
+}
+
+impl InstallIntent {
+    fn new(snapshot: &Snapshot, disposition: SuffixDisposition) -> Self {
+        Self {
+            last_index: snapshot.meta.last_index,
+            last_term: snapshot.meta.last_term,
+            disposition: disposition.into(),
+        }
+    }
+
+    /// Whether `snapshot` is the one this record was written for.
+    ///
+    /// A boundary is identified by index and term together. Two snapshots
+    /// sharing both describe the same committed prefix, so either one satisfies
+    /// the record.
+    fn covers(&self, snapshot: &Snapshot) -> bool {
+        snapshot.meta.last_index == self.last_index && snapshot.meta.last_term == self.last_term
+    }
+}
+
+/// Disk-backed storage. State lives in up to four files inside `dir`.
 ///
 /// `meta.json` holds the current term and vote, replaced atomically by rename.
 /// `snapshot.json` holds the most recent snapshot, if any. `log.jsonl` holds one
 /// JSON-encoded entry per line, optionally preceded by a `LogFileHeader` line.
+/// `install.json` exists only while a snapshot install is in flight.
 ///
 /// The in-memory log is a write-through cache: reads come from memory, and a
 /// write updates memory and then reaches disk with an fsync before the call
@@ -74,43 +133,94 @@ where
     /// missing file is read as its empty value: term 0, no vote, no snapshot,
     /// no entries.
     ///
-    /// Also reconciles a crash between the two durable writes of
-    /// `install_snapshot`. If the header of `log.jsonl` claims entries starting
-    /// at or below the snapshot boundary, the file predates the snapshot, and
-    /// the overlapping prefix is dropped while loading. Only the in-memory log
-    /// is corrected here; the file itself is rewritten at the next mutation.
+    /// Also completes a `install_snapshot` that a crash interrupted, driven by
+    /// the `install.json` record it left behind, and removes that record before
+    /// returning. Recovery therefore runs exactly once, and a later crash cannot
+    /// replay a discard over entries appended after this call.
     ///
     /// # Errors
-    /// `FileStorageError::Io` if the directory or a file cannot be read.
+    /// `FileStorageError::Io` if the directory or a file cannot be read or the
+    /// interrupted install cannot be completed.
     /// `FileStorageError::Corrupt` if a file does not parse.
     pub fn open(dir: &Path) -> Result<Self, FileStorageError> {
         fs::create_dir_all(dir)?;
         let meta = Self::read_meta(dir)?;
         let snapshot = Self::read_snapshot(dir)?;
         let (claimed_first_index, entries) = Self::read_log(dir)?;
+        let intent = Self::read_install_intent(dir)?;
 
-        let log = match &snapshot {
-            Some(snap) => {
-                let surviving = entries
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| {
-                        claimed_first_index.advance_by(*i as u64) > snap.meta.last_index
-                    })
-                    .map(|(_, entry)| entry)
-                    .collect();
-                Log::from_snapshot_and_suffix(snap.meta.last_index, snap.meta.last_term, surviving)
-            }
-            None => Log::from_entries(entries),
-        };
+        let log = Self::reconcile_log(
+            snapshot.as_ref(),
+            intent.as_ref(),
+            claimed_first_index,
+            entries,
+        );
 
-        Ok(Self {
+        let storage = Self {
             dir: dir.to_path_buf(),
             current_term: meta.current_term,
             voted_for: meta.voted_for,
             snapshot,
             log,
-        })
+        };
+
+        if intent.is_some() {
+            storage.rewrite_log_file()?;
+            storage.clear_install_intent()?;
+        }
+
+        Ok(storage)
+    }
+
+    /// Rebuilds the in-memory log from the files on disk, resolving an
+    /// interrupted `install_snapshot`.
+    ///
+    /// An intent record whose boundary matches the stored snapshot means the
+    /// snapshot half reached disk, so the install counts as committed and its
+    /// disposition decides the log. An intent that does not match names an
+    /// install whose snapshot never landed; the log half had not run either, so
+    /// what is on disk still stands.
+    ///
+    /// Without the record a discarded suffix is indistinguishable from a
+    /// retained one, because the entry whose term settled the question is inside
+    /// the compacted prefix and no longer readable.
+    fn reconcile_log(
+        snapshot: Option<&Snapshot>,
+        intent: Option<&InstallIntent>,
+        claimed_first_index: LogIndex,
+        entries: Vec<LogEntry<Cmd>>,
+    ) -> Log<Cmd> {
+        let Some(snap) = snapshot else {
+            return Log::from_entries(entries);
+        };
+
+        let discards_suffix = match intent {
+            Some(intent) if intent.covers(snap) => {
+                match SuffixDisposition::from(intent.disposition) {
+                    SuffixDisposition::Discard => true,
+                    SuffixDisposition::Retain => false,
+                }
+            }
+            Some(_) | None => false,
+        };
+        if discards_suffix {
+            return Log::from_snapshot_and_suffix(
+                snap.meta.last_index,
+                snap.meta.last_term,
+                Vec::new(),
+            );
+        }
+
+        // Entries at or below the boundary belong to a log file written before
+        // the snapshot landed. Their positions come from the header, so a
+        // compacted file is read at its true indexes rather than from 1.
+        let surviving = entries
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| claimed_first_index.advance_by(*i as u64) > snap.meta.last_index)
+            .map(|(_, entry)| entry)
+            .collect();
+        Log::from_snapshot_and_suffix(snap.meta.last_index, snap.meta.last_term, surviving)
     }
 
     fn meta_path(&self) -> PathBuf {
@@ -123,6 +233,10 @@ where
 
     fn log_path(&self) -> PathBuf {
         self.dir.join("log.jsonl")
+    }
+
+    fn install_intent_path(&self) -> PathBuf {
+        self.dir.join("install.json")
     }
 
     fn read_meta(dir: &Path) -> Result<Meta, FileStorageError> {
@@ -139,6 +253,15 @@ where
 
     fn read_snapshot(dir: &Path) -> Result<Option<Snapshot>, FileStorageError> {
         let path = dir.join("snapshot.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    fn read_install_intent(dir: &Path) -> Result<Option<InstallIntent>, FileStorageError> {
+        let path = dir.join("install.json");
         if !path.exists() {
             return Ok(None);
         }
@@ -218,6 +341,32 @@ where
         Ok(())
     }
 
+    /// Writes `install.json` atomically, by the same sequence as `flush_meta`.
+    fn flush_install_intent(&self, intent: &InstallIntent) -> Result<(), FileStorageError> {
+        let tmp = self.dir.join("install.json.tmp");
+        let bytes = serde_json::to_vec(intent)?;
+        let mut file = File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, self.install_intent_path())?;
+        File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Removes `install.json`. Its absence is what marks the install complete,
+    /// so the unlink is followed by a directory fsync like every other rename
+    /// here.
+    fn clear_install_intent(&self) -> Result<(), FileStorageError> {
+        let path = self.install_intent_path();
+        if !path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(&path)?;
+        File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+
     /// Appends one serialized entry to `log.jsonl` and fsyncs it.
     fn append_to_log_file(&self, entry: &LogEntry<Cmd>) -> Result<(), FileStorageError> {
         let mut line = serde_json::to_string(entry)?;
@@ -229,6 +378,18 @@ where
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
         Ok(())
+    }
+
+    /// Brings the in-memory log into the state `disposition` names.
+    fn apply_snapshot_to_log(&mut self, snapshot: &Snapshot, disposition: SuffixDisposition) {
+        match disposition {
+            SuffixDisposition::Retain => self
+                .log
+                .compact_through(snapshot.meta.last_index, snapshot.meta.last_term),
+            SuffixDisposition::Discard => self
+                .log
+                .reset_to_snapshot(snapshot.meta.last_index, snapshot.meta.last_term),
+        }
     }
 
     /// Rewrites `log.jsonl` from the in-memory log, atomically and with an fsync.
@@ -301,15 +462,26 @@ where
         Ok(())
     }
 
-    /// Makes the snapshot durable first, then drops the compacted prefix and
-    /// rewrites the log. A crash between the two leaves a log file whose header
-    /// overlaps the snapshot boundary, which `open` detects and reconciles.
-    fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), Self::Error> {
+    /// Runs the install as one recoverable transaction: record the intent, make
+    /// the snapshot durable, bring the log into the state the intent names, then
+    /// clear the record.
+    ///
+    /// The record goes down first because the decision it carries cannot be
+    /// recomputed later. Once the snapshot replaces the prefix, the local term
+    /// at the boundary is gone, and a retained suffix looks exactly like one
+    /// that a conflict had already invalidated. A crash at any point leaves
+    /// `open` able to finish or roll back.
+    fn install_snapshot(
+        &mut self,
+        snapshot: &Snapshot,
+        disposition: SuffixDisposition,
+    ) -> Result<(), Self::Error> {
+        self.flush_install_intent(&InstallIntent::new(snapshot, disposition))?;
         self.flush_snapshot(snapshot)?;
         self.snapshot = Some(snapshot.clone());
-        self.log
-            .compact_through(snapshot.meta.last_index, snapshot.meta.last_term);
-        self.rewrite_log_file()
+        self.apply_snapshot_to_log(snapshot, disposition);
+        self.rewrite_log_file()?;
+        self.clear_install_intent()
     }
 }
 
@@ -496,7 +668,7 @@ mod tests {
         let mut s = open_fresh(tmp.path());
         s.append(&three_entry_log()).expect("append");
 
-        s.install_snapshot(&test_snapshot(2, 1, vec![9, 9]))
+        s.install_snapshot(&test_snapshot(2, 1, vec![9, 9]), SuffixDisposition::Retain)
             .expect("install snapshot");
 
         let entries = s.load().expect("load").entries;
@@ -514,7 +686,8 @@ mod tests {
         {
             let mut s = open_fresh(tmp.path());
             s.append(&three_entry_log()).expect("append");
-            s.install_snapshot(&snapshot).expect("install snapshot");
+            s.install_snapshot(&snapshot, SuffixDisposition::Retain)
+                .expect("install snapshot");
         }
 
         let s = open_fresh(tmp.path());
@@ -557,6 +730,200 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("snapshot.json"), b"not valid json")
             .expect("write corrupt snapshot");
+
+        let result = FileStorage::<String>::open(tmp.path());
+
+        assert!(matches!(result, Err(FileStorageError::Corrupt(_))));
+    }
+
+    /// The durable step of `install_snapshot` after which a crash is simulated.
+    #[derive(Clone, Copy)]
+    enum CrashAfter {
+        IntentRecorded,
+        SnapshotDurable,
+        LogRewritten,
+        IntentCleared,
+    }
+
+    /// Runs the durable steps of `install_snapshot` in production order and
+    /// stops after `crash_after`, leaving the directory in exactly the state a
+    /// crash at that point would.
+    fn install_snapshot_interrupted(
+        storage: &mut FileStorage<String>,
+        snapshot: &Snapshot,
+        disposition: SuffixDisposition,
+        crash_after: CrashAfter,
+    ) {
+        storage
+            .flush_install_intent(&InstallIntent::new(snapshot, disposition))
+            .expect("write install intent");
+        if matches!(crash_after, CrashAfter::IntentRecorded) {
+            return;
+        }
+        storage.flush_snapshot(snapshot).expect("write snapshot");
+        if matches!(crash_after, CrashAfter::SnapshotDurable) {
+            return;
+        }
+        storage.apply_snapshot_to_log(snapshot, disposition);
+        storage.rewrite_log_file().expect("rewrite log");
+        if matches!(crash_after, CrashAfter::LogRewritten) {
+            return;
+        }
+        storage
+            .clear_install_intent()
+            .expect("clear install intent");
+    }
+
+    fn reopen_after_interrupted_install(
+        disposition: SuffixDisposition,
+        boundary_term: u64,
+        crash_after: CrashAfter,
+    ) -> FileStorage<String> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = test_snapshot(2, boundary_term, vec![4, 2]);
+        {
+            let mut s = open_fresh(tmp.path());
+            s.append(&three_entry_log()).expect("append");
+            install_snapshot_interrupted(&mut s, &snapshot, disposition, crash_after);
+        }
+        // Leaked deliberately: the reopened handle must outlive the guard, and
+        // the directory is removed with the process.
+        let dir = tmp.keep();
+        FileStorage::open(&dir).expect("reopen")
+    }
+
+    /// A conflicting boundary invalidates the whole log. Once `snapshot.json` is
+    /// durable the install has happened, so no later crash may bring the suffix
+    /// back.
+    #[test]
+    fn reopen_discards_suffix_when_conflicting_install_crashes_after_snapshot() {
+        for crash_after in [
+            CrashAfter::SnapshotDurable,
+            CrashAfter::LogRewritten,
+            CrashAfter::IntentCleared,
+        ] {
+            let s = reopen_after_interrupted_install(SuffixDisposition::Discard, 9, crash_after);
+            let loaded = s.load().expect("load");
+
+            assert!(
+                loaded.entries.is_empty(),
+                "a term 9 boundary at index 2 conflicts with the local term 1 entry, \
+                 so the entire log goes"
+            );
+            assert_eq!(
+                loaded.snapshot.map(|snap| snap.meta.last_term),
+                Some(Term::from(9))
+            );
+        }
+    }
+
+    /// A matching boundary leaves the entries above it valid, so the same crash
+    /// points must keep them.
+    #[test]
+    fn reopen_keeps_suffix_when_matching_install_crashes_after_snapshot() {
+        for crash_after in [
+            CrashAfter::SnapshotDurable,
+            CrashAfter::LogRewritten,
+            CrashAfter::IntentCleared,
+        ] {
+            let s = reopen_after_interrupted_install(SuffixDisposition::Retain, 1, crash_after);
+            let loaded = s.load().expect("load");
+
+            assert_eq!(loaded.entries.len(), 1);
+            assert_eq!(
+                loaded.entries[0].payload,
+                LogPayload::Command("SET status=active".into())
+            );
+        }
+    }
+
+    /// The record alone commits nothing. Without the snapshot beside it the
+    /// install never happened, so the log must survive untouched.
+    #[test]
+    fn reopen_rolls_back_install_that_crashed_before_the_snapshot_landed() {
+        let s = reopen_after_interrupted_install(
+            SuffixDisposition::Discard,
+            9,
+            CrashAfter::IntentRecorded,
+        );
+        let loaded = s.load().expect("load");
+
+        assert_eq!(loaded.entries.len(), 3);
+        assert!(loaded.snapshot.is_none());
+    }
+
+    /// Recovery must consume the record, not merely read it. A record left in
+    /// place would replay its discard over entries appended after recovery and
+    /// erase them.
+    #[test]
+    fn reopen_clears_the_install_record_so_later_appends_survive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = test_snapshot(2, 9, vec![4, 2]);
+        {
+            let mut s = open_fresh(tmp.path());
+            s.append(&three_entry_log()).expect("append");
+            install_snapshot_interrupted(
+                &mut s,
+                &snapshot,
+                SuffixDisposition::Discard,
+                CrashAfter::SnapshotDurable,
+            );
+        }
+        {
+            let mut s = open_fresh(tmp.path());
+            assert!(!tmp.path().join("install.json").exists());
+            s.append(&[LogEntry {
+                term: Term::from(9),
+                payload: LogPayload::Command("SET region=eu-west-1".into()),
+            }])
+            .expect("append after recovery");
+        }
+
+        let loaded = open_fresh(tmp.path()).load().expect("load");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(
+            loaded.entries[0].payload,
+            LogPayload::Command("SET region=eu-west-1".into())
+        );
+    }
+
+    /// A completed install leaves no record behind, so a plain restart takes the
+    /// ordinary path rather than the recovery one.
+    #[test]
+    fn install_snapshot_removes_its_record_on_success() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut s = open_fresh(tmp.path());
+        s.append(&three_entry_log()).expect("append");
+
+        s.install_snapshot(&test_snapshot(2, 9, vec![4, 2]), SuffixDisposition::Discard)
+            .expect("install snapshot");
+
+        assert!(!tmp.path().join("install.json").exists());
+        assert!(s.load().expect("load").entries.is_empty());
+    }
+
+    #[test]
+    fn install_snapshot_with_discard_drops_the_whole_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut s = open_fresh(tmp.path());
+        s.append(&three_entry_log()).expect("append");
+
+        s.install_snapshot(&test_snapshot(2, 9, vec![4, 2]), SuffixDisposition::Discard)
+            .expect("install snapshot");
+
+        let loaded = s.load().expect("load");
+        assert!(loaded.entries.is_empty());
+        assert_eq!(
+            loaded.snapshot.map(|snap| snap.meta.last_term),
+            Some(Term::from(9))
+        );
+    }
+
+    #[test]
+    fn corrupt_install_record_returns_corrupt_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("install.json"), b"not valid json")
+            .expect("write corrupt install record");
 
         let result = FileStorage::<String>::open(tmp.path());
 
