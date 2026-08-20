@@ -168,18 +168,21 @@ impl<Cmd: Clone> PersistentState<Cmd> {
     /// `Log::merge` and records the resulting truncation point and suffix, so
     /// `save` can hand storage the identical change.
     fn merge_entries(&mut self, prev_index: LogIndex, entries: Vec<LogEntry<Cmd>>) -> MergeOutcome {
-        let before_len = self.log.len();
         let outcome = self.log.merge(prev_index, entries);
 
         match outcome {
+            MergeOutcome::Unchanged => {}
             MergeOutcome::Truncated { from } => {
                 self.truncated_from = Some(from);
                 self.pending_append = self.log.suffix_from(from).to_vec();
             }
-            MergeOutcome::Appended => {
-                let new_start = LogIndex::from_length(before_len).next();
+            // The merge names the absolute index it started writing at. Deriving
+            // it from the retained length instead would name an index still held
+            // by an older entry once compaction has moved the log's start, and
+            // storage would receive that entry a second time.
+            MergeOutcome::Appended { from } => {
                 self.pending_append
-                    .extend(self.log.suffix_from(new_start).iter().cloned());
+                    .extend(self.log.suffix_from(from).iter().cloned());
             }
         }
 
@@ -1946,6 +1949,90 @@ mod tests {
 
         let reloaded: PersistentState<String> = PersistentState::load(&storage).unwrap();
         assert_eq!(reloaded.log, persistent.log);
+    }
+
+    /// A compacted log's retained length is smaller than its last index. Deriving
+    /// the first appended index from that length names an index that is still
+    /// retained, so `save` hands storage a suffix beginning one or more entries
+    /// too early and the entry is persisted twice.
+    #[test]
+    fn save_after_compaction_does_not_duplicate_a_retained_entry() {
+        use crate::storage::MemoryStorage;
+
+        let mut storage: MemoryStorage<String> = MemoryStorage::new();
+        let mut persistent = compacted_state_with_one_retained_entry(&mut storage);
+
+        persistent.merge_entries(
+            LogIndex::from(2),
+            vec![LogEntry {
+                term: Term::from(1),
+                payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+            }],
+        );
+        persistent.save(&mut storage).unwrap();
+
+        let reloaded: PersistentState<String> = PersistentState::load(&storage).unwrap();
+        assert_eq!(reloaded.log, persistent.log);
+    }
+
+    /// The same accounting failure, checked across a real reopen so that the
+    /// duplicate cannot be masked by in-memory state the backend still holds.
+    #[test]
+    fn file_storage_reopen_after_compaction_does_not_duplicate_a_retained_entry() {
+        use crate::storage::FileStorage;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage: FileStorage<String> = FileStorage::open(dir.path()).expect("open storage");
+        let mut persistent = compacted_state_with_one_retained_entry(&mut storage);
+
+        persistent.merge_entries(
+            LogIndex::from(2),
+            vec![LogEntry {
+                term: Term::from(1),
+                payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+            }],
+        );
+        persistent.save(&mut storage).unwrap();
+        drop(storage);
+
+        let reopened: FileStorage<String> = FileStorage::open(dir.path()).expect("reopen storage");
+        let reloaded: PersistentState<String> = PersistentState::load(&reopened).unwrap();
+        assert_eq!(reloaded.log, persistent.log);
+    }
+
+    /// Two entries appended and made durable, then compacted through index 1, so
+    /// that the log retains exactly entry 2 above a snapshot boundary at 1.
+    fn compacted_state_with_one_retained_entry<S: Storage<String>>(
+        storage: &mut S,
+    ) -> PersistentState<String>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        let mut persistent: PersistentState<String> = PersistentState::new();
+        persistent.set_term(Term::from(1));
+        persistent.set_voted_for(Some(NodeId::from(1)));
+        persistent.append_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        persistent.append_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        persistent.save(storage).unwrap();
+
+        let snapshot = Snapshot {
+            meta: SnapshotMeta {
+                last_index: LogIndex::from(1),
+                last_term: Term::from(1),
+                config: test_config(1, &[2, 3]),
+            },
+            data: SnapshotData::new(b"name=miles".to_vec()),
+        };
+        persistent.install_snapshot(snapshot, SuffixDisposition::Retain);
+        persistent.save(storage).unwrap();
+
+        persistent
     }
 
     #[test]

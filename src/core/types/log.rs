@@ -37,8 +37,12 @@ pub struct LogEntry<Cmd> {
 /// which range changed, so storage never has to re-derive a diff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeOutcome {
-    /// No conflict. New entries, if any, went after the existing suffix.
-    Appended,
+    /// Every incoming entry was already present at its index with the same
+    /// term, so a retransmission left the log untouched.
+    Unchanged,
+    /// No conflict. New entries went after the existing suffix, the first of
+    /// them at `from`.
+    Appended { from: LogIndex },
     /// An entry at index `from` held a different term than the incoming one. The
     /// log was truncated at `from` and the incoming suffix took its place.
     Truncated { from: LogIndex },
@@ -262,7 +266,8 @@ impl<Cmd> Log<Cmd> {
     /// boundary are skipped, since a committed prefix cannot conflict.
     pub fn merge(&mut self, prev_index: LogIndex, entries: Vec<LogEntry<Cmd>>) -> MergeOutcome {
         let mut insert_index = prev_index.next();
-        let mut outcome = MergeOutcome::Appended;
+        let mut truncated_from: Option<LogIndex> = None;
+        let mut appended_from: Option<LogIndex> = None;
 
         for entry in entries {
             if insert_index <= self.snapshot_last_index {
@@ -274,17 +279,26 @@ impl<Cmd> Log<Cmd> {
                     if self.entries[idx].term != entry.term {
                         self.entries.truncate(idx);
                         self.entries.push(entry);
-                        outcome = MergeOutcome::Truncated { from: insert_index };
+                        truncated_from.get_or_insert(insert_index);
                     }
                     // Same term at this index means the entry is already
                     // present. Truncating here would discard a correct suffix.
                 }
-                None => self.entries.push(entry),
+                None => {
+                    self.entries.push(entry);
+                    appended_from.get_or_insert(insert_index);
+                }
             }
             insert_index = insert_index.next();
         }
 
-        outcome
+        // A truncation subsumes everything written after it, so its index is the
+        // start of the whole changed range.
+        match (truncated_from, appended_from) {
+            (Some(from), _) => MergeOutcome::Truncated { from },
+            (None, Some(from)) => MergeOutcome::Appended { from },
+            (None, None) => MergeOutcome::Unchanged,
+        }
     }
 
     /// Drops every entry up to and including `index` and records the new
@@ -349,7 +363,12 @@ mod tests {
 
         let outcome = log.merge(LogIndex::from(1), vec![entry(1, "SET counter=1")]);
 
-        assert_eq!(outcome, MergeOutcome::Appended);
+        assert_eq!(
+            outcome,
+            MergeOutcome::Appended {
+                from: LogIndex::from(2)
+            }
+        );
         assert_eq!(log.len(), 2);
         assert_eq!(
             log.entry(LogIndex::from(2)),
@@ -421,7 +440,7 @@ mod tests {
             vec![entry(1, "SET name=miles"), entry(1, "SET counter=1")],
         );
 
-        assert_eq!(outcome, MergeOutcome::Appended);
+        assert_eq!(outcome, MergeOutcome::Unchanged);
         assert_eq!(log.len(), 2);
     }
 
@@ -609,11 +628,35 @@ mod tests {
         // It has no array slot, so merge must skip it rather than look it up.
         let outcome = log.merge(LogIndex::default(), vec![entry(1, "SET name=miles")]);
 
-        assert_eq!(outcome, MergeOutcome::Appended);
+        assert_eq!(outcome, MergeOutcome::Unchanged);
         assert_eq!(log.len(), 1);
         assert_eq!(
             log.entry(LogIndex::from(2)),
             Some(&entry(1, "SET status=pending"))
+        );
+    }
+
+    /// After compaction the retained length no longer equals the last index, so
+    /// the appended range must be reported as an absolute index.
+    #[test]
+    fn merge_appends_after_compaction_report_absolute_index() {
+        let mut log = compacted_log(
+            vec![entry(1, "SET name=miles"), entry(1, "SET status=pending")],
+            1,
+            1,
+        );
+
+        let outcome = log.merge(LogIndex::from(2), vec![entry(1, "SET region=eu-west-1")]);
+
+        assert_eq!(
+            outcome,
+            MergeOutcome::Appended {
+                from: LogIndex::from(3)
+            }
+        );
+        assert_eq!(
+            log.entry(LogIndex::from(3)),
+            Some(&entry(1, "SET region=eu-west-1"))
         );
     }
 
