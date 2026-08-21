@@ -969,11 +969,14 @@ impl<Cmd: Clone> Node<Cmd> {
     /// Whether the uncommitted suffix holds a `ConfigChange`. Enforces the
     /// one-change-at-a-time rule of single-server membership changes.
     fn has_pending_config_change(&self) -> bool {
-        let committed = self.volatile.commit_index;
-        self.persistent.log.iter().enumerate().any(|(i, e)| {
-            let index = LogIndex::from_length(i + 1);
-            index > committed && matches!(e.payload, LogPayload::ConfigChange(_))
-        })
+        // Ask the log for the uncommitted range rather than deriving absolute
+        // indexes from iterator positions: after compaction the first retained
+        // entry is not index 1, and a pending change would read as committed.
+        self.persistent
+            .log
+            .suffix_from(self.volatile.commit_index.next())
+            .iter()
+            .any(|e| matches!(e.payload, LogPayload::ConfigChange(_)))
     }
 
     /// Recomputes the commit index from the leader's replication state.
@@ -1312,6 +1315,8 @@ impl<Cmd: Clone> Node<Cmd> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn test_addr(id: u64) -> std::net::SocketAddr {
@@ -2194,6 +2199,75 @@ mod tests {
             Err(SubmitError::ConfigChangePending),
             "second change must be rejected as pending, not conflated with not-leader"
         );
+    }
+
+    #[test]
+    fn second_config_change_rejected_when_compaction_moved_the_log_start() {
+        let mut n = node(1, &[2, 3]);
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote: Vote::Granted,
+            },
+        );
+        // The leader no-op at index 1 commits, applies, and is compacted away,
+        // so the first retained entry no longer sits at index 1.
+        n.volatile.commit_index = LogIndex::from(1);
+        n.volatile.last_applied = LogIndex::from(1);
+        n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
+
+        let config_a = test_config(1, &[2, 3, 4]);
+        let config_b = test_config(1, &[2, 3, 4, 5]);
+
+        let first = n.propose_config_change(config_a).unwrap();
+        assert_eq!(first, LogIndex::from(2));
+
+        assert_eq!(
+            n.propose_config_change(config_b),
+            Err(SubmitError::ConfigChangePending),
+            "the uncommitted change at index 2 is the first retained entry; \
+             reading its position as index 1 would make it look committed"
+        );
+    }
+
+    proptest! {
+        /// A `ConfigChange` is pending exactly when its absolute index is above
+        /// the commit index, whatever compaction did to the retained range.
+        #[test]
+        fn pending_config_change_follows_absolute_index_across_compaction_boundaries(
+            length in 4usize..10,
+            config_slot in 1usize..10,
+            first_boundary in 1usize..10,
+            boundary_gap in 1usize..4,
+            commit_gap in 0usize..4,
+        ) {
+            let config_index = config_slot.min(length);
+            let first = first_boundary.min(length - 2);
+            let second = (first + boundary_gap).min(length - 1);
+            let commit = (second + commit_gap).min(length);
+
+            let mut n = node(1, &[2, 3]);
+            for i in 1..=length {
+                let payload = if i == config_index {
+                    LogPayload::ConfigChange(test_config(1, &[2, 3, 4]))
+                } else {
+                    LogPayload::Command(format!("SET counter={i}"))
+                };
+                n.push_entry(LogEntry { term: Term::from(1), payload });
+            }
+            n.volatile.commit_index = LogIndex::from(commit as u64);
+
+            // Two compactions, so the retained range starts well above index 1
+            // and a position-derived index would be wrong by two offsets.
+            n.volatile.last_applied = LogIndex::from(first as u64);
+            n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
+            n.volatile.last_applied = LogIndex::from(second as u64);
+            n.compact_to_snapshot(SnapshotData::new(vec![2])).unwrap();
+
+            prop_assert_eq!(n.has_pending_config_change(), config_index > commit);
+        }
     }
 
     #[test]
