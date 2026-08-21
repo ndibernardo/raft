@@ -999,9 +999,12 @@ impl<Cmd: Clone> Node<Cmd> {
         match_indices.push(self.last_log_index());
         match_indices.sort();
 
-        // Sorted ascending, the element at len/2 is the highest index that a
-        // majority of len servers have reached.
-        let majority_pos = match_indices.len() / 2;
+        // Sorted ascending, the element at position p is matched by the len - p
+        // servers at or above it. A majority of len is len / 2 + 1, so the
+        // highest index a majority has reached sits at (len - 1) / 2. Using
+        // len / 2 would count exactly half of an even-sized cluster as a
+        // majority and commit an entry one server short of quorum.
+        let majority_pos = (match_indices.len() - 1) / 2;
         let majority_index = match_indices[majority_pos];
 
         // term_at rather than entry(), so that a majority index landing exactly
@@ -1800,6 +1803,75 @@ mod tests {
         let entry = n.persistent.log.entry(LogIndex::from(1)).unwrap();
         assert!(matches!(entry.payload, LogPayload::NoOp));
         assert_eq!(entry.term, Term::from(1));
+    }
+
+    #[test]
+    fn two_node_leader_needs_both_logs_to_commit() {
+        let mut n = node(1, &[2]);
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote: Vote::Granted,
+            },
+        );
+
+        assert_eq!(
+            n.volatile.commit_index,
+            LogIndex::default(),
+            "a majority of two is two; the leader's own log is not enough"
+        );
+
+        n.handle_append_entries_response(
+            NodeId::from(2),
+            AppendEntriesResponse::Accepted {
+                term: Term::from(1),
+                match_index: LogIndex::from(1),
+            },
+        );
+
+        assert_eq!(n.volatile.commit_index, LogIndex::from(1));
+    }
+
+    #[test]
+    fn four_node_leader_needs_three_logs_to_commit() {
+        let mut n = node(1, &[2, 3, 4]);
+        n.election_timeout();
+        for voter in [2, 3] {
+            n.handle_request_vote_response(
+                NodeId::from(voter),
+                RequestVoteResponse {
+                    term: Term::from(1),
+                    vote: Vote::Granted,
+                },
+            );
+        }
+        assert!(is_leader(&n));
+
+        n.handle_append_entries_response(
+            NodeId::from(2),
+            AppendEntriesResponse::Accepted {
+                term: Term::from(1),
+                match_index: LogIndex::from(1),
+            },
+        );
+
+        assert_eq!(
+            n.volatile.commit_index,
+            LogIndex::default(),
+            "two of four logs is half, not a majority of four"
+        );
+
+        n.handle_append_entries_response(
+            NodeId::from(3),
+            AppendEntriesResponse::Accepted {
+                term: Term::from(1),
+                match_index: LogIndex::from(1),
+            },
+        );
+
+        assert_eq!(n.volatile.commit_index, LogIndex::from(1));
     }
 
     #[test]
