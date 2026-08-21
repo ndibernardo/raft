@@ -100,10 +100,14 @@ impl Leader {
         self.next_index.get(&peer).copied()
     }
 
-    /// Match indices of every tracked peer, for the commit calculation. The
-    /// leader's own log position is not included and the caller must add it.
-    pub fn match_indices(&self) -> impl Iterator<Item = LogIndex> + '_ {
-        self.match_index.values().copied()
+    /// Highest index known replicated on `peer`, or `None` if `peer` is not
+    /// tracked.
+    ///
+    /// The commit calculation asks per configuration member rather than reading
+    /// the whole map, so an untracked member counts as nothing replicated
+    /// instead of silently shrinking the quorum it is measured against.
+    pub fn match_index_for(&self, peer: NodeId) -> Option<LogIndex> {
+        self.match_index.get(&peer).copied()
     }
 
     /// Records an acknowledgement from `from` up to `match_index`, advancing
@@ -178,9 +182,12 @@ mod tests {
             Some(LogIndex::from(6))
         );
 
-        let match_indices: Vec<_> = leader.match_indices().collect();
-        assert_eq!(match_indices.len(), 3);
-        assert!(match_indices.iter().all(|&idx| idx == LogIndex::default()));
+        for peer in [1, 2, 3] {
+            assert_eq!(
+                leader.match_index_for(NodeId::from(peer)),
+                Some(LogIndex::default())
+            );
+        }
     }
 
     #[test]
@@ -198,8 +205,10 @@ mod tests {
 
         leader.record_success(NodeId::from(1), LogIndex::from(5));
 
-        let match_indices: Vec<_> = leader.match_indices().collect();
-        assert!(match_indices.contains(&LogIndex::from(5)));
+        assert_eq!(
+            leader.match_index_for(NodeId::from(1)),
+            Some(LogIndex::from(5))
+        );
         assert_eq!(
             leader.next_index_for(NodeId::from(1)),
             Some(LogIndex::from(6))
@@ -232,9 +241,9 @@ mod tests {
         // until it is acknowledged.
         leader.record_success(NodeId::from(1), LogIndex::from(3));
 
-        let match_indices: Vec<_> = leader.match_indices().collect();
-        assert!(
-            match_indices.contains(&LogIndex::from(8)),
+        assert_eq!(
+            leader.match_index_for(NodeId::from(1)),
+            Some(LogIndex::from(8)),
             "match_index must not regress from a stale duplicate response"
         );
         assert_eq!(
@@ -304,12 +313,17 @@ mod tests {
         leader.record_success(NodeId::from(2), LogIndex::from(5));
         leader.record_success(NodeId::from(3), LogIndex::from(4));
 
-        let mut match_indices: Vec<_> = leader.match_indices().collect();
-        match_indices.sort();
-
         assert_eq!(
-            match_indices,
-            vec![LogIndex::from(3), LogIndex::from(4), LogIndex::from(5),]
+            leader.match_index_for(NodeId::from(1)),
+            Some(LogIndex::from(3))
+        );
+        assert_eq!(
+            leader.match_index_for(NodeId::from(2)),
+            Some(LogIndex::from(5))
+        );
+        assert_eq!(
+            leader.match_index_for(NodeId::from(3)),
+            Some(LogIndex::from(4))
         );
     }
 
@@ -324,8 +338,10 @@ mod tests {
             leader.next_index_for(NodeId::from(99)),
             Some(LogIndex::from(11))
         );
-        let match_indices: Vec<_> = leader.match_indices().collect();
-        assert!(match_indices.contains(&LogIndex::from(10)));
+        assert_eq!(
+            leader.match_index_for(NodeId::from(99)),
+            Some(LogIndex::from(10))
+        );
     }
 
     #[test]

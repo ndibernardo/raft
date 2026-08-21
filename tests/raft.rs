@@ -24,6 +24,7 @@ use raft::types::InstallSnapshot;
 use raft::types::LogEntry;
 use raft::types::LogIndex;
 use raft::types::LogPayload;
+use raft::types::Membership;
 use raft::types::Message;
 use raft::types::NodeId;
 use raft::types::RequestVoteResponse;
@@ -780,4 +781,112 @@ fn leader_election_works_when_all_logs_fully_compacted() {
         Some(1),
         "election must still succeed once every log is fully compacted"
     );
+}
+
+/// A leader that removes itself keeps replicating until the removal commits,
+/// then steps down and leaves the remaining members able to elect a successor
+/// on their own (dissertation section 4.2.2).
+#[test]
+fn a_leader_that_removes_itself_steps_down_and_the_rest_carry_on() {
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
+    elect(&mut cluster, 0);
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    let leader_id = cluster.runtime(0).node().id();
+    let without_leader = cluster
+        .runtime(0)
+        .node()
+        .config()
+        .without_member(leader_id)
+        .unwrap();
+
+    cluster
+        .runtime_mut(0)
+        .submit_config_change(without_leader)
+        .unwrap();
+    assert_eq!(
+        cluster.runtime(0).node().local_membership(),
+        Membership::NonMember
+    );
+    assert!(
+        matches!(cluster.runtime(0).node().role(), Role::Leader(_)),
+        "the removal has not committed, so it must keep replicating it"
+    );
+
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    assert!(
+        matches!(cluster.runtime(0).node().role(), Role::Follower(_)),
+        "once the removal commits the leader must step down"
+    );
+
+    // The two remaining members are a cluster of their own and can elect a
+    // leader without the removed node's vote.
+    elect(&mut cluster, 1);
+    assert_eq!(cluster.leader(), Some(1));
+}
+
+/// After a removal commits, the remaining members are the whole cluster: they
+/// commit on their own quorum, and the removed node stops receiving entries.
+///
+/// The removed node is dropped from replication the moment the change is
+/// appended, so it never learns of its own removal. Stopping it from disrupting
+/// the cluster it still believes it belongs to needs the minimum-election-timeout
+/// rule of dissertation section 4.2.3, which is not implemented here.
+#[test]
+fn a_removed_follower_stops_receiving_entries_while_the_rest_commit() {
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(3);
+    elect(&mut cluster, 0);
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    let removed_id = cluster.runtime(2).node().id();
+    let without_node = cluster
+        .runtime(0)
+        .node()
+        .config()
+        .without_member(removed_id)
+        .unwrap();
+    cluster
+        .runtime_mut(0)
+        .submit_config_change(without_node)
+        .unwrap();
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    let removed_last_index = cluster.runtime(2).node().persistent().log().last_index();
+
+    cluster
+        .runtime_mut(0)
+        .submit(set("city", "amsterdam"))
+        .unwrap();
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    assert_eq!(
+        cluster.runtime(2).node().persistent().log().last_index(),
+        removed_last_index,
+        "a removed member must no longer receive replication"
+    );
+
+    // One more round so the follower learns the advanced commit index.
+    cluster.heartbeat_timeout(0);
+    cluster.deliver_all();
+
+    for i in [0, 1] {
+        let result = cluster
+            .runtime_mut(i)
+            .state_machine_mut()
+            .apply(KvCommand::Get {
+                key: "city".to_string(),
+            });
+        assert_eq!(
+            result,
+            KvResult::Value(Some("amsterdam".to_string())),
+            "node {i} is part of the quorum of the remaining configuration"
+        );
+    }
+    assert_eq!(cluster.leader(), Some(0));
 }

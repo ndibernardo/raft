@@ -438,6 +438,16 @@ impl<Cmd: Clone> Node<Cmd> {
         self.config.peer_ids(self.id)
     }
 
+    /// Whether this node holds a voting seat in the active configuration.
+    ///
+    /// A `NonMember` has been removed by a committed or still-pending
+    /// `ConfigChange`, or was never in the configuration it was started with. It
+    /// may not campaign, vote, accept client work, or count its own log toward a
+    /// quorum, and it steps down if it is leading when its removal commits.
+    pub fn local_membership(&self) -> Membership {
+        self.config.membership_of(self.id)
+    }
+
     fn last_log_index(&self) -> LogIndex {
         self.persistent.log.last_index()
     }
@@ -537,6 +547,14 @@ impl<Cmd: Clone> Node<Cmd> {
     /// election; a leader has nothing to do, since it is the reason the timeout
     /// should not have fired elsewhere.
     pub fn election_timeout(&mut self) -> Vec<Command<Cmd>> {
+        // A server outside the configuration holds no seat, so no majority can
+        // include it. Campaigning would only raise terms and disrupt the members
+        // that do hold seats (dissertation section 4.2.3).
+        match self.local_membership() {
+            Membership::NonMember => return Vec::new(),
+            Membership::Member => {}
+        }
+
         match &self.role {
             Role::Leader(_) => Vec::new(),
             Role::Follower(_) | Role::Candidate(_) => self.start_election(),
@@ -553,9 +571,10 @@ impl<Cmd: Clone> Node<Cmd> {
         let peers = self.peer_ids();
 
         // In a single-node cluster the candidate's own vote is already a
-        // majority, and there is no peer to wait for.
-        let cluster_size = peers.len() + 1;
-        if cluster_size == 1 {
+        // majority, and there is no peer to wait for. The size comes from the
+        // configuration, so a node absent from it can never read as a cluster of
+        // one and promote itself.
+        if self.config.size() == 1 {
             return self.become_leader();
         }
 
@@ -615,6 +634,14 @@ impl<Cmd: Clone> Node<Cmd> {
     /// the candidate's log is at least as up to date as this one (section
     /// 5.4.1).
     fn should_grant_vote(&self, req: &RequestVote) -> bool {
+        // A server outside the configuration has no vote to give. Counting one
+        // would let a removed member supply the deciding vote in an election it
+        // is not part of.
+        match self.local_membership() {
+            Membership::NonMember => return false,
+            Membership::Member => {}
+        }
+
         let term_ok = req.term >= self.persistent.current_term;
         let vote_ok = match self.persistent.voted_for {
             None => true,
@@ -650,7 +677,7 @@ impl<Cmd: Clone> Node<Cmd> {
         // The transport is unauthenticated, so a removed member, or anything
         // able to spoof one, could otherwise supply the deciding vote.
         let membership = self.config.membership_of(from);
-        let cluster_size = self.peer_ids().len() + 1;
+        let cluster_size = self.config.size();
         let dominated = match &mut self.role {
             Role::Candidate(candidate) => {
                 match (resp.vote, membership) {
@@ -925,7 +952,11 @@ impl<Cmd: Clone> Node<Cmd> {
     /// `NotLeaderError` when this node is not the leader, carrying the leader
     /// hint to retry against.
     pub fn submit_command(&mut self, command: Cmd) -> Result<LogIndex, NotLeaderError> {
-        if !matches!(self.role, Role::Leader(_)) {
+        // A leader that removed itself keeps replicating until the removal
+        // commits, but it must not take on new client work on behalf of a
+        // cluster it no longer belongs to.
+        let seated = matches!(self.local_membership(), Membership::Member);
+        if !matches!(self.role, Role::Leader(_)) || !seated {
             return Err(NotLeaderError {
                 leader_hint: self.leader_hint(),
             });
@@ -955,7 +986,8 @@ impl<Cmd: Clone> Node<Cmd> {
         &mut self,
         config: ClusterConfig,
     ) -> Result<LogIndex, SubmitError> {
-        if !matches!(self.role, Role::Leader(_)) {
+        let seated = matches!(self.local_membership(), Membership::Member);
+        if !matches!(self.role, Role::Leader(_)) || !seated {
             return Err(SubmitError::NotLeader {
                 leader_hint: self.leader_hint(),
             });
@@ -1004,10 +1036,23 @@ impl<Cmd: Clone> Node<Cmd> {
             return;
         };
 
-        // The leader stores every entry it has appended, so its own log position
-        // counts toward the quorum alongside the tracked peers.
-        let mut match_indices: Vec<LogIndex> = leader.match_indices().collect();
-        match_indices.push(self.last_log_index());
+        // The voters are the configuration members, not the tracked peers plus
+        // an unconditional local vote. A leader that removed itself is absent
+        // from this list, so its own log stops counting the moment the change
+        // takes effect. A member with no replication state yet contributes
+        // index 0 rather than being skipped, which would measure the majority
+        // against a smaller cluster than the configuration describes.
+        let mut match_indices: Vec<LogIndex> = self
+            .config
+            .members()
+            .map(|(id, _)| {
+                if id == self.id {
+                    self.last_log_index()
+                } else {
+                    leader.match_index_for(id).unwrap_or_default()
+                }
+            })
+            .collect();
         match_indices.sort();
 
         // Sorted ascending, the element at position p is matched by the len - p
@@ -1031,6 +1076,32 @@ impl<Cmd: Clone> Node<Cmd> {
             self.volatile.commit_index = majority_index;
             debug!(node = %self.id, commit_index = %majority_index, "commit index advanced");
         }
+
+        self.step_down_if_removal_committed();
+    }
+
+    /// Ends the leadership of a server that removed itself, once the removal is
+    /// committed.
+    ///
+    /// Dissertation section 4.2.2: a leader absent from the new configuration
+    /// keeps managing the cluster until that configuration commits, because it
+    /// is the only server that can replicate the entry removing it. It steps
+    /// down as soon as the entry commits.
+    ///
+    /// An uncommitted `ConfigChange` in the log is that removal still in flight,
+    /// so leadership continues. With none pending, the configuration excluding
+    /// this node is durable on a majority of that configuration and the term
+    /// ends here. The one-change-at-a-time rule guarantees the pending entry can
+    /// only be the removal itself.
+    fn step_down_if_removal_committed(&mut self) {
+        let leading = matches!(self.role, Role::Leader(_));
+        let removed = matches!(self.local_membership(), Membership::NonMember);
+        if !leading || !removed || self.has_pending_config_change() {
+            return;
+        }
+
+        info!(node = %self.id, term = %self.persistent.current_term, "stepping down: no longer a member");
+        self.become_follower(self.persistent.current_term, None);
     }
 
     /// Whether any committed entry has yet to be applied.
@@ -1967,6 +2038,211 @@ mod tests {
             n.volatile.commit_index,
             LogIndex::default(),
             "only a leader may decide a commit index from replication state"
+        );
+    }
+
+    /// A configuration that excludes `id`, as one does after `id` removes
+    /// itself. `Node::new` is given the pre-removal view so the node starts as a
+    /// legitimate member.
+    fn config_without(id: u64, members: &[u64]) -> ClusterConfig {
+        let members = members
+            .iter()
+            .copied()
+            .filter(|&m| m != id)
+            .map(|i| (NodeId::from(i), test_addr(i)))
+            .collect();
+        ClusterConfig::new(members).unwrap()
+    }
+
+    /// Elects node 1 in a three-member cluster and returns it as leader.
+    fn elected_leader() -> Node<String> {
+        let mut n = node(1, &[2, 3]);
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote: Vote::Granted,
+            },
+        );
+        n
+    }
+
+    #[test]
+    fn local_membership_names_whether_this_node_holds_a_seat() {
+        let n = node(1, &[2, 3]);
+        assert_eq!(n.local_membership(), Membership::Member);
+
+        let mut removed = node(1, &[2, 3]);
+        removed.set_config(config_without(1, &[1, 2, 3]));
+        assert_eq!(removed.local_membership(), Membership::NonMember);
+    }
+
+    #[test]
+    fn a_removed_node_does_not_campaign() {
+        let mut n = node(1, &[2, 3]);
+        n.set_config(config_without(1, &[1, 2, 3]));
+
+        let commands = n.election_timeout();
+
+        assert!(is_follower(&n), "a non-member must not become a candidate");
+        assert!(
+            commands.is_empty(),
+            "a non-member must not solicit votes it has no seat to use"
+        );
+        assert_eq!(n.persistent.current_term, Term::default());
+    }
+
+    #[test]
+    fn a_removed_node_denies_its_vote() {
+        let mut n = node(1, &[2, 3]);
+        n.set_config(config_without(1, &[1, 2, 3]));
+
+        let commands = n.handle_request_vote(
+            NodeId::from(2),
+            RequestVote {
+                term: Term::from(1),
+                candidate_id: NodeId::from(2),
+                last_log_index: LogIndex::default(),
+                last_log_term: Term::default(),
+            },
+        );
+
+        assert!(
+            !extract_vote_granted(&commands),
+            "a node outside the configuration holds no vote to grant"
+        );
+    }
+
+    #[test]
+    fn a_removed_leader_refuses_client_commands() {
+        let mut n = elected_leader();
+        n.propose_config_change(config_without(1, &[1, 2, 3]))
+            .unwrap();
+
+        assert!(is_leader(&n), "the removal has not committed yet");
+        assert!(
+            matches!(
+                n.submit_command("SET price=1250".to_string()),
+                Err(NotLeaderError { .. })
+            ),
+            "a server outside the configuration must not take on new client work"
+        );
+    }
+
+    #[test]
+    fn a_removed_leader_refuses_a_further_config_change() {
+        let mut n = elected_leader();
+        n.propose_config_change(config_without(1, &[1, 2, 3]))
+            .unwrap();
+
+        assert!(matches!(
+            n.propose_config_change(test_config(1, &[2, 3, 4])),
+            Err(SubmitError::NotLeader { .. })
+        ));
+    }
+
+    #[test]
+    fn a_removed_leader_does_not_count_its_own_log_toward_quorum() {
+        let mut n = elected_leader();
+        n.submit_command("SET price=1250".to_string()).unwrap();
+        let removal = n
+            .propose_config_change(config_without(1, &[1, 2, 3]))
+            .unwrap();
+
+        // Members {2, 3} remain. Node 1 holds the entry but no longer votes, so
+        // one acknowledgement is short of the majority of two.
+        n.handle_append_entries_response(
+            NodeId::from(2),
+            AppendEntriesResponse::Accepted {
+                term: Term::from(1),
+                match_index: removal,
+            },
+        );
+
+        assert_eq!(
+            n.volatile.commit_index,
+            LogIndex::default(),
+            "counting the removed leader's own log would forge a majority of two"
+        );
+        assert!(
+            is_leader(&n),
+            "the removal has not committed, so it leads on"
+        );
+    }
+
+    /// A configuration adopted from the log or a snapshot can exclude this node
+    /// without any pending entry, which is what a restart or a truncation
+    /// leaves behind. There is no removal left to replicate, so leadership ends
+    /// at once rather than waiting for a commit that will never come.
+    #[test]
+    fn a_leader_whose_configuration_already_excludes_it_steps_down_at_once() {
+        let mut n = elected_leader();
+
+        n.set_config(config_without(1, &[1, 2, 3]));
+
+        assert!(is_follower(&n));
+        assert_eq!(n.local_membership(), Membership::NonMember);
+    }
+
+    #[test]
+    fn a_leader_that_removed_itself_keeps_leading_until_the_removal_commits() {
+        let mut n = elected_leader();
+        n.propose_config_change(config_without(1, &[1, 2, 3]))
+            .unwrap();
+
+        assert!(
+            is_leader(&n),
+            "section 4.2.2: the leader manages the cluster until C_new commits"
+        );
+        assert_eq!(n.volatile.commit_index, LogIndex::default());
+    }
+
+    #[test]
+    fn a_leader_that_removed_itself_steps_down_once_the_removal_commits() {
+        let mut n = elected_leader();
+        let removal = n
+            .propose_config_change(config_without(1, &[1, 2, 3]))
+            .unwrap();
+
+        // Both remaining members replicate the removal, which is a majority of
+        // the new two-member configuration.
+        for peer in [2, 3] {
+            n.handle_append_entries_response(
+                NodeId::from(peer),
+                AppendEntriesResponse::Accepted {
+                    term: Term::from(1),
+                    match_index: removal,
+                },
+            );
+        }
+
+        assert_eq!(n.volatile.commit_index, removal);
+        assert!(
+            is_follower(&n),
+            "section 4.2.2: the leader steps down once its own removal commits"
+        );
+    }
+
+    #[test]
+    fn a_leader_still_in_the_configuration_does_not_step_down_when_a_change_commits() {
+        let mut n = elected_leader();
+        let change = n.propose_config_change(test_config(1, &[2, 3, 4])).unwrap();
+
+        for peer in [2, 3, 4] {
+            n.handle_append_entries_response(
+                NodeId::from(peer),
+                AppendEntriesResponse::Accepted {
+                    term: Term::from(1),
+                    match_index: change,
+                },
+            );
+        }
+
+        assert_eq!(n.volatile.commit_index, change);
+        assert!(
+            is_leader(&n),
+            "a leader that remains a member has no reason to step down"
         );
     }
 

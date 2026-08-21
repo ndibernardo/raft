@@ -98,7 +98,10 @@ The core protocol — leader election, log replication, the safety rules, persis
 - Read-only queries without log writes (dissertation section 6.4)
 - Client sessions and request de-duplication (dissertation section 6.3)
 - Pre-vote (dissertation section 9.6)
-- Leader self-removal step-down (dissertation section 4.2.2)
+- The minimum-election-timeout rule for disruptive removed servers
+  (dissertation section 4.2.3). A removed server is dropped from replication
+  as soon as the change is appended, so it never learns of its own removal
+  and can still call elections in the configuration it was dropped from.
 - Joint consensus (paper section 6)
 - Accelerated log backtracking (paper section 5.3)
 
