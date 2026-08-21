@@ -68,6 +68,95 @@ fn single_node_becomes_leader_without_messages() {
     assert_eq!(cluster.role_counts(), (0, 0, 1));
 }
 
+/// A lone leader commits and applies without any peer traffic. Its own log is
+/// the whole quorum, so nothing will ever acknowledge on its behalf.
+#[test]
+fn single_node_applies_a_command_with_no_peer_to_acknowledge_it() {
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(1);
+    cluster.election_timeout(0);
+
+    cluster
+        .runtime_mut(0)
+        .submit(set("city", "amsterdam"))
+        .unwrap();
+    // The runtime applies committed entries while handling an event. No peer
+    // will ever send one here, so the heartbeat tick is what pumps the apply
+    // loop, exactly as the server loop drives it.
+    cluster.heartbeat_timeout(0);
+
+    let outputs = cluster.runtime_mut(0).take_outputs();
+    assert_eq!(
+        outputs.len(),
+        1,
+        "the command commits on the local append alone"
+    );
+
+    let result = cluster
+        .runtime_mut(0)
+        .state_machine_mut()
+        .apply(KvCommand::Get {
+            key: "city".to_string(),
+        });
+    assert_eq!(result, KvResult::Value(Some("amsterdam".to_string())));
+}
+
+/// What a lone leader committed survives a restart, and is restored from the
+/// snapshot the commit made compactable.
+#[test]
+fn single_node_recovers_what_it_committed_alone_across_a_restart() {
+    let policy = SnapshotPolicy {
+        compact_threshold: NonZeroUsize::new(2),
+    };
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::with_snapshot_policy(1, policy);
+    cluster.election_timeout(0);
+
+    for (key, value) in [("city", "amsterdam"), ("country", "netherlands")] {
+        cluster.runtime_mut(0).submit(set(key, value)).unwrap();
+        cluster.heartbeat_timeout(0);
+        cluster.runtime_mut(0).take_outputs();
+    }
+
+    cluster.restart(0);
+    // commit_index is volatile and comes back at the snapshot boundary, so the
+    // recovered suffix is durable but uncommitted. Only a new leader commits it,
+    // and on a lone node nothing but its own append can.
+    cluster.election_timeout(0);
+
+    let result = cluster
+        .runtime_mut(0)
+        .state_machine_mut()
+        .apply(KvCommand::Get {
+            key: "country".to_string(),
+        });
+    assert_eq!(
+        result,
+        KvResult::Value(Some("netherlands".to_string())),
+        "a restart must not lose entries that committed without peer acks"
+    );
+}
+
+/// A lone leader commits its own membership change, so growing a one-node
+/// cluster is not blocked on the member it is about to add.
+#[test]
+fn single_node_commits_the_config_change_that_adds_a_second_member() {
+    let mut cluster: Cluster<KvCommand, KvStore> = Cluster::new(1);
+    cluster.election_timeout(0);
+
+    let members: HashMap<NodeId, SocketAddr> =
+        [(NodeId::from(1), addr(9001))].into_iter().collect();
+    let index = cluster
+        .runtime_mut(0)
+        .submit_config_change(ClusterConfig::new(members).unwrap())
+        .unwrap();
+
+    assert_eq!(index, LogIndex::from(2));
+    assert_eq!(
+        cluster.runtime(0).node().volatile().commit_index,
+        LogIndex::from(2),
+        "the sole member is the quorum for its own change"
+    );
+}
+
 /// A three-node election: one candidate and two voters, of whom one suffices
 /// for a majority.
 #[test]

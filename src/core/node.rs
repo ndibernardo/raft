@@ -493,6 +493,12 @@ impl<Cmd: Clone> Node<Cmd> {
 
         self.config = config.clone();
         self.pending_config_changes.push(config);
+
+        // The quorum is computed from the tracked peers, so removing one lowers
+        // the bar. An index that the smaller membership already replicated is
+        // committed the moment the change takes effect, without waiting for the
+        // next response. Does nothing unless this node is the leader.
+        self.advance_commit_index();
     }
 
     /// Scans the log backward for the newest `ConfigChange` and adopts it.
@@ -684,6 +690,10 @@ impl<Cmd: Clone> Node<Cmd> {
         });
         self.role = Role::Leader(Leader::new(&self.peer_ids(), self.last_log_index()));
         info!(node = %self.id, term = %self.persistent.current_term, "became leader");
+        // The local log is one of the quorum's votes, so an append can be a
+        // majority on its own. In a single-member cluster it always is, and no
+        // peer response will ever arrive to trigger the commit decision later.
+        self.advance_commit_index();
         self.send_heartbeats()
     }
 
@@ -927,6 +937,7 @@ impl<Cmd: Clone> Node<Cmd> {
         };
         let index = self.persistent.append_entry(entry);
         debug!(node = %self.id, term = %self.persistent.current_term, index = %index, "command appended to log");
+        self.advance_commit_index();
         Ok(index)
     }
 
@@ -1803,6 +1814,160 @@ mod tests {
         let entry = n.persistent.log.entry(LogIndex::from(1)).unwrap();
         assert!(matches!(entry.payload, LogPayload::NoOp));
         assert_eq!(entry.term, Term::from(1));
+    }
+
+    #[test]
+    fn single_node_leader_commits_its_noop_on_election() {
+        let mut n = node(1, &[]);
+
+        n.election_timeout();
+
+        assert!(is_leader(&n), "a lone member is its own majority");
+        assert_eq!(n.last_log_index(), LogIndex::from(1));
+        assert_eq!(
+            n.volatile.commit_index,
+            LogIndex::from(1),
+            "no peer will ever acknowledge, so the local append is the quorum"
+        );
+    }
+
+    #[test]
+    fn single_node_leader_commits_and_applies_a_submitted_command() {
+        let mut n = node(1, &[]);
+        n.election_timeout();
+
+        let index = n.submit_command("SET price=1250".to_string()).unwrap();
+
+        assert_eq!(index, LogIndex::from(2));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(2));
+
+        let applied = n.take_entry_to_apply().unwrap();
+        assert_eq!(applied.index, LogIndex::from(2));
+        assert_eq!(applied.command, &"SET price=1250".to_string());
+    }
+
+    #[test]
+    fn single_node_leader_commits_its_own_config_change() {
+        let mut n = node(1, &[]);
+        n.election_timeout();
+
+        let index = n.propose_config_change(test_config(1, &[])).unwrap();
+
+        assert_eq!(index, LogIndex::from(2));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(2));
+        assert!(
+            n.take_entry_to_apply().is_none(),
+            "a ConfigChange is not a state-machine command"
+        );
+        assert_eq!(
+            n.take_committed_config_changes(),
+            vec![(LogIndex::from(2), test_config(1, &[]))]
+        );
+    }
+
+    #[test]
+    fn single_node_leader_can_compact_the_entries_it_committed_alone() {
+        let mut n = node(1, &[]);
+        n.election_timeout();
+        n.submit_command("SET price=1250".to_string()).unwrap();
+        while n.take_entry_to_apply().is_some() {}
+
+        let snapshot = n.compact_to_snapshot(SnapshotData::new(vec![1])).unwrap();
+
+        assert_eq!(snapshot.meta.last_index, LogIndex::from(2));
+        assert_eq!(n.persistent.log.snapshot_last_index(), LogIndex::from(2));
+    }
+
+    #[test]
+    fn multi_node_leader_does_not_commit_its_noop_before_any_peer_acknowledges() {
+        let mut n = node(1, &[2, 3]);
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote: Vote::Granted,
+            },
+        );
+
+        assert!(is_leader(&n));
+        assert_eq!(
+            n.volatile.commit_index,
+            LogIndex::default(),
+            "two of three logs still lack the no-op"
+        );
+    }
+
+    #[test]
+    fn multi_node_leader_does_not_commit_a_submitted_command_before_replication() {
+        let mut n = node(1, &[2, 3]);
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote: Vote::Granted,
+            },
+        );
+
+        n.submit_command("SET price=1250".to_string()).unwrap();
+
+        assert_eq!(n.volatile.commit_index, LogIndex::default());
+    }
+
+    #[test]
+    fn shrinking_the_configuration_commits_what_the_smaller_quorum_already_holds() {
+        let mut n = node(1, &[2, 3]);
+        n.election_timeout();
+        n.handle_request_vote_response(
+            NodeId::from(2),
+            RequestVoteResponse {
+                term: Term::from(1),
+                vote: Vote::Granted,
+            },
+        );
+        n.submit_command("SET price=1250".to_string()).unwrap();
+        n.handle_append_entries_response(
+            NodeId::from(2),
+            AppendEntriesResponse::Accepted {
+                term: Term::from(1),
+                match_index: LogIndex::from(2),
+            },
+        );
+        assert_eq!(n.volatile.commit_index, LogIndex::from(2));
+
+        // Node 3 never replicated anything. Dropping it makes {1, 2} the whole
+        // cluster, and both already hold index 2, so the ConfigChange at index 3
+        // commits on the two logs that carry it.
+        let index = n.propose_config_change(test_config(1, &[2])).unwrap();
+        assert_eq!(index, LogIndex::from(3));
+        n.handle_append_entries_response(
+            NodeId::from(2),
+            AppendEntriesResponse::Accepted {
+                term: Term::from(1),
+                match_index: LogIndex::from(3),
+            },
+        );
+
+        assert_eq!(n.volatile.commit_index, LogIndex::from(3));
+    }
+
+    #[test]
+    fn adopting_a_configuration_on_a_follower_never_advances_the_commit_index() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET price=1250".to_string()),
+        });
+
+        n.set_config(test_config(1, &[2]));
+
+        assert!(is_follower(&n));
+        assert_eq!(
+            n.volatile.commit_index,
+            LogIndex::default(),
+            "only a leader may decide a commit index from replication state"
+        );
     }
 
     #[test]
