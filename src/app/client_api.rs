@@ -215,6 +215,11 @@ async fn submit_membership(
             StatusCode::CONFLICT,
             "another config change is pending".into(),
         ),
+        Ok(Ok(MembershipResult::Indeterminate)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "leadership changed before the config change committed; re-read the configuration"
+                .into(),
+        ),
         Ok(Err(_)) | Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout".into()),
     }
 }

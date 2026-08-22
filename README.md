@@ -54,7 +54,7 @@ Each node prints its listen addresses to stderr on startup. The cluster elects a
 
 ## Client API
 
-Send commands to any node's client API. Writes and membership changes are accepted only by the leader — non-leaders return `503 not the leader`. Only one membership change may be in flight at a time; concurrent requests return `409`.
+Send commands to any node's client API. Writes and membership changes are accepted only by the leader — non-leaders return `503 not the leader`. Only one membership change may be in flight at a time; concurrent requests return `409`. If leadership changes before a membership change commits, the request returns `503` with an undecided outcome: the next leader determines whether the entry survives, so re-read the configuration rather than assuming either result.
 
 ```bash
 # Store a value

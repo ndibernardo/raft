@@ -346,10 +346,10 @@ impl<Cmd: Clone, S: StateMachine<Cmd>, St: Storage<Cmd>> Runtime<Cmd, S, St> {
         self.node.take_config_changes()
     }
 
-    /// Drains the configurations that have committed, with the index of the
-    /// entry that carried each. The caller resolves the membership requests
-    /// waiting on them.
-    pub fn take_committed_config_changes(&mut self) -> Vec<(LogIndex, ClusterConfig)> {
+    /// Drains the configurations that have committed, each with the term and
+    /// index of the entry that carried it. The caller resolves the membership
+    /// requests waiting on them.
+    pub fn take_committed_config_changes(&mut self) -> Vec<(Term, LogIndex, ClusterConfig)> {
         self.node.take_committed_config_changes()
     }
 

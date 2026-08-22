@@ -333,7 +333,7 @@ pub struct Node<Cmd> {
     pending_config_changes: Vec<ClusterConfig>,
     /// Configurations that have just committed. The server drains these to
     /// resolve the client requests that proposed them.
-    pending_committed_config_changes: Vec<(LogIndex, ClusterConfig)>,
+    pending_committed_config_changes: Vec<(Term, LogIndex, ClusterConfig)>,
     /// A snapshot accepted by `handle_install_snapshot` and awaiting the
     /// runtime's call to `StateMachine::restore`. Drained by
     /// `take_snapshot_to_restore`.
@@ -1133,7 +1133,9 @@ impl<Cmd: Clone> Node<Cmd> {
                     // appended. Only the commit notification is outstanding, so
                     // the server can answer the request that proposed it.
                     let cfg = cfg.clone();
-                    self.pending_committed_config_changes.push((index, cfg));
+                    let term = entry.term;
+                    self.pending_committed_config_changes
+                        .push((term, index, cfg));
                 }
                 LogPayload::Command(command) => {
                     return Some(Applied {
@@ -1153,10 +1155,14 @@ impl<Cmd: Clone> Node<Cmd> {
         std::mem::take(&mut self.pending_config_changes)
     }
 
-    /// Drains the configurations that have committed, paired with the index of
-    /// the entry that carried them. The server uses these to resolve the
-    /// membership requests waiting on them.
-    pub fn take_committed_config_changes(&mut self) -> Vec<(LogIndex, ClusterConfig)> {
+    /// Drains the configurations that have committed, each paired with the term
+    /// and index of the entry that carried it. The server uses these to resolve
+    /// the membership requests waiting on them.
+    ///
+    /// The term is part of the identity because an index alone does not name an
+    /// entry: after a leadership change a different configuration can occupy the
+    /// same index.
+    pub fn take_committed_config_changes(&mut self) -> Vec<(Term, LogIndex, ClusterConfig)> {
         std::mem::take(&mut self.pending_committed_config_changes)
     }
 
@@ -1932,7 +1938,7 @@ mod tests {
         );
         assert_eq!(
             n.take_committed_config_changes(),
-            vec![(LogIndex::from(2), test_config(1, &[]))]
+            vec![(Term::from(1), LogIndex::from(2), test_config(1, &[]))]
         );
     }
 
@@ -2806,8 +2812,9 @@ mod tests {
         // The committed config change must be buffered.
         let committed = n.take_committed_config_changes();
         assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].0, LogIndex::from(1));
-        assert_eq!(committed[0].1, new_config);
+        assert_eq!(committed[0].0, Term::from(1));
+        assert_eq!(committed[0].1, LogIndex::from(1));
+        assert_eq!(committed[0].2, new_config);
     }
 
     fn make_leader(id: u64, peers: &[u64]) -> Node<String> {

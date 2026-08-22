@@ -78,10 +78,34 @@ pub enum MembershipResult {
     /// The change was refused: another one is still uncommitted, or it would
     /// have emptied the cluster.
     Rejected,
+    /// Leadership changed before the change committed. The next leader decides
+    /// whether the entry survives or is overwritten, so the caller must re-read
+    /// the configuration rather than assume either outcome.
+    Indeterminate,
 }
 
 /// A membership request paired with the channel its result is returned on.
 pub type MembershipPending = (MembershipRequest, oneshot::Sender<MembershipResult>);
+
+/// A `ConfigChange` this node appended: the entry that carries it, and the
+/// membership it installs.
+///
+/// The term belongs here because an index alone does not identify an entry. Only
+/// the pair names the one entry a caller is waiting on.
+struct AppendedConfigChange {
+    term: Term,
+    index: LogIndex,
+    config: ClusterConfig,
+}
+
+/// A membership caller awaiting the commit of the exact entry its request
+/// appended.
+struct MembershipWaiter {
+    /// The membership the caller asked for. Checked against the configuration
+    /// that actually commits at the awaited term and index.
+    expected: ClusterConfig,
+    resp_tx: oneshot::Sender<MembershipResult>,
+}
 
 /// Why `Server::apply_membership_request` could not apply a membership change.
 #[derive(Debug)]
@@ -128,10 +152,13 @@ pub struct Server<Cmd, SM: StateMachine<Cmd>> {
     /// index-keyed map would hand that entry's result to this client.
     pending: HashMap<(Term, LogIndex), oneshot::Sender<ApiResponse<SM::Output>>>,
     membership_rx: mpsc::Receiver<MembershipPending>,
-    /// Membership requests awaiting commit, keyed by log index. No term is
-    /// needed: a `ConfigChange` that loses its index is superseded by whatever
-    /// configuration the new leader has, and the request simply times out.
-    pending_membership: HashMap<LogIndex, oneshot::Sender<MembershipResult>>,
+    /// Membership callers awaiting commit, keyed by the term and index of the
+    /// `ConfigChange` they appended.
+    ///
+    /// Keyed like `pending`, and for the same reason: after a leadership change
+    /// a different configuration can occupy the same index, and an index-keyed
+    /// map would report that unrelated change as this caller's success.
+    pending_membership: HashMap<(Term, LogIndex), MembershipWaiter>,
 }
 
 impl<Cmd, SM> Server<Cmd, SM>
@@ -256,9 +283,20 @@ where
     fn poll_membership_requests(&mut self) {
         while let Ok((req, resp_tx)) = self.membership_rx.try_recv() {
             match self.apply_membership_request(req) {
-                Ok(index) => {
-                    tracing::debug!(node = %self.runtime.node().id(), %index, "membership change queued");
-                    self.pending_membership.insert(index, resp_tx);
+                Ok(appended) => {
+                    let AppendedConfigChange {
+                        term,
+                        index,
+                        config,
+                    } = appended;
+                    tracing::debug!(node = %self.runtime.node().id(), %term, %index, "membership change queued");
+                    self.pending_membership.insert(
+                        (term, index),
+                        MembershipWaiter {
+                            expected: config,
+                            resp_tx,
+                        },
+                    );
                 }
                 Err(MembershipApplyError::Submit(SubmitError::NotLeader { .. })) => {
                     let _ = resp_tx.send(MembershipResult::NotLeader);
@@ -280,17 +318,25 @@ where
     fn apply_membership_request(
         &mut self,
         req: MembershipRequest,
-    ) -> Result<LogIndex, MembershipApplyError> {
+    ) -> Result<AppendedConfigChange, MembershipApplyError> {
         let current = self.runtime.node().config();
-        let new_config = match req {
+        let config = match req {
             MembershipRequest::Add { id, addr } => current.with_member(id, addr),
             MembershipRequest::Remove { id } => current
                 .without_member(id)
                 .map_err(|_| MembershipApplyError::WouldLeaveNoMembers)?,
         };
-        let index = self.runtime.submit_config_change(new_config)?;
+        let index = self.runtime.submit_config_change(config.clone())?;
+        // submit_config_change stamped the entry with the current term a moment
+        // ago, and nothing between then and here can change it, so this read
+        // yields the term the entry was appended under.
+        let term = self.runtime.node().persistent().current_term();
         self.apply_config_changes();
-        Ok(index)
+        Ok(AppendedConfigChange {
+            term,
+            index,
+            config,
+        })
     }
 
     /// Brings the transport peer map in line with every configuration that has
@@ -336,15 +382,29 @@ where
         for (_, tx) in self.pending.drain() {
             let _ = tx.send(ApiResponse::NotLeader { leader_hint });
         }
+        for (_, waiter) in self.pending_membership.drain() {
+            let _ = waiter.resp_tx.send(MembershipResult::Indeterminate);
+        }
     }
 
     /// Answers the membership requests whose `ConfigChange` entries have just
     /// committed.
     fn resolve_membership_outputs(&mut self) {
-        for (index, _config) in self.runtime.take_committed_config_changes() {
-            if let Some(tx) = self.pending_membership.remove(&index) {
-                let _ = tx.send(MembershipResult::Ok);
-            }
+        for (term, index, config) in self.runtime.take_committed_config_changes() {
+            let Some(waiter) = self.pending_membership.remove(&(term, index)) else {
+                continue;
+            };
+            // The Log Matching Property makes term and index enough to identify
+            // an entry, so this comparison should always hold. It is kept
+            // because reporting someone else's change as this caller's success
+            // is the failure being guarded against, and silence is cheaper than
+            // a wrong answer.
+            let result = if waiter.expected == config {
+                MembershipResult::Ok
+            } else {
+                MembershipResult::Indeterminate
+            };
+            let _ = waiter.resp_tx.send(result);
         }
     }
 
@@ -606,6 +666,207 @@ mod tests {
                 )
             }
             Ok(ApiResponse::NotLeader { .. }) | Err(_) => {}
+        }
+    }
+
+    /// A membership request registers a waiter and is answered once its own
+    /// `ConfigChange` commits. A lone leader commits it on the local append.
+    #[test]
+    fn membership_waiter_is_answered_when_its_own_change_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+
+        let appended = server
+            .apply_membership_request(MembershipRequest::Add {
+                id: NodeId::from(2),
+                addr: test_addr(19999),
+            })
+            .unwrap();
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        server.pending_membership.insert(
+            (appended.term, appended.index),
+            MembershipWaiter {
+                expected: appended.config.clone(),
+                resp_tx,
+            },
+        );
+
+        // The new member is part of the quorum from the moment the change is
+        // appended, so the entry commits only once it acknowledges.
+        server
+            .runtime
+            .handle(Event::Message {
+                from: NodeId::from(2),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
+                    term: appended.term,
+                    match_index: appended.index,
+                }),
+            })
+            .unwrap();
+        server.resolve_membership_outputs();
+
+        assert!(
+            matches!(resp_rx.try_recv(), Ok(MembershipResult::Ok)),
+            "the caller's own change committed, so it must be told so"
+        );
+    }
+
+    /// A committed `ConfigChange` with nobody waiting on it is discarded. That
+    /// is the normal case on a follower and after a restart.
+    #[test]
+    fn committed_change_with_no_waiter_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+
+        let appended = server
+            .apply_membership_request(MembershipRequest::Add {
+                id: NodeId::from(2),
+                addr: test_addr(19999),
+            })
+            .unwrap();
+        server
+            .runtime
+            .handle(Event::Message {
+                from: NodeId::from(2),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
+                    term: appended.term,
+                    match_index: appended.index,
+                }),
+            })
+            .unwrap();
+
+        server.resolve_membership_outputs();
+
+        assert!(server.pending_membership.is_empty());
+    }
+
+    /// Stepping down strands every membership waiter. The next leader decides
+    /// whether the entry survives, so the caller is told the outcome is
+    /// undecided rather than being left to time out.
+    #[test]
+    fn stepping_down_answers_membership_waiters_as_indeterminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+
+        let appended = server
+            .apply_membership_request(MembershipRequest::Add {
+                id: NodeId::from(2),
+                addr: test_addr(19999),
+            })
+            .unwrap();
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        server.pending_membership.insert(
+            (appended.term, appended.index),
+            MembershipWaiter {
+                expected: appended.config,
+                resp_tx,
+            },
+        );
+
+        server.purge_pending();
+
+        assert!(
+            matches!(resp_rx.try_recv(), Ok(MembershipResult::Indeterminate)),
+            "a stranded membership caller must be told the outcome is undecided"
+        );
+        assert!(server.pending_membership.is_empty());
+    }
+
+    /// If leadership changes before a membership change commits, a different
+    /// `ConfigChange` can later commit at the same log index. A caller waiting
+    /// on the original request must never be told its own change succeeded.
+    #[test]
+    fn stranded_membership_client_never_receives_a_different_configs_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = test_server(1, dir.path());
+
+        // Node 1 leads alone in term 1. Its no-op takes index 1, so the
+        // membership change lands at index 2.
+        server.runtime.handle(Event::ElectionTimeout).unwrap();
+        let leader_term = server.runtime.node().persistent().current_term();
+
+        let appended = server
+            .apply_membership_request(MembershipRequest::Add {
+                id: NodeId::from(2),
+                addr: test_addr(19999),
+            })
+            .unwrap();
+        assert_eq!(appended.index, LogIndex::from(2));
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        server.pending_membership.insert(
+            (appended.term, appended.index),
+            MembershipWaiter {
+                expected: appended.config,
+                resp_tx,
+            },
+        );
+
+        // A higher term forces node 1 to step down before its change commits.
+        let commands = server
+            .runtime
+            .handle(Event::Message {
+                from: NodeId::from(2),
+                message: Message::RequestVote(RequestVote {
+                    term: Term::from(5),
+                    candidate_id: NodeId::from(2),
+                    last_log_index: LogIndex::from(1),
+                    last_log_term: leader_term,
+                }),
+            })
+            .unwrap();
+        server.apply_config_changes();
+        server.dispatch(commands);
+        if server.runtime.take_stepped_down() {
+            server.purge_pending();
+        }
+        server.resolve_membership_outputs();
+
+        // A term 6 leader overwrites index 2 with an unrelated configuration
+        // and directs node 1 to commit it.
+        let unrelated = ClusterConfig::new(HashMap::from([
+            (NodeId::from(1), test_addr(19001)),
+            (NodeId::from(7), test_addr(19007)),
+        ]))
+        .unwrap();
+        let commands = server
+            .runtime
+            .handle(Event::Message {
+                from: NodeId::from(2),
+                message: Message::AppendEntries(AppendEntries {
+                    term: Term::from(6),
+                    leader_id: NodeId::from(2),
+                    prev_log_index: LogIndex::from(1),
+                    prev_log_term: leader_term,
+                    entries: vec![LogEntry {
+                        term: Term::from(6),
+                        payload: LogPayload::ConfigChange(unrelated),
+                    }],
+                    leader_commit: LogIndex::from(2),
+                }),
+            })
+            .unwrap();
+        server.apply_config_changes();
+        server.dispatch(commands);
+        if server.runtime.take_stepped_down() {
+            server.purge_pending();
+        }
+        server.resolve_membership_outputs();
+
+        // Either the caller was told the outcome is undecided when the node
+        // stepped down, or it is still waiting. Both are correct. Only an Ok
+        // here would mean a different configuration's commit was reported as
+        // this caller's success.
+        match resp_rx.try_recv() {
+            Ok(MembershipResult::Ok) => {
+                panic!("stranded membership caller was told an unrelated config change succeeded")
+            }
+            Ok(MembershipResult::NotLeader)
+            | Ok(MembershipResult::Rejected)
+            | Ok(MembershipResult::Indeterminate)
+            | Err(_) => {}
         }
     }
 }
