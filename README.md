@@ -6,6 +6,7 @@ A Raft consensus implementation in Rust, designed as the foundation for a distri
 
 This library implements the Raft consensus algorithm as described in "In Search of an Understandable Consensus Algorithm" by Ongaro and Ousterhout.
 The Raft layer is generic over command type. The key-value store is implemented as a state machine that applies committed log entries.
+The demo store and its HTTP API sit behind the default `kv` feature; building with `--no-default-features` leaves the protocol library alone.
 
 ## Running a cluster
 
@@ -50,11 +51,12 @@ Start three nodes in separate terminals. Each node needs a unique `--id`, its ow
   --client-addr 127.0.0.1:8003
 ```
 
-Each node prints its listen addresses to stderr on startup. The cluster elects a leader automatically once a majority of nodes are reachable. Persistent state (term, vote, log) is stored in the `--data-dir` directory and survives restarts.
+Each node prints its listen addresses to stderr on startup. The cluster elects a leader automatically once a majority of nodes are reachable. Persistent state (term, vote, log, snapshot) is stored in the `--data-dir` directory and survives restarts.
+The binary snapshots the state machine and compacts the log every 1024 applied entries; a follower that falls behind the compaction boundary is caught up with an `InstallSnapshot` RPC.
 
 ## Client API
 
-Send commands to any node's client API. Writes and membership changes are accepted only by the leader — non-leaders return `503 not the leader`. Only one membership change may be in flight at a time; concurrent requests return `409`. If leadership changes before a membership change commits, the request returns `503` with an undecided outcome: the next leader determines whether the entry survives, so re-read the configuration rather than assuming either result.
+Send commands to any node's client API. Writes and membership changes are accepted only by the leader. Non-leaders return `503 not the leader`. Only one membership change may be in flight at a time; concurrent requests return `409`. If leadership changes before a membership change commits, the request returns `503` with an undecided outcome: the next leader determines whether the entry survives, so re-read the configuration rather than assuming either result.
 
 ```bash
 # Store a value
@@ -89,11 +91,13 @@ curl -X DELETE http://127.0.0.1:8001/cluster/members/4               # ok
 cargo test
 ```
 
-Unit tests in `src/` cover node protocol logic, storage, state machine, and transport. Property tests in `tests/common/cluster.rs` run randomised operation sequences verified against election-safety and state-machine-safety invariants. Integration tests in `tests/` exercise end-to-end scenarios (election, replication, commit propagation, re-election) through the public API only.
+Unit tests in `src/` cover node protocol logic, storage, state machine, and transport. Property tests in `tests/common/cluster.rs` run randomised operation sequences verified against election-safety and state-machine-safety invariants. Integration tests in `tests/` exercise end-to-end scenarios (election, replication, commit propagation, re-election, snapshot catch-up, membership change) through the public API only.
+
+`scripts/test-cluster.sh` drives a real three-node cluster of release binaries over HTTP. It needs `cargo build --release` first, takes `--logs` to stream node output, and reads `RUST_LOG` for verbosity.
 
 ## To be implemented
 
-The core protocol — leader election, log replication, the safety rules, persistence, and single-server membership changes — is complete. Still missing from the paper and dissertation:
+The core protocol is complete: leader election, log replication, the safety rules, persistence, and single-server membership changes. Still missing from the paper and dissertation:
 
 - Read-only queries without log writes (dissertation section 6.4)
 - Client sessions and request de-duplication (dissertation section 6.3)
