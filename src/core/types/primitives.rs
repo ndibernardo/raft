@@ -83,6 +83,12 @@ impl LogIndex {
         }
     }
 
+    /// Returns `self` advanced by `n` positions, or `None` when the result is
+    /// not representable.
+    pub fn checked_advance_by(self, n: u64) -> Option<LogIndex> {
+        self.value.checked_add(n).map(|value| LogIndex { value })
+    }
+
     /// Number of positions from `base` up to `self`, or `None` when `self` does
     /// not lie strictly after `base`.
     pub fn value_since(self, base: LogIndex) -> Option<u64> {
@@ -136,6 +142,19 @@ mod tests {
     #[test]
     fn term_next_increases_by_one() {
         assert_eq!(Term::from(3).next(), Term::from(4));
+    }
+
+    #[test]
+    fn checked_advance_by_returns_the_end_of_a_representable_range() {
+        assert_eq!(
+            LogIndex::from(41).checked_advance_by(7),
+            Some(LogIndex::from(48))
+        );
+    }
+
+    #[test]
+    fn checked_advance_by_returns_none_when_the_range_overflows() {
+        assert_eq!(LogIndex::from(u64::MAX).checked_advance_by(1), None);
     }
 
     #[test]

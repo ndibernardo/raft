@@ -858,6 +858,18 @@ impl<Cmd: Clone> Node<Cmd> {
 
         let mut commands = vec![Command::ResetElectionTimer];
 
+        let entry_count = req.entries.len() as u64;
+        let Some(verified_end) = req.prev_log_index.checked_advance_by(entry_count) else {
+            debug!(node = %self.id, leader = %from, prev_index = %req.prev_log_index, count = entry_count, "append entries rejected: entry range not representable");
+            commands.push(Command::Send {
+                to: from,
+                message: Message::AppendEntriesResponse(AppendEntriesResponse::Rejected {
+                    term: self.persistent.current_term,
+                }),
+            });
+            return commands;
+        };
+
         if !self.check_log_consistency(req.prev_log_index, req.prev_log_term) {
             debug!(node = %self.id, leader = %from, prev_index = %req.prev_log_index, prev_term = %req.prev_log_term, "append entries rejected: log inconsistency");
             commands.push(Command::Send {
@@ -869,21 +881,26 @@ impl<Cmd: Clone> Node<Cmd> {
             return commands;
         }
 
-        let entry_count = req.entries.len();
         self.append_entries(req.prev_log_index, req.entries);
         if entry_count > 0 {
-            debug!(node = %self.id, leader = %from, count = entry_count, match_index = %self.last_log_index(), "entries appended");
+            debug!(node = %self.id, leader = %from, count = entry_count, match_index = %verified_end, "entries appended");
         }
 
-        if req.leader_commit > self.volatile.commit_index {
-            self.volatile.commit_index = std::cmp::min(req.leader_commit, self.last_log_index());
+        // A local tail past `verified_end` survived the merge because it did not
+        // conflict with what arrived, which is not evidence that the leader
+        // holds it. Acknowledging or committing it would let one follower's
+        // uncommitted leftovers count toward a quorum for entries it does not
+        // have.
+        let committable = std::cmp::min(req.leader_commit, verified_end);
+        if committable > self.volatile.commit_index {
+            self.volatile.commit_index = committable;
         }
 
         commands.push(Command::Send {
             to: from,
             message: Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
                 term: self.persistent.current_term,
-                match_index: self.last_log_index(),
+                match_index: verified_end,
             }),
         });
 
@@ -1457,6 +1474,22 @@ mod tests {
                     message: Message::AppendEntriesResponse(r),
                     ..
                 } => Some(matches!(r, AppendEntriesResponse::Accepted { .. })),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn extract_match_index(cmds: &[Command<String>]) -> LogIndex {
+        cmds.iter()
+            .find_map(|c| match c {
+                Command::Send {
+                    message:
+                        Message::AppendEntriesResponse(AppendEntriesResponse::Accepted {
+                            match_index,
+                            ..
+                        }),
+                    ..
+                } => Some(*match_index),
                 _ => None,
             })
             .unwrap()
@@ -2658,6 +2691,281 @@ mod tests {
         n.handle_append_entries(NodeId::from(2), req);
 
         assert_eq!(n.volatile.commit_index, LogIndex::from(1));
+    }
+
+    /// A request proves agreement only through `prev_log_index + entries.len()`.
+    /// A longer local tail survived because it did not conflict with the
+    /// received prefix, not because this leader vouched for it.
+    #[test]
+    fn append_entries_acknowledges_only_the_range_the_request_proved() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        // Left over from a leader that never committed it.
+        n.push_entry(LogEntry {
+            term: Term::from(2),
+            payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+        });
+
+        let req = AppendEntries {
+            term: Term::from(3),
+            leader_id: NodeId::from(3),
+            prev_log_index: LogIndex::from(1),
+            prev_log_term: Term::from(1),
+            entries: vec![LogEntry {
+                term: Term::from(1),
+                payload: LogPayload::Command("SET status=pending".to_string()),
+            }],
+            leader_commit: LogIndex::from(3),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(3), req);
+
+        assert_eq!(extract_match_index(&cmds), LogIndex::from(2));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(2));
+        // The unverified entry stays in place; only a conflicting entry removes it.
+        assert_eq!(n.persistent.log.len(), 3);
+    }
+
+    #[test]
+    fn heartbeat_acknowledges_its_own_position_not_the_whole_local_tail() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(2),
+            payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+        });
+
+        let req = AppendEntries {
+            term: Term::from(3),
+            leader_id: NodeId::from(3),
+            prev_log_index: LogIndex::from(1),
+            prev_log_term: Term::from(1),
+            entries: vec![],
+            leader_commit: LogIndex::from(3),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(3), req);
+
+        assert_eq!(extract_match_index(&cmds), LogIndex::from(1));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(1));
+    }
+
+    #[test]
+    fn conflict_repair_acknowledges_the_replaced_range() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(2),
+            payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(2),
+            payload: LogPayload::Command("SET tier=gold".to_string()),
+        });
+
+        let req = AppendEntries {
+            term: Term::from(3),
+            leader_id: NodeId::from(3),
+            prev_log_index: LogIndex::from(1),
+            prev_log_term: Term::from(1),
+            entries: vec![
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(3),
+                    payload: LogPayload::Command("SET region=us-east-1".to_string()),
+                },
+            ],
+            leader_commit: LogIndex::from(3),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(3), req);
+
+        assert_eq!(extract_match_index(&cmds), LogIndex::from(3));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(3));
+        assert_eq!(
+            n.persistent.log.len(),
+            3,
+            "the conflicting tail was replaced"
+        );
+        assert_eq!(
+            n.persistent.log.entry(LogIndex::from(3)).unwrap().payload,
+            LogPayload::Command("SET region=us-east-1".to_string())
+        );
+    }
+
+    #[test]
+    fn commit_index_does_not_regress_on_a_late_duplicate_request() {
+        let mut n = node(1, &[2, 3]);
+        for command in [
+            "SET name=miles",
+            "SET status=pending",
+            "SET region=eu-west-1",
+            "SET tier=gold",
+        ] {
+            n.push_entry(LogEntry {
+                term: Term::from(1),
+                payload: LogPayload::Command(command.to_string()),
+            });
+        }
+        n.volatile.commit_index = LogIndex::from(3);
+
+        // A retransmission of the very first batch, long after index 3 committed.
+        let req = AppendEntries {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::default(),
+            prev_log_term: Term::default(),
+            entries: vec![LogEntry {
+                term: Term::from(1),
+                payload: LogPayload::Command("SET name=miles".to_string()),
+            }],
+            leader_commit: LogIndex::from(4),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(2), req);
+
+        assert_eq!(extract_match_index(&cmds), LogIndex::from(1));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(3));
+    }
+
+    #[test]
+    fn request_covered_by_the_snapshot_prefix_neither_reapplies_nor_regresses_commit() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        n.volatile.commit_index = LogIndex::from(2);
+        n.volatile.last_applied = LogIndex::from(2);
+        n.compact_to_snapshot(SnapshotData::new(vec![42])).unwrap();
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+        });
+
+        // A retransmission of entries the snapshot already covers.
+        let req = AppendEntries {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::default(),
+            prev_log_term: Term::default(),
+            entries: vec![
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".to_string()),
+                },
+            ],
+            leader_commit: LogIndex::from(3),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(2), req);
+
+        assert_eq!(extract_match_index(&cmds), LogIndex::from(2));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(2));
+        assert_eq!(n.volatile.last_applied, LogIndex::from(2));
+        assert_eq!(
+            n.persistent.log.len(),
+            1,
+            "the retained suffix is untouched"
+        );
+        assert_eq!(
+            n.persistent.log.entry(LogIndex::from(3)).unwrap().payload,
+            LogPayload::Command("SET region=eu-west-1".to_string())
+        );
+    }
+
+    #[test]
+    fn request_starting_at_the_snapshot_boundary_acknowledges_absolute_indices() {
+        let mut n = node(1, &[2, 3]);
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET name=miles".to_string()),
+        });
+        n.push_entry(LogEntry {
+            term: Term::from(1),
+            payload: LogPayload::Command("SET status=pending".to_string()),
+        });
+        n.volatile.commit_index = LogIndex::from(2);
+        n.volatile.last_applied = LogIndex::from(2);
+        n.compact_to_snapshot(SnapshotData::new(vec![42])).unwrap();
+
+        let req = AppendEntries {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::from(2),
+            prev_log_term: Term::from(1),
+            entries: vec![LogEntry {
+                term: Term::from(1),
+                payload: LogPayload::Command("SET region=eu-west-1".to_string()),
+            }],
+            leader_commit: LogIndex::from(3),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(2), req);
+
+        assert_eq!(extract_match_index(&cmds), LogIndex::from(3));
+        assert_eq!(n.volatile.commit_index, LogIndex::from(3));
+    }
+
+    /// Any index below the snapshot boundary passes log matching unconditionally,
+    /// since a committed prefix cannot conflict. A request placed just under a
+    /// maximal boundary therefore reaches the range calculation with a
+    /// consistency check that already succeeded.
+    #[test]
+    fn append_entries_rejects_a_range_that_is_not_representable() {
+        let mut n = node(1, &[2, 3]);
+        n.persistent
+            .log
+            .reset_to_snapshot(LogIndex::from(u64::MAX), Term::from(1));
+
+        let req = AppendEntries {
+            term: Term::from(1),
+            leader_id: NodeId::from(2),
+            prev_log_index: LogIndex::from(u64::MAX - 1),
+            prev_log_term: Term::from(1),
+            entries: vec![
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET name=miles".to_string()),
+                },
+                LogEntry {
+                    term: Term::from(1),
+                    payload: LogPayload::Command("SET status=pending".to_string()),
+                },
+            ],
+            leader_commit: LogIndex::from(u64::MAX),
+        };
+        let cmds = n.handle_append_entries(NodeId::from(2), req);
+
+        assert!(!extract_append_success(&cmds));
+        assert!(n.persistent.log.is_empty(), "no entry was grafted");
+        assert_eq!(n.volatile.commit_index, LogIndex::default());
     }
 
     #[test]
