@@ -62,7 +62,7 @@ impl KvStore {
 /// Separate from `KvStore` so the domain type carries no derive of its own, and
 /// the on-disk format can change without changing the store.
 #[derive(Serialize, Deserialize)]
-struct KvSnapshotDto {
+struct KvSnapshotRecord {
     entries: HashMap<String, String>,
 }
 
@@ -80,16 +80,16 @@ impl StateMachine<KvCommand> for KvStore {
     }
 
     fn snapshot(&self) -> Result<SnapshotData, Self::SnapshotError> {
-        let dto = KvSnapshotDto {
+        let record = KvSnapshotRecord {
             entries: self.data.clone(),
         };
-        let bytes = serde_json::to_vec(&dto)?;
+        let bytes = serde_json::to_vec(&record)?;
         Ok(SnapshotData::new(bytes))
     }
 
     fn restore(&mut self, data: &SnapshotData) -> Result<(), Self::SnapshotError> {
-        let dto: KvSnapshotDto = serde_json::from_slice(data.as_bytes())?;
-        self.data = dto.entries;
+        let record: KvSnapshotRecord = serde_json::from_slice(data.as_bytes())?;
+        self.data = record.entries;
         Ok(())
     }
 }

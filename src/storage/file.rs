@@ -51,12 +51,12 @@ struct LogFileHeader {
 /// On-disk form of `SuffixDisposition`.
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum DispositionDto {
+enum StoredDisposition {
     Retain,
     Discard,
 }
 
-impl From<SuffixDisposition> for DispositionDto {
+impl From<SuffixDisposition> for StoredDisposition {
     fn from(disposition: SuffixDisposition) -> Self {
         match disposition {
             SuffixDisposition::Retain => Self::Retain,
@@ -65,11 +65,11 @@ impl From<SuffixDisposition> for DispositionDto {
     }
 }
 
-impl From<DispositionDto> for SuffixDisposition {
-    fn from(dto: DispositionDto) -> Self {
-        match dto {
-            DispositionDto::Retain => Self::Retain,
-            DispositionDto::Discard => Self::Discard,
+impl From<StoredDisposition> for SuffixDisposition {
+    fn from(stored: StoredDisposition) -> Self {
+        match stored {
+            StoredDisposition::Retain => Self::Retain,
+            StoredDisposition::Discard => Self::Discard,
         }
     }
 }
@@ -83,7 +83,7 @@ impl From<DispositionDto> for SuffixDisposition {
 struct InstallIntent {
     last_index: LogIndex,
     last_term: Term,
-    disposition: DispositionDto,
+    disposition: StoredDisposition,
 }
 
 impl InstallIntent {
